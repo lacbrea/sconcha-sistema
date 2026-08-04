@@ -94,6 +94,17 @@ C:\Python312\python.exe -m pip install -r requirements.txt
      nombre de este negocio, con su `nombre_corto`, `razon_social`, `ruc`
      (entre comillas) y la lista de `locales` que factura ese RUC (puede
      quedar vacía `[]`).
+     - `local_por_defecto`: **obligatorio si esa empresa tiene más de un
+       local** en su lista de `locales`. Un comprobante nunca dice a qué
+       local corresponde: se emite a nombre de la razón social, no del
+       establecimiento — el local es conocimiento de quien compra, no un
+       dato que esté en el documento. Sin `local_por_defecto`, TODOS los
+       comprobantes de esa empresa caen en `02_REVISAR` pidiendo asignación
+       manual y el sistema queda inservible para ella. Pon aquí el local
+       que compra la mayor parte del tiempo; los pocos comprobantes que en
+       realidad sean del otro local se corrigen a mano en el Sheet. Ver
+       `config.ejemplo.yaml` para el formato exacto y la sección "Trampas
+       conocidas" de `SKILL.md` para el caso real que motivó este campo.
    - Deja `sheets.contable` y `sheets.detalle` vacíos (`""`): los llena
      automáticamente el Paso 6.
 3. `config.yaml` nunca se sube a un repositorio (contiene los IDs de los
@@ -148,14 +159,29 @@ creados.
 
 ---
 
-## Paso 7 — Corrida de calibración con 15 documentos reales
+## Paso 7 — Corrida de calibración con documentos representativos del flujo nuevo
 
-Antes de confiar el negocio al sistema, coloca en `00_BUZON` unos 15
-comprobantes reales que cubran los tres tipos de origen (XML, PDF y foto),
-y de varias empresas/locales configurados. Luego:
+Este sistema existe precisamente para dejar de escanear papel. No calibres
+con comprobantes escaneados históricos: eso afinaría el sistema para un
+problema que se está eliminando, no para el flujo real con el que va a
+operar. En el flujo nuevo, las facturas y boletas llegan como **PDF
+digital** o **XML de factura electrónica** (por correo o por el bot), y la
+**foto con el celular** queda reservada solo para comprobantes
+genuinamente físicos y sin versión digital (compras en el mercado, en el
+terminal pesquero).
+
+Antes de confiar el negocio al sistema, coloca en `00_BUZON` **tres
+documentos representativos de ese flujo**:
+
+1. Un **XML de factura electrónica** real de un proveedor.
+2. Un **PDF digital** recibido por correo (no un escaneo).
+3. Una **foto tomada con el celular** de una boleta de compra en el
+   mercado (o de otro comprobante genuinamente físico).
+
+Luego:
 
 ```powershell
-C:\Python312\python.exe procesar.py --config config.yaml --limite 15 --verbose
+C:\Python312\python.exe procesar.py --config config.yaml --limite 3 --verbose
 ```
 
 Revisa **campo por campo contra el documento original**: RUC, serie y
@@ -164,6 +190,11 @@ emparejado de catálogo. Cualquier comprobante que haya caído en
 `02_REVISAR` tiene su motivo en el archivo `.motivo.txt` correspondiente —
 revísalo también, para confirmar que la razón es correcta y no un error
 del sistema.
+
+Si los tres calzan bien, puedes sumar más documentos reales de otras
+empresas/locales configurados para ampliar la muestra antes del Paso 8,
+siempre dentro de este mismo flujo (XML, PDF digital o foto de comprobante
+físico) — nunca con escaneos históricos.
 
 No continúes al Paso 8 hasta estar conforme con la precisión de esta
 corrida.

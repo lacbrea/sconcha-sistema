@@ -29,76 +29,32 @@ import sys
 
 import yaml
 
+from registro_sheets import COLUMNAS_CONTABLE, COLUMNAS_DETALLE
+
 logger = logging.getLogger("procesar.init_negocio")
 
 # -----------------------------------------------------------------------------
 # Cabeceras de los dos Sheets del negocio. Fila 1 de cada spreadsheet.
 #
-# Copiadas EXACTAS (mismo orden, mismos nombres) de COLUMNAS_CONTABLE y
-# COLUMNAS_DETALLE en registro_sheets.py: ese módulo escribe cada fila como
-# una lista posicional (sin mapear por nombre de columna), así que si estas
-# cabeceras no coinciden en cantidad y orden con las de registro_sheets.py,
-# los datos quedan desalineados en el Sheet. Si esas columnas cambian, hay
-# que actualizar esta lista en el mismo cambio.
+# Se IMPORTAN de registro_sheets.py en vez de copiarse: ese módulo escribe
+# cada fila del Sheet como una lista posicional (sin mapear por nombre de
+# columna), así que la cabecera y la fila tienen que salir siempre de la
+# misma fuente. Una copia local -por exacta que sea el día que se escribe-
+# diverge en el primer cambio que se haga de un solo lado: eso ya pasó (esta
+# lista llegó a quedarse en 31 columnas mientras COLUMNAS_CONTABLE ya tenía
+# 32, con ARCHIVO agregada al final; el Sheet se habría creado con una
+# cabecera de menos y cada dato a partir de ahí habría quedado bajo la
+# etiqueta equivocada, en silencio). Importar en vez de copiar elimina esa
+# clase de bug de raíz, no solo esta instancia.
 #
-# Las primeras 18 columnas de ENCABEZADOS_CONTABLE replican a propósito el
-# registro histórico REGISTRO COMPROBANTES.xlsx (hoja 'COMPROBANTES') para
-# que build_conciliacion.py lo siga consumiendo sin cambios; la columna 15
-# se llama LINK_DRIVE (no LINK_COMPROBANTE, que era el nombre del Excel
-# viejo) porque es la clave que ya lee ese motor de conciliación.
+# registro_sheets.py NO importa googleapiclient a nivel de módulo (solo lo
+# menciona en un docstring; el import real vive en auth_google.py y en
+# Registro._obtener_servicio, ambos diferidos) -verificado leyendo sus
+# imports antes de este cambio-, así que este import es liviano: no toca
+# red ni credenciales y --dry-run sigue funcionando igual.
 # -----------------------------------------------------------------------------
-ENCABEZADOS_CONTABLE = [
-    "FECHA_EMISION",
-    "EMPRESA",
-    "LOCAL",
-    "PROVEEDOR",
-    "RUC",
-    "TIPO",
-    "SERIE_NUMERO",
-    "SUBTOTAL",
-    "IGV",
-    "TOTAL",
-    "CONDICION",
-    "ESTADO_PAGO",
-    "FECHA_PAGO",
-    "CAJA_CHICA",
-    "LINK_DRIVE",
-    "REGISTRADO_POR",
-    "FECHA_REGISTRO",
-    "OBSERVACIONES",
-    # columnas nuevas, no existen en el Excel histórico.
-    "MONEDA",
-    "TIPO_CAMBIO",
-    "FECHA_VENCIMIENTO",
-    "DETRACCION_PCT",
-    "DETRACCION_MONTO",
-    "RETENCION",
-    "ICBPER",
-    "DESCUENTO_GLOBAL",
-    "CLIENTE_RUC",
-    "DOC_REFERENCIA",
-    "ORIGEN",
-    "CONFIANZA",
-    "ADVERTENCIAS",
-]
-
-ENCABEZADOS_DETALLE = [
-    "FECHA_EMISION",
-    "EMPRESA",
-    "LOCAL",
-    "RUC",
-    "SERIE_NUMERO",
-    "ORDEN",
-    "DESCRIPCION_FACTURA",
-    "INSUMO",
-    "CATEGORIA",
-    "CANTIDAD",
-    "UNIDAD",
-    "PRECIO_UNITARIO",
-    "TOTAL_LINEA",
-    "MATCH",
-    "FECHA_REGISTRO",
-]
+ENCABEZADOS_CONTABLE = COLUMNAS_CONTABLE
+ENCABEZADOS_DETALLE = COLUMNAS_DETALLE
 
 
 def cargar_config(ruta_config: pathlib.Path) -> dict:
@@ -186,7 +142,15 @@ def _crear_spreadsheet(servicio_sheets, titulo: str, encabezados: list[str]) -> 
 def preparar_sheet(
     servicio_sheets, negocio: str, sufijo: str, encabezados: list[str], id_actual: str, dry_run: bool
 ) -> str:
-    titulo = f"SCONCHA {negocio} - {sufijo}" if negocio != "SCONCHA" else f"SCONCHA - {sufijo}"
+    # Defecto de replicabilidad encontrado y corregido en la Fase 2: la
+    # version anterior anteponia "SCONCHA" al titulo sin importar el
+    # negocio (ej. "SCONCHA EL FARO - contable" para un negocio que no es
+    # SCONCHA), confuso para el dueno de otro negocio que ve su propio
+    # Sheet con el nombre de una cevicheria ajena. El titulo ahora usa solo
+    # el nombre configurado en config.yaml -> negocio. Para SCONCHA mismo
+    # el resultado no cambia ("SCONCHA - contable"), porque negocio ya es
+    # "SCONCHA".
+    titulo = f"{negocio} - {sufijo}"
 
     if id_actual:
         if dry_run:
