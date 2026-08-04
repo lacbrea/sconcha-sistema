@@ -1,0 +1,80 @@
+# =============================================================================
+# config.ejemplo.yaml
+# -----------------------------------------------------------------------------
+# Plantilla de configuración para instalar el sistema en OTRA empresa.
+# Copia este archivo como "config.yaml" (en la raíz del proyecto, junto a
+# procesar.py) y reemplaza cada valor de ejemplo por el dato real de la
+# empresa que estás dando de alta. "config.yaml" NUNCA se sube al repositorio
+# (ver .gitignore) porque contiene los IDs de los Google Sheets del negocio.
+#
+# Los datos de este archivo son FICTICIOS (empresa de ejemplo "LA CALETA").
+# No los uses tal cual: son solo para mostrar la forma que debe tener cada
+# campo.
+# =============================================================================
+
+# Nombre corto del negocio. Se usa en logs y en el asunto de los Sheets que
+# crea init_negocio.py. Una sola palabra o pocas, en mayúsculas, sin tildes.
+negocio: LA CALETA
+
+# Cuenta de Google dedicada y exclusiva de este negocio (ver paso 0 de
+# ONBOARDING.md). Es la cuenta con la que se instaló Google Drive para
+# escritorio y con la que se generaron las credenciales OAuth. Debe ser una
+# cuenta que NO se comparta con otro negocio ni con el uso personal de nadie.
+cuenta_google: administracion.lacaleta@gmail.com
+
+# Carpetas de trabajo dentro de Google Drive para escritorio. "raiz" es la
+# ruta local (en este equipo) a la carpeta raíz del negocio dentro de la
+# unidad "Mi unidad" sincronizada por Drive para escritorio. La letra de
+# unidad (G:, H:, etc.) la asigna Windows al instalar Drive para escritorio;
+# ábrela y verifica cuál te tocó. "buzon", "procesado" y "revisar" son
+# subcarpetas directas de "raiz" y deben coincidir exactamente con los
+# nombres de carpeta reales (init_negocio.py las crea si no existen).
+drive:
+  raiz: "G:/Mi unidad/LA CALETA"
+  buzon: "00_BUZON"
+  procesado: "01_PROCESADO"
+  revisar: "02_REVISAR"
+
+# Modelo de Claude usado por extractores/modelo.py para leer PDF e imágenes.
+# "esfuerzo" controla el nivel de esfuerzo de razonamiento (low/medium/high);
+# "low" alcanza para lectura de comprobantes y mantiene el costo bajo.
+modelo: claude-opus-5
+esfuerzo: low
+
+# Una entrada por cada razón social (RUC) que factura a nombre de este
+# negocio. "nombre_corto" es el identificador interno: se usa para nombrar
+# la carpeta de destino en 01_PROCESADO (los espacios se reemplazan por
+# guion bajo) y para las columnas de los Sheets. Debe ser estable: si lo
+# cambias después de la primera corrida, los comprobantes viejos y los
+# nuevos quedarán con nombres de empresa distintos.
+# "razon_social" es el nombre legal completo tal como figura en SUNAT.
+# "ruc" va entre comillas para que YAML no lo trate como número (perdería
+# ceros a la izquierda). "locales" es la lista de locales físicos que
+# facturan bajo este RUC; puede quedar vacía ([]) si el RUC no tiene local
+# propio (por ejemplo, una razón social usada solo para compras generales).
+empresas:
+  - nombre_corto: LA CALETA CENTRO
+    razon_social: LA CALETA CENTRO S.A.C.
+    ruc: "20123456789"
+    locales: [CENTRO]
+  - nombre_corto: LA CALETA NORTE
+    razon_social: INVERSIONES LA CALETA NORTE S.A.C.
+    ruc: "20198765432"
+    locales: [NORTE, NORTE2]
+    # OBLIGATORIO cuando la empresa tiene MAS DE UN local.
+    # Un comprobante nunca dice a que local corresponde: se emite a nombre de
+    # la razon social, no del establecimiento. El local es conocimiento de
+    # quien compra, no un dato del documento. Sin este valor TODOS los
+    # comprobantes de esta empresa irian a 02_REVISAR pidiendo asignacion
+    # manual y el sistema dejaria de ser util. Pon aqui el local que compra
+    # la mayor parte del tiempo; los pocos del otro local se corrigen a mano
+    # en el Sheet.
+    local_por_defecto: NORTE
+
+# IDs de los dos Google Sheets del negocio. Se dejan vacíos: init_negocio.py
+# crea los Sheets la primera vez que se corre y escribe aquí los IDs
+# resultantes. No los llenes a mano salvo que estés reconectando el sistema
+# a un Sheet ya existente.
+sheets:
+  contable: ""
+  detalle: ""
