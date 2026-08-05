@@ -7,6 +7,12 @@ registrados directamente en sys.modules ANTES de importar procesar, así que
 procesar.py se importa igual aunque esos archivos no existan en disco
 todavía (los están escribiendo otros dos agentes en paralelo).
 
+El trato con Google Drive (almacen_drive.AlmacenDrive) se sustituye por
+AlmacenDriveFalso, un doble en memoria que implementa la misma interfaz sin
+pasar por googleapiclient en absoluto: eso se prueba aparte, contra un
+doble del Resource real, en tests/test_almacen_drive.py. Acá lo que se
+prueba es que procesar.py orquesta correctamente esas llamadas.
+
 Correr con:
     C:\\Python312\\python.exe -m pytest tests/test_procesar.py -q
 """
@@ -183,17 +189,84 @@ class ComprobanteFalso:
 
 
 # -----------------------------------------------------------------------------
+# Doble en memoria de AlmacenDrive (orquestación de procesar.py). El doble
+# del Resource de drive v3 (googleapiclient) se prueba aparte, en
+# tests/test_almacen_drive.py, contra la clase real.
+# -----------------------------------------------------------------------------
+class AlmacenDriveFalso:
+    def __init__(self, servicio_drive=None):
+        self._contador = 0
+        self.archivos: dict[str, dict] = {}
+        self.carpetas: dict[str, dict] = {}
+        self.textos_creados: list[tuple[str, str, str]] = []
+        self.movimientos: list[tuple[str, str, str | None]] = []
+        self.carpetas_aseguradas: list[tuple[str, str | None]] = []
+
+    def _nuevo_id(self, prefijo: str) -> str:
+        self._contador += 1
+        return f"{prefijo}-{self._contador}"
+
+    # -- helpers de test para poblar estado -------------------------------
+    def agregar_archivo(self, carpeta_id: str, nombre: str, contenido: bytes = b"contenido de prueba") -> str:
+        file_id = self._nuevo_id("archivo")
+        self.archivos[file_id] = {"name": nombre, "parent": carpeta_id, "contenido": contenido, "mimeType": "application/octet-stream"}
+        return file_id
+
+    def agregar_carpeta(self, nombre: str, padre_id: str | None = None) -> str:
+        carpeta_id = self._nuevo_id("carpeta")
+        self.carpetas[carpeta_id] = {"nombre": nombre, "padre_id": padre_id}
+        return carpeta_id
+
+    # -- interfaz de AlmacenDrive ------------------------------------------
+    def listar(self, carpeta_id: str) -> list[dict]:
+        return [
+            {"id": fid, "name": f["name"], "mimeType": f["mimeType"], "size": len(f["contenido"])}
+            for fid, f in self.archivos.items()
+            if f["parent"] == carpeta_id
+        ]
+
+    def descargar(self, file_id: str, destino):
+        destino = pathlib.Path(destino)
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_bytes(self.archivos[file_id]["contenido"])
+        return destino
+
+    def mover(self, file_id: str, carpeta_destino_id: str, nuevo_nombre: str | None = None) -> None:
+        self.movimientos.append((file_id, carpeta_destino_id, nuevo_nombre))
+        archivo = self.archivos[file_id]
+        archivo["parent"] = carpeta_destino_id
+        if nuevo_nombre:
+            archivo["name"] = nuevo_nombre
+
+    def crear_texto(self, carpeta_id: str, nombre: str, contenido: str) -> str:
+        file_id = self._nuevo_id("texto")
+        self.archivos[file_id] = {
+            "name": nombre, "parent": carpeta_id, "contenido": contenido.encode("utf-8"), "mimeType": "text/plain"
+        }
+        self.textos_creados.append((carpeta_id, nombre, contenido))
+        return file_id
+
+    def enlace(self, file_id: str) -> str:
+        return f"https://drive.google.com/file/d/{file_id}/view"
+
+    def asegurar_carpeta(self, nombre: str, padre_id: str | None = None) -> str:
+        self.carpetas_aseguradas.append((nombre, padre_id))
+        for cid, c in self.carpetas.items():
+            if c["nombre"] == nombre and c["padre_id"] == padre_id:
+                return cid
+        return self.agregar_carpeta(nombre, padre_id)
+
+
+# -----------------------------------------------------------------------------
 # Fixtures / helpers de prueba
 # -----------------------------------------------------------------------------
-def _config_base(tmp_path: pathlib.Path) -> dict:
+def _config_base() -> dict:
     return {
         "negocio": "SCONCHA",
         "cuenta_google": "administracion.sconcha@gmail.com",
         "drive": {
-            "raiz": str(tmp_path),
-            "buzon": "00_BUZON",
-            "procesado": "01_PROCESADO",
-            "revisar": "02_REVISAR",
+            "raiz_nombre": "SCONCHA",
+            "carpetas": {"raiz": "", "buzon": "", "procesado": "", "revisar": ""},
         },
         "modelo": "claude-opus-5",
         "esfuerzo": "low",
@@ -206,36 +279,52 @@ def _config_base(tmp_path: pathlib.Path) -> dict:
     }
 
 
-def _entorno(tmp_path: pathlib.Path):
-    config = _config_base(tmp_path)
-    carpeta_buzon = tmp_path / "00_BUZON"
-    carpeta_procesado = tmp_path / "01_PROCESADO"
-    carpeta_revisar = tmp_path / "02_REVISAR"
-    carpeta_buzon.mkdir(parents=True, exist_ok=True)
+def _entorno():
+    config = _config_base()
+    almacen = AlmacenDriveFalso()
+    carpeta_raiz_id = almacen.agregar_carpeta("SCONCHA")
+    carpeta_buzon_id = almacen.agregar_carpeta("00_BUZON", carpeta_raiz_id)
+    carpeta_procesado_id = almacen.agregar_carpeta("01_PROCESADO", carpeta_raiz_id)
+    carpeta_revisar_id = almacen.agregar_carpeta("02_REVISAR", carpeta_raiz_id)
+    config["drive"]["carpetas"] = {
+        "raiz": carpeta_raiz_id,
+        "buzon": carpeta_buzon_id,
+        "procesado": carpeta_procesado_id,
+        "revisar": carpeta_revisar_id,
+    }
     registro = _RegistroFalso(config)
     catalogo_obj = _CatalogoFalso(None)
-    resolutor = procesar.ResolutorLinkDrive(None, config)  # servicio_drive=None -> nunca hace red
-    return config, carpeta_buzon, carpeta_procesado, carpeta_revisar, registro, catalogo_obj, resolutor
+    return config, almacen, carpeta_buzon_id, carpeta_procesado_id, carpeta_revisar_id, registro, catalogo_obj
 
 
-def _crear_archivo(carpeta: pathlib.Path, nombre: str, contenido: bytes = b"contenido de prueba") -> pathlib.Path:
+def _crear_archivo_local(carpeta: pathlib.Path, nombre: str, contenido: bytes = b"contenido de prueba") -> pathlib.Path:
+    """Crea un archivo real en disco. Solo lo usa test_clasificacion_por_extension,
+    que ejercita extraer_comprobante() directo (sigue recibiendo pathlib.Path,
+    eso no cambió: lo que cambió es cómo procesar.py obtiene esa ruta local
+    -descargándola de Drive a un temporal- antes de llamarlo)."""
     carpeta.mkdir(parents=True, exist_ok=True)
     ruta = carpeta / nombre
     ruta.write_bytes(contenido)
     return ruta
 
 
-def _procesar_uno(ruta, respaldos, config, registro, catalogo_obj, resolutor, procesado, revisar, dry_run=False):
+def _crear_archivo(almacen: AlmacenDriveFalso, carpeta_id: str, nombre: str, contenido: bytes = b"contenido de prueba") -> "procesar.ArchivoDrive":
+    file_id = almacen.agregar_archivo(carpeta_id, nombre, contenido)
+    return procesar.ArchivoDrive(id=file_id, name=nombre, mime_type="application/octet-stream", size=len(contenido))
+
+
+def _procesar_uno(archivo, respaldos, config, registro, catalogo_obj, almacen, carpeta_procesado_id, carpeta_revisar_id, dry_run=False):
     return procesar.procesar_uno(
-        ruta,
+        archivo,
         respaldos,
         config=config,
         registro=registro,
         catalogo_obj=catalogo_obj,
-        resolutor_link=resolutor,
+        almacen=almacen,
         claves_procesadas_en_lote=set(),
-        carpeta_procesado=procesado,
-        carpeta_revisar=revisar,
+        nombres_por_carpeta={},
+        carpeta_procesado_id=carpeta_procesado_id,
+        carpeta_revisar_id=carpeta_revisar_id,
         dry_run=dry_run,
     )
 
@@ -257,11 +346,11 @@ def test_clasificacion_por_extension(tmp_path):
     _modulo_xml_ubl.extraer = falso_xml
     _modulo_extractor_modelo.extraer = falso_modelo
 
-    ruta_xml = _crear_archivo(tmp_path, "a.xml")
-    ruta_zip = _crear_archivo(tmp_path, "b.zip")
-    ruta_pdf = _crear_archivo(tmp_path, "c.pdf")
-    ruta_jpg = _crear_archivo(tmp_path, "d.jpg")
-    ruta_png = _crear_archivo(tmp_path, "e.png")
+    ruta_xml = _crear_archivo_local(tmp_path, "a.xml")
+    ruta_zip = _crear_archivo_local(tmp_path, "b.zip")
+    ruta_pdf = _crear_archivo_local(tmp_path, "c.pdf")
+    ruta_jpg = _crear_archivo_local(tmp_path, "d.jpg")
+    ruta_png = _crear_archivo_local(tmp_path, "e.png")
 
     procesar.extraer_comprobante(ruta_xml, ".xml")
     procesar.extraer_comprobante(ruta_zip, ".zip")
@@ -278,10 +367,10 @@ def test_clasificacion_por_extension(tmp_path):
     ]
 
 
-def test_construir_planes_agrupa_xml_y_pdf_por_nombre(tmp_path):
-    xml = _crear_archivo(tmp_path, "F001-1.xml")
-    pdf_respaldo = _crear_archivo(tmp_path, "F001-1.pdf")
-    pdf_suelto = _crear_archivo(tmp_path, "F001-2.pdf")
+def test_construir_planes_agrupa_xml_y_pdf_por_nombre():
+    xml = procesar.ArchivoDrive(id="1", name="F001-1.xml", mime_type="text/xml")
+    pdf_respaldo = procesar.ArchivoDrive(id="2", name="F001-1.pdf", mime_type="application/pdf")
+    pdf_suelto = procesar.ArchivoDrive(id="3", name="F001-2.pdf", mime_type="application/pdf")
 
     planes = procesar.construir_planes([xml, pdf_respaldo, pdf_suelto])
 
@@ -293,45 +382,57 @@ def test_construir_planes_agrupa_xml_y_pdf_por_nombre(tmp_path):
 
 
 # -----------------------------------------------------------------------------
+# nombre_destino_unico (reemplaza el viejo ruta_destino_unica basado en disco)
+# -----------------------------------------------------------------------------
+def test_nombre_destino_unico_devuelve_igual_si_no_choca():
+    assert procesar.nombre_destino_unico(set(), "x.xml") == "x.xml"
+
+
+def test_nombre_destino_unico_agrega_sufijos_incrementales():
+    existentes = {"x.xml", "x_2.xml"}
+    assert procesar.nombre_destino_unico(existentes, "x.xml") == "x_3.xml"
+
+
+# -----------------------------------------------------------------------------
 # .heic va a revisar
 # -----------------------------------------------------------------------------
-def test_heic_va_a_revisar(tmp_path):
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
-    ruta = _crear_archivo(buzon, "foto.heic")
+def test_heic_va_a_revisar():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    archivo = _crear_archivo(almacen, buzon_id, "foto.heic")
 
-    resultado = _procesar_uno(ruta, [], config, registro, cat, resolutor, procesado, revisar)
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
 
     assert resultado.estado == "revisar"
     assert resultado.motivo == procesar.MOTIVO_HEIC
-    assert not ruta.exists()
-    assert (revisar / "foto.heic").exists()
-    assert (revisar / "foto.heic.motivo.txt").read_text(encoding="utf-8") == procesar.MOTIVO_HEIC
+    assert almacen.archivos[archivo.id]["parent"] == revisar_id
+    assert almacen.archivos[archivo.id]["name"] == "foto.heic"
+    motivo_id = next(fid for fid, f in almacen.archivos.items() if f["name"] == "foto.heic.motivo.txt")
+    assert almacen.archivos[motivo_id]["contenido"] == procesar.MOTIVO_HEIC.encode("utf-8")
     assert registro.escritos == []
 
 
 # -----------------------------------------------------------------------------
 # RUC de cliente desconocido va a revisar
 # -----------------------------------------------------------------------------
-def test_ruc_cliente_desconocido_va_a_revisar(tmp_path):
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
+def test_ruc_cliente_desconocido_va_a_revisar():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
     _modulo_xml_ubl.extraer = lambda ruta: ComprobanteFalso(cliente_ruc="99999999999")
-    ruta = _crear_archivo(buzon, "f.xml")
+    archivo = _crear_archivo(almacen, buzon_id, "f.xml")
 
-    resultado = _procesar_uno(ruta, [], config, registro, cat, resolutor, procesado, revisar)
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
 
     assert resultado.estado == "revisar"
     assert "no corresponde a ninguna empresa" in resultado.motivo
-    assert not ruta.exists()
-    assert (revisar / "f.xml").exists()
+    assert almacen.archivos[archivo.id]["parent"] == revisar_id
     assert registro.escritos == []
 
 
-def test_sin_ruc_cliente_va_a_revisar(tmp_path):
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
+def test_sin_ruc_cliente_va_a_revisar():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
     _modulo_xml_ubl.extraer = lambda ruta: ComprobanteFalso(cliente_ruc=None)
-    ruta = _crear_archivo(buzon, "f.xml")
+    archivo = _crear_archivo(almacen, buzon_id, "f.xml")
 
-    resultado = _procesar_uno(ruta, [], config, registro, cat, resolutor, procesado, revisar)
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
 
     assert resultado.estado == "revisar"
     assert "no trae RUC de cliente" in resultado.motivo
@@ -341,40 +442,36 @@ def test_sin_ruc_cliente_va_a_revisar(tmp_path):
 # -----------------------------------------------------------------------------
 # Duplicado va a revisar sin escribir
 # -----------------------------------------------------------------------------
-def test_duplicado_va_a_revisar_sin_escribir(tmp_path):
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
+def test_duplicado_va_a_revisar_sin_escribir():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
     comp = ComprobanteFalso()
     _modulo_xml_ubl.extraer = lambda ruta: comp
     registro._claves_existentes.add(comp.clave())
-    ruta = _crear_archivo(buzon, "f.xml")
+    archivo = _crear_archivo(almacen, buzon_id, "f.xml")
 
-    resultado = _procesar_uno(ruta, [], config, registro, cat, resolutor, procesado, revisar)
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
 
     assert resultado.estado == "duplicado"
     assert "duplicado" in resultado.motivo
     assert registro.escritos == []
-    assert not ruta.exists()
-    assert (revisar / "f.xml").exists()
+    assert almacen.archivos[archivo.id]["parent"] == revisar_id
 
 
 # -----------------------------------------------------------------------------
 # Caso feliz: procesado, con emparejado de ítems
 # -----------------------------------------------------------------------------
-def test_comprobante_valido_se_procesa_y_empareja_items(tmp_path):
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
+def test_comprobante_valido_se_procesa_y_empareja_items():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
     item = ItemFalso(descripcion="ACEITE CRISOL X20 LT")
     comp = ComprobanteFalso(items=[item])
     _modulo_xml_ubl.extraer = lambda ruta: comp
-
-    _modulo_catalogo.Catalogo = _CatalogoFalso  # por si otro test lo cambió
-    cat_local = _CatalogoFalso(None)
 
     class CatalogoConMatch(_CatalogoFalso):
         def emparejar(self, descripcion):
             return "ACEITE CRISOL X20 LT", "ABARROTES", 0.95
 
-    ruta = _crear_archivo(buzon, "f.xml")
-    resultado = _procesar_uno(ruta, [], config, registro, CatalogoConMatch(None), resolutor, procesado, revisar)
+    archivo = _crear_archivo(almacen, buzon_id, "f.xml")
+    resultado = _procesar_uno(archivo, [], config, registro, CatalogoConMatch(None), almacen, procesado_id, revisar_id)
 
     assert resultado.estado == "procesado"
     assert resultado.n_items == 1
@@ -384,22 +481,30 @@ def test_comprobante_valido_se_procesa_y_empareja_items(tmp_path):
     assert len(registro.escritos) == 1
     assert registro.escritos[0]["empresa"] == "INSTITUCION"
     assert registro.escritos[0]["local"] == "MIRAFLORES"
-    assert not ruta.exists()
+    assert registro.escritos[0]["link_drive"] == f"https://drive.google.com/file/d/{archivo.id}/view"
 
-    destino_esperado = procesado / "2026-07" / "INSTITUCION" / procesar.nombre_destino(comp, ".xml")
-    assert destino_esperado.exists()
+    nombre_esperado = procesar.nombre_destino(comp, ".xml")
+    assert almacen.archivos[archivo.id]["name"] == nombre_esperado
+    carpeta_destino_id = almacen.archivos[archivo.id]["parent"]
+    assert carpeta_destino_id != buzon_id
+
+    carpeta_empresa = almacen.carpetas[carpeta_destino_id]
+    assert carpeta_empresa["nombre"] == "INSTITUCION"
+    carpeta_mes = almacen.carpetas[carpeta_empresa["padre_id"]]
+    assert carpeta_mes["nombre"] == "2026-07"
+    assert carpeta_mes["padre_id"] == procesado_id
 
 
 # -----------------------------------------------------------------------------
 # Un archivo que falla no detiene el lote
 # -----------------------------------------------------------------------------
-def test_archivo_que_falla_no_detiene_el_lote(tmp_path):
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
+def test_archivo_que_falla_no_detiene_el_lote(tmp_path, monkeypatch):
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
     ruta_config = tmp_path / "config.yaml"
     ruta_config.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
 
-    ruta_mala = _crear_archivo(buzon, "malo.xml")
-    ruta_buena = _crear_archivo(buzon, "bueno.xml")
+    archivo_malo = _crear_archivo(almacen, buzon_id, "malo.xml")
+    archivo_bueno = _crear_archivo(almacen, buzon_id, "bueno.xml")
 
     comp_bueno = ComprobanteFalso(serie_numero="F001-999", total=50.0)
 
@@ -410,6 +515,7 @@ def test_archivo_que_falla_no_detiene_el_lote(tmp_path):
 
     _modulo_xml_ubl.extraer = extraer_falible
     _modulo_registro_sheets.Registro = lambda cfg: registro
+    monkeypatch.setattr(procesar, "AlmacenDrive", lambda servicio: almacen)
 
     try:
         codigo = procesar.main(["--config", str(ruta_config)])
@@ -417,11 +523,11 @@ def test_archivo_que_falla_no_detiene_el_lote(tmp_path):
         _modulo_registro_sheets.Registro = _RegistroFalso
 
     assert codigo == 0
-    assert not ruta_mala.exists()
-    assert (revisar / "malo.xml").exists()
-    assert "XML corrupto de prueba" in (revisar / "malo.xml.motivo.txt").read_text(encoding="utf-8")
+    assert almacen.archivos[archivo_malo.id]["parent"] == revisar_id
+    motivo_id = next(fid for fid, f in almacen.archivos.items() if f["name"] == "malo.xml.motivo.txt")
+    assert "XML corrupto de prueba" in almacen.archivos[motivo_id]["contenido"].decode("utf-8")
 
-    assert not ruta_buena.exists()
+    assert almacen.archivos[archivo_bueno.id]["parent"] not in (buzon_id, revisar_id)
     assert len(registro.escritos) == 1
     assert registro.escritos[0]["archivo"] == procesar.nombre_destino(comp_bueno, ".xml")
 
@@ -429,8 +535,8 @@ def test_archivo_que_falla_no_detiene_el_lote(tmp_path):
 # -----------------------------------------------------------------------------
 # Ningún archivo se borra jamás
 # -----------------------------------------------------------------------------
-def test_ningun_archivo_se_borra(tmp_path):
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
+def test_ningun_archivo_se_borra(tmp_path, monkeypatch):
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
     ruta_config = tmp_path / "config.yaml"
     ruta_config.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
 
@@ -445,10 +551,11 @@ def test_ningun_archivo_se_borra(tmp_path):
 
     _modulo_xml_ubl.extraer = extraer
     _modulo_registro_sheets.Registro = lambda cfg: registro
+    monkeypatch.setattr(procesar, "AlmacenDrive", lambda servicio: almacen)
 
-    _crear_archivo(buzon, "bueno.xml")
-    _crear_archivo(buzon, "duplicado.xml")
-    _crear_archivo(buzon, "foto.heic")
+    id_bueno = _crear_archivo(almacen, buzon_id, "bueno.xml").id
+    id_dup = _crear_archivo(almacen, buzon_id, "duplicado.xml").id
+    id_heic = _crear_archivo(almacen, buzon_id, "foto.heic").id
 
     try:
         codigo = procesar.main(["--config", str(ruta_config)])
@@ -457,58 +564,49 @@ def test_ningun_archivo_se_borra(tmp_path):
 
     assert codigo == 0
 
-    archivos_reales = [
-        p for p in tmp_path.rglob("*")
-        if p.is_file() and p.suffix != ".yaml" and not p.name.endswith(".motivo.txt")
-    ]
-    assert len(archivos_reales) == 3
-    nombres_encontrados = {p.name for p in archivos_reales}
-    assert nombres_encontrados == {"foto.heic", procesar.nombre_destino(comp_ok, ".xml"), "duplicado.xml"}
+    # AlmacenDriveFalso no tiene método de borrado: ningún id original puede
+    # haber desaparecido, solo cambiar de padre/nombre.
+    assert {id_bueno, id_dup, id_heic} <= set(almacen.archivos.keys())
+    assert almacen.listar(buzon_id) == []  # el buzón quedó vacío: todo se movió
+
+    assert almacen.archivos[id_bueno]["parent"] not in (buzon_id, revisar_id)
+    assert almacen.archivos[id_bueno]["name"] == procesar.nombre_destino(comp_ok, ".xml")
+    assert almacen.archivos[id_dup]["parent"] == revisar_id
+    assert almacen.archivos[id_heic]["parent"] == revisar_id
 
 
 # -----------------------------------------------------------------------------
 # El renombrado nunca sobrescribe un archivo existente en el destino
 # -----------------------------------------------------------------------------
-def test_renombrado_no_sobrescribe(tmp_path):
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
+def test_renombrado_no_sobrescribe():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
     comp = ComprobanteFalso(proveedor_ruc="20100000001", serie_numero="F001-500", total=200.0)
     _modulo_xml_ubl.extraer = lambda ruta: comp
 
     nombre_esperado = procesar.nombre_destino(comp, ".xml")
-    carpeta_destino = procesado / procesar.anio_mes(comp) / procesar.nombre_empresa_carpeta("INSTITUCION")
-    carpeta_destino.mkdir(parents=True, exist_ok=True)
-    archivo_previo = carpeta_destino / nombre_esperado
-    archivo_previo.write_bytes(b"CONTENIDO_ORIGINAL_NO_TOCAR")
+    carpeta_mes_id = almacen.agregar_carpeta(procesar.anio_mes(comp), procesado_id)
+    carpeta_empresa_id = almacen.agregar_carpeta("INSTITUCION", carpeta_mes_id)
+    id_previo = almacen.agregar_archivo(carpeta_empresa_id, nombre_esperado, b"CONTENIDO_ORIGINAL_NO_TOCAR")
 
-    ruta = _crear_archivo(buzon, "nuevo.xml", b"CONTENIDO_NUEVO")
-    resultado = _procesar_uno(ruta, [], config, registro, cat, resolutor, procesado, revisar)
+    archivo = _crear_archivo(almacen, buzon_id, "nuevo.xml", b"CONTENIDO_NUEVO")
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
 
     assert resultado.estado == "procesado"
-    assert archivo_previo.read_bytes() == b"CONTENIDO_ORIGINAL_NO_TOCAR"
+    assert almacen.archivos[id_previo]["contenido"] == b"CONTENIDO_ORIGINAL_NO_TOCAR"
+    assert almacen.archivos[id_previo]["name"] == nombre_esperado
 
-    hermanos = {p.name: p.read_bytes() for p in carpeta_destino.iterdir()}
-    assert len(hermanos) == 2
     stem, ext = nombre_esperado.rsplit(".", 1)
     nombre_con_sufijo = f"{stem}_2.{ext}"
-    assert nombre_con_sufijo in hermanos
-    assert hermanos[nombre_con_sufijo] == b"CONTENIDO_NUEVO"
-    assert hermanos[nombre_esperado] == b"CONTENIDO_ORIGINAL_NO_TOCAR"
-
-
-def test_ruta_destino_unica_agrega_sufijos_incrementales(tmp_path):
-    (tmp_path / "x.xml").write_bytes(b"1")
-    (tmp_path / "x_2.xml").write_bytes(b"2")
-
-    destino = procesar.ruta_destino_unica(tmp_path, "x.xml")
-
-    assert destino.name == "x_3.xml"
+    assert almacen.archivos[archivo.id]["name"] == nombre_con_sufijo
+    assert almacen.archivos[archivo.id]["parent"] == carpeta_empresa_id
 
 
 # -----------------------------------------------------------------------------
-# --dry-run no escribe ni mueve nada
+# --dry-run no escribe ni mueve nada en Drive
 # -----------------------------------------------------------------------------
-def test_dry_run_no_mueve_y_delega_escritura_en_registro(tmp_path):
-    """En dry-run no se mueve nada, pero la escritura SÍ se delega en Registro.
+def test_dry_run_no_mueve_y_delega_escritura_en_registro():
+    """En dry-run no se mueve nada en Drive, pero la escritura SÍ se delega
+    en Registro.
 
     El contrato cambió a propósito: antes procesar.py cortaba antes de llamar
     a `registro.escribir()` en dry-run, lo que dejaba muerto el modo CSV de
@@ -518,14 +616,46 @@ def test_dry_run_no_mueve_y_delega_escritura_en_registro(tmp_path):
     ejercita el mismo camino de código que la real (construcción de filas,
     orden de columnas, emparejado de ítems) en vez de solo anunciarlo.
     """
-    config, buzon, procesado, revisar, registro, cat, resolutor = _entorno(tmp_path)
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
     comp = ComprobanteFalso()
     _modulo_xml_ubl.extraer = lambda ruta: comp
-    ruta = _crear_archivo(buzon, "f.xml")
+    archivo = _crear_archivo(almacen, buzon_id, "f.xml")
 
-    resultado = _procesar_uno(ruta, [], config, registro, cat, resolutor, procesado, revisar, dry_run=True)
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id, dry_run=True)
 
     assert resultado.estado == "procesado"
-    assert ruta.exists()  # no se movió: eso es lo que dry-run garantiza
-    assert not any(procesado.rglob("*")), "dry-run no debe crear nada en 01_PROCESADO"
+    assert almacen.archivos[archivo.id]["parent"] == buzon_id  # no se movió
+    assert almacen.movimientos == []
+    assert almacen.carpetas_aseguradas == []  # no se creó ninguna subcarpeta
+    assert almacen.textos_creados == []
     assert len(registro.escritos) == 1  # se delegó en Registro, que decide el destino
+
+
+def test_main_dry_run_llama_a_drive_pero_no_escribe(tmp_path, monkeypatch):
+    """--dry-run sigue necesitando autenticarse contra Drive (listar y
+    descargar son lecturas contra la API, ya no lectura de disco local),
+    pero no debe mover nada, ni crear carpetas, ni crear .motivo.txt."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    ruta_config = tmp_path / "config.yaml"
+    ruta_config.write_text(yaml.safe_dump(config, allow_unicode=True), encoding="utf-8")
+
+    comp = ComprobanteFalso()
+    _modulo_xml_ubl.extraer = lambda ruta: comp
+    _modulo_registro_sheets.Registro = lambda cfg: registro
+    _crear_archivo(almacen, buzon_id, "f.xml")
+
+    llamadas_servicio_drive = []
+    monkeypatch.setattr(_modulo_auth_google, "servicio_drive", lambda: llamadas_servicio_drive.append(1) or None)
+    monkeypatch.setattr(procesar, "AlmacenDrive", lambda servicio: almacen)
+
+    try:
+        codigo = procesar.main(["--config", str(ruta_config), "--dry-run"])
+    finally:
+        _modulo_registro_sheets.Registro = _RegistroFalso
+
+    assert codigo == 0
+    assert llamadas_servicio_drive == [1]  # se autenticó igual, aunque sea dry-run
+    assert almacen.movimientos == []
+    assert almacen.textos_creados == []
+    assert almacen.carpetas_aseguradas == []
+    assert len(registro.escritos) == 1
