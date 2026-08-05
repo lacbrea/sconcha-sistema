@@ -18,6 +18,29 @@ import registro_sheets  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
+# Doble mínimo de AlmacenDrive para probar preparar_carpetas() (la única
+# función de init_negocio.py que la usa, y solo llama a asegurar_carpeta()).
+# El doble del Resource de drive v3 (googleapiclient) se prueba aparte,
+# contra AlmacenDrive real, en tests/test_almacen_drive.py.
+# ---------------------------------------------------------------------------
+class _FakeAlmacenCarpetas:
+    def __init__(self):
+        self.llamadas: list[tuple[str, str | None]] = []
+        self._contador = 0
+        self._existentes: dict[tuple[str, str | None], str] = {}
+
+    def asegurar_carpeta(self, nombre, padre_id=None):
+        clave = (nombre, padre_id)
+        if clave in self._existentes:
+            return self._existentes[clave]
+        self._contador += 1
+        nuevo_id = f"carpeta-{self._contador}"
+        self._existentes[clave] = nuevo_id
+        self.llamadas.append(clave)
+        return nuevo_id
+
+
+# ---------------------------------------------------------------------------
 # Doble de prueba del Resource de sheets v4 (googleapiclient), sin red.
 # Cubre los métodos que usa init_negocio.py: spreadsheets().get() (verificar
 # accesibilidad), spreadsheets().create() y spreadsheets().values().update()
@@ -78,15 +101,13 @@ class FakeServicioSheets:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _config_minima(tmp_path: pathlib.Path, negocio: str = "LA CALETA") -> dict:
+def _config_minima(negocio: str = "LA CALETA") -> dict:
     return {
         "negocio": negocio,
         "cuenta_google": "administracion.lacaleta@gmail.com",
         "drive": {
-            "raiz": str(tmp_path / "RAIZ"),
-            "buzon": "00_BUZON",
-            "procesado": "01_PROCESADO",
-            "revisar": "02_REVISAR",
+            "raiz_nombre": negocio,
+            "carpetas": {"raiz": "", "buzon": "", "procesado": "", "revisar": ""},
         },
         "sheets": {"contable": "", "detalle": ""},
     }
@@ -126,22 +147,21 @@ def test_encabezados_detalle_longitud_correcta():
 # --dry-run: no toca disco ni llama a la API de Google.
 # ---------------------------------------------------------------------------
 def test_dry_run_no_crea_carpetas(tmp_path, capsys):
-    config = _config_minima(tmp_path)
+    config = _config_minima()
     ruta_config = tmp_path / "config.yaml"
     _escribir_config_yaml(ruta_config, config)
 
     codigo = init_negocio.main(["--config", str(ruta_config), "--dry-run"])
 
     assert codigo == 0
-    assert not (tmp_path / "RAIZ").exists()
     salida = capsys.readouterr().out
     assert "DRY-RUN" in salida
 
 
 def test_dry_run_no_importa_ni_llama_auth_google(tmp_path, monkeypatch):
-    """auth_google (y por lo tanto la API de Google) no debe ni siquiera
-    importarse en modo --dry-run: si el código intentara autenticar, este
-    doble saboteado lo delataría."""
+    """auth_google (y por lo tanto la API de Google, tanto Sheets como
+    Drive) no debe ni siquiera importarse en modo --dry-run: si el código
+    intentara autenticar, este doble saboteado lo delataría."""
     llamadas: list[str] = []
 
     class _AuthGoogleSaboteado:
@@ -153,9 +173,14 @@ def test_dry_run_no_importa_ni_llama_auth_google(tmp_path, monkeypatch):
             llamadas.append("servicio_sheets")
             raise AssertionError("--dry-run no debe llamar a auth_google.servicio_sheets()")
 
+        @staticmethod
+        def servicio_drive():
+            llamadas.append("servicio_drive")
+            raise AssertionError("--dry-run no debe llamar a auth_google.servicio_drive()")
+
     monkeypatch.setitem(sys.modules, "auth_google", _AuthGoogleSaboteado)
 
-    config = _config_minima(tmp_path)
+    config = _config_minima()
     ruta_config = tmp_path / "config.yaml"
     _escribir_config_yaml(ruta_config, config)
 
@@ -166,7 +191,7 @@ def test_dry_run_no_importa_ni_llama_auth_google(tmp_path, monkeypatch):
 
 
 def test_dry_run_no_escribe_config_yaml(tmp_path):
-    config = _config_minima(tmp_path)
+    config = _config_minima()
     ruta_config = tmp_path / "config.yaml"
     _escribir_config_yaml(ruta_config, config)
     texto_original = ruta_config.read_text(encoding="utf-8")
@@ -179,29 +204,228 @@ def test_dry_run_no_escribe_config_yaml(tmp_path):
 # ---------------------------------------------------------------------------
 # Idempotencia de carpetas: si ya existen, no falla ni las duplica.
 # ---------------------------------------------------------------------------
-def test_preparar_carpetas_es_idempotente(tmp_path):
-    config = _config_minima(tmp_path)
+def test_preparar_carpetas_es_idempotente():
+    config = _config_minima()
+    almacen = _FakeAlmacenCarpetas()
 
-    init_negocio.preparar_carpetas(config, dry_run=False)
-    raiz = tmp_path / "RAIZ"
-    assert raiz.exists()
-    subcarpetas_creadas = sorted(p.name for p in raiz.iterdir())
-    assert subcarpetas_creadas == ["00_BUZON", "01_PROCESADO", "02_REVISAR"]
+    ids_1 = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+    assert set(ids_1) == {"raiz", "buzon", "procesado", "revisar"}
+    assert all(ids_1.values())  # ningún id vacío
+    assert len(almacen.llamadas) == 4  # una asegurar_carpeta() por carpeta
 
-    # Segunda corrida: no debe fallar ni duplicar nada.
-    init_negocio.preparar_carpetas(config, dry_run=False)
-    assert sorted(p.name for p in raiz.iterdir()) == subcarpetas_creadas
+    # Segunda corrida: no debe fallar ni duplicar nada (mismos ids, no crece
+    # la lista de llamadas efectivas -asegurar_carpeta() es idempotente-).
+    ids_2 = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+    assert ids_2 == ids_1
+    assert len(almacen.llamadas) == 4
 
 
-def test_preparar_carpetas_reporta_reutilizacion(tmp_path, capsys):
-    config = _config_minima(tmp_path)
-    init_negocio.preparar_carpetas(config, dry_run=False)
-    capsys.readouterr()  # descarta la salida de la primera corrida
+def test_preparar_carpetas_arma_la_jerarquia_correcta():
+    config = _config_minima(negocio="EL FARO")
+    almacen = _FakeAlmacenCarpetas()
 
-    init_negocio.preparar_carpetas(config, dry_run=False)
+    ids = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+
+    # buzon/procesado/revisar cuelgan de la raíz, que a su vez cuelga de
+    # 'root' (padre_id=None en asegurar_carpeta significa "Mi unidad").
+    assert (init_negocio.NOMBRE_BUZON, ids["raiz"]) in almacen.llamadas
+    assert (init_negocio.NOMBRE_PROCESADO, ids["raiz"]) in almacen.llamadas
+    assert (init_negocio.NOMBRE_REVISAR, ids["raiz"]) in almacen.llamadas
+    assert ("EL FARO", None) in almacen.llamadas
+
+
+def test_preparar_carpetas_dry_run_no_toca_el_almacen():
+    config = _config_minima()
+
+    resultado = init_negocio.preparar_carpetas(config, None, dry_run=True)
+
+    assert resultado == {}
+
+
+# ---------------------------------------------------------------------------
+# Carpeta CONCILIACION: opcional, solo se crea si config.yaml trae la
+# sección 'conciliacion'. Ver docstring de NOMBRE_CONCILIACION en
+# init_negocio.py para el porqué.
+# ---------------------------------------------------------------------------
+def test_preparar_carpetas_crea_conciliacion_si_la_seccion_existe():
+    config = _config_minima()
+    config["conciliacion"] = {"carpeta": "", "empresas": []}
+    almacen = _FakeAlmacenCarpetas()
+
+    ids = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+
+    assert set(ids) == {"raiz", "buzon", "procesado", "revisar", "conciliacion"}
+    assert ids["conciliacion"]
+    assert (init_negocio.NOMBRE_CONCILIACION, ids["raiz"]) in almacen.llamadas
+
+
+def test_preparar_carpetas_no_crea_conciliacion_si_no_hay_seccion():
+    config = _config_minima()
+    assert "conciliacion" not in config
+    almacen = _FakeAlmacenCarpetas()
+
+    ids = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+
+    assert set(ids) == {"raiz", "buzon", "procesado", "revisar"}
+    assert not any(nombre == init_negocio.NOMBRE_CONCILIACION for nombre, _ in almacen.llamadas)
+
+
+def test_preparar_carpetas_dry_run_informa_conciliacion_si_hay_seccion(capsys):
+    config = _config_minima()
+    config["conciliacion"] = {"carpeta": "", "empresas": []}
+
+    init_negocio.preparar_carpetas(config, None, dry_run=True)
+
     salida = capsys.readouterr().out
-    assert "ya existía" in salida
-    assert "creada:" not in salida
+    assert init_negocio.NOMBRE_CONCILIACION in salida
+    assert "no se crearía la carpeta CONCILIACION" not in salida
+
+
+def test_preparar_carpetas_dry_run_informa_que_no_hay_conciliacion_sin_seccion(capsys):
+    config = _config_minima()
+    assert "conciliacion" not in config
+
+    init_negocio.preparar_carpetas(config, None, dry_run=True)
+
+    salida = capsys.readouterr().out
+    assert "no se crearía la carpeta CONCILIACION" in salida
+
+
+# ---------------------------------------------------------------------------
+# _actualizar_carpeta_conciliacion_en_config: mismo mecanismo
+# (_reemplazar_clave) aplicado a la clave 'carpeta' dentro de la sección
+# 'conciliacion', preservando el resto del archivo.
+# ---------------------------------------------------------------------------
+_CONFIG_CON_CONCILIACION = """\
+negocio: LA CALETA
+cuenta_google: administracion.lacaleta@gmail.com
+drive:
+  raiz_nombre: LA CALETA
+  carpetas:
+    raiz: "id-raiz"
+    buzon: "id-buzon"
+    procesado: "id-procesado"
+    revisar: "id-revisar"
+conciliacion:
+  carpeta: ""       # id de Drive de LA CALETA/CONCILIACION - lo llena init_negocio.py
+  empresas:
+    - nombre_corto: LA CALETA CENTRO
+      nombre_motor: LA CALETA CENTRO
+sheets:
+  contable: ""
+  detalle: ""
+"""
+
+
+def test_actualizar_carpeta_conciliacion_en_config_preserva_comentarios_y_resto_del_archivo(tmp_path):
+    ruta_config = tmp_path / "config_temporal.yaml"
+    ruta_config.write_text(_CONFIG_CON_CONCILIACION, encoding="utf-8")
+
+    init_negocio._actualizar_carpeta_conciliacion_en_config(ruta_config, "id-conciliacion-789")
+
+    texto_final = ruta_config.read_text(encoding="utf-8")
+
+    assert 'carpeta: "id-conciliacion-789"' in texto_final
+    # El comentario junto a 'carpeta:' se preserva.
+    assert "# id de Drive de LA CALETA/CONCILIACION - lo llena init_negocio.py" in texto_final
+    # El resto del archivo no cambia.
+    for linea_esperada in [
+        "negocio: LA CALETA",
+        '    raiz: "id-raiz"',
+        "  empresas:",
+        "    - nombre_corto: LA CALETA CENTRO",
+        "      nombre_motor: LA CALETA CENTRO",
+    ]:
+        assert linea_esperada in texto_final
+
+    data = yaml.safe_load(texto_final)
+    assert data["conciliacion"]["carpeta"] == "id-conciliacion-789"
+    assert data["negocio"] == "LA CALETA"
+    assert data["drive"]["carpetas"]["raiz"] == "id-raiz"
+
+
+# ---------------------------------------------------------------------------
+# main() end-to-end: cableado completo de CONCILIACION, incluida la
+# idempotencia (no reescribe el config si el id ya está puesto).
+# ---------------------------------------------------------------------------
+def _parchar_auth_google(monkeypatch, servicio_sheets, almacen_falso):
+    monkeypatch.setattr(init_negocio, "AlmacenDrive", lambda servicio_drive: almacen_falso)
+
+    class _AuthGoogleFalso:
+        class ErrorAutenticacion(RuntimeError):
+            pass
+
+        @staticmethod
+        def servicio_drive():
+            return object()  # no se usa directo: AlmacenDrive está parcheado arriba
+
+        @staticmethod
+        def servicio_sheets():
+            return servicio_sheets
+
+    monkeypatch.setitem(sys.modules, "auth_google", _AuthGoogleFalso)
+
+
+def test_main_crea_conciliacion_y_escribe_su_id_si_la_seccion_existe(tmp_path, monkeypatch):
+    config = _config_minima()
+    config["conciliacion"] = {"carpeta": "", "empresas": []}
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+
+    servicio = FakeServicioSheets()
+    almacen_falso = _FakeAlmacenCarpetas()
+    _parchar_auth_google(monkeypatch, servicio, almacen_falso)
+
+    codigo = init_negocio.main(["--config", str(ruta_config)])
+
+    assert codigo == 0
+    assert len(almacen_falso.llamadas) == 5  # raiz + buzon + procesado + revisar + conciliacion
+
+    config_final = yaml.safe_load(ruta_config.read_text(encoding="utf-8"))
+    assert config_final["conciliacion"]["carpeta"]
+
+    # Segunda corrida: idempotente. No debe reescribir el config (el id ya
+    # está puesto), ni volver a llamar a asegurar_carpeta() de más.
+    texto_tras_primera = ruta_config.read_text(encoding="utf-8")
+    codigo_2 = init_negocio.main(["--config", str(ruta_config)])
+    assert codigo_2 == 0
+    assert ruta_config.read_text(encoding="utf-8") == texto_tras_primera
+    assert len(almacen_falso.llamadas) == 5
+
+
+def test_main_no_crea_conciliacion_ni_escribe_clave_si_no_hay_seccion(tmp_path, monkeypatch):
+    config = _config_minima()
+    assert "conciliacion" not in config
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+
+    servicio = FakeServicioSheets()
+    almacen_falso = _FakeAlmacenCarpetas()
+    _parchar_auth_google(monkeypatch, servicio, almacen_falso)
+
+    codigo = init_negocio.main(["--config", str(ruta_config)])
+
+    assert codigo == 0
+    assert len(almacen_falso.llamadas) == 4  # raiz + buzon + procesado + revisar, sin conciliacion
+    assert not any(nombre == init_negocio.NOMBRE_CONCILIACION for nombre, _ in almacen_falso.llamadas)
+
+    config_final = yaml.safe_load(ruta_config.read_text(encoding="utf-8"))
+    assert "conciliacion" not in config_final
+
+
+def test_dry_run_conciliacion_no_llama_api_ni_escribe_config(tmp_path, capsys):
+    config = _config_minima()
+    config["conciliacion"] = {"carpeta": "", "empresas": []}
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+    texto_original = ruta_config.read_text(encoding="utf-8")
+
+    codigo = init_negocio.main(["--config", str(ruta_config), "--dry-run"])
+
+    assert codigo == 0
+    assert ruta_config.read_text(encoding="utf-8") == texto_original
+    salida = capsys.readouterr().out
+    assert init_negocio.NOMBRE_CONCILIACION in salida
 
 
 # ---------------------------------------------------------------------------
@@ -336,19 +560,79 @@ def test_actualizar_ids_en_config_preserva_comentarios_y_resto_del_archivo(tmp_p
 
 
 # ---------------------------------------------------------------------------
-# main() end-to-end con el doble de servicio (sin red): crea sheets nuevos,
-# actualiza config.yaml con los IDs, y es idempotente en una segunda corrida.
+# _actualizar_carpetas_en_config: mismo mecanismo (_reemplazar_clave)
+# aplicado a las 4 claves de drive.carpetas.
+# ---------------------------------------------------------------------------
+_CONFIG_CON_CARPETAS = """\
+negocio: LA CALETA
+cuenta_google: administracion.lacaleta@gmail.com
+drive:
+  raiz_nombre: LA CALETA        # nombre de la carpeta en "Mi unidad"
+  carpetas:
+    raiz: ""                    # los rellena init_negocio.py
+    buzon: ""
+    procesado: ""
+    revisar: ""
+empresas:
+  - nombre_corto: LA CALETA CENTRO
+    razon_social: LA CALETA CENTRO S.A.C.
+    ruc: "20123456789"
+    locales: [CENTRO]
+sheets:
+  contable: ""
+  detalle: ""
+"""
+
+
+def test_actualizar_carpetas_en_config_preserva_comentarios_y_resto_del_archivo(tmp_path):
+    ruta_config = tmp_path / "config_temporal.yaml"
+    ruta_config.write_text(_CONFIG_CON_CARPETAS, encoding="utf-8")
+
+    init_negocio._actualizar_carpetas_en_config(
+        ruta_config,
+        {"raiz": "id-raiz", "buzon": "id-buzon", "procesado": "id-procesado", "revisar": "id-revisar"},
+    )
+
+    texto_final = ruta_config.read_text(encoding="utf-8")
+
+    assert 'raiz: "id-raiz"' in texto_final
+    assert 'buzon: "id-buzon"' in texto_final
+    assert 'procesado: "id-procesado"' in texto_final
+    assert 'revisar: "id-revisar"' in texto_final
+    # El comentario junto a 'raiz_nombre:' y el resto del archivo no cambian.
+    assert '# nombre de la carpeta en "Mi unidad"' in texto_final
+    assert "negocio: LA CALETA" in texto_final
+    assert "  - nombre_corto: LA CALETA CENTRO" in texto_final
+    assert '    ruc: "20123456789"' in texto_final
+
+    data = yaml.safe_load(texto_final)
+    assert data["drive"]["carpetas"] == {
+        "raiz": "id-raiz", "buzon": "id-buzon", "procesado": "id-procesado", "revisar": "id-revisar"
+    }
+    assert data["drive"]["raiz_nombre"] == "LA CALETA"
+    assert data["negocio"] == "LA CALETA"
+
+
+# ---------------------------------------------------------------------------
+# main() end-to-end con dobles de servicio (sin red): crea carpetas y sheets
+# nuevos, actualiza config.yaml con todos los IDs.
 # ---------------------------------------------------------------------------
 def test_main_crea_sheets_y_actualiza_config(tmp_path, monkeypatch):
-    config = _config_minima(tmp_path)
+    config = _config_minima()
     ruta_config = tmp_path / "config.yaml"
     _escribir_config_yaml(ruta_config, config)
 
     servicio = FakeServicioSheets()
+    almacen_falso = _FakeAlmacenCarpetas()
+    monkeypatch.setattr(init_negocio, "AlmacenDrive", lambda servicio_drive: almacen_falso)
 
     class _AuthGoogleFalso:
         class ErrorAutenticacion(RuntimeError):
             pass
+
+        @staticmethod
+        def servicio_drive():
+            return object()  # no se usa directo: AlmacenDrive está parcheado arriba
 
         @staticmethod
         def servicio_sheets():
@@ -359,9 +643,19 @@ def test_main_crea_sheets_y_actualiza_config(tmp_path, monkeypatch):
     codigo = init_negocio.main(["--config", str(ruta_config)])
 
     assert codigo == 0
-    assert (tmp_path / "RAIZ" / "00_BUZON").exists()
     assert len(servicio.creados) == 2  # contable + detalle
+    assert len(almacen_falso.llamadas) == 4  # raiz + buzon + procesado + revisar
 
     config_final = yaml.safe_load(ruta_config.read_text(encoding="utf-8"))
     assert config_final["sheets"]["contable"].startswith("nuevo-")
     assert config_final["sheets"]["detalle"].startswith("nuevo-")
+    assert config_final["drive"]["carpetas"]["raiz"]
+    assert config_final["drive"]["carpetas"]["buzon"]
+    assert config_final["drive"]["carpetas"]["procesado"]
+    assert config_final["drive"]["carpetas"]["revisar"]
+
+    # Segunda corrida: idempotente, no crea sheets ni carpetas de nuevo.
+    codigo_2 = init_negocio.main(["--config", str(ruta_config)])
+    assert codigo_2 == 0
+    assert len(servicio.creados) == 2
+    assert len(almacen_falso.llamadas) == 4

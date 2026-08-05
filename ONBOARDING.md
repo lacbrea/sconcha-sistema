@@ -3,7 +3,13 @@
 Esta guía es para instalar el sistema de conciliación de comprobantes en
 **otro negocio** (otra cadena, otra empresa), reutilizando el mismo código.
 No hace falta saber programar: es copiar archivos, pegar valores y correr
-un par de comandos. Sigue los pasos en orden.
+un par de comandos. No hace falta instalar nada de Google en la máquina
+que corre el sistema: el motor habla directo con la API de Google Drive
+(ver `almacen_drive.py`), así que no depende de tener Google Drive para
+escritorio instalado ni de una letra de unidad de Windows. Los archivos
+siguen entrando al buzón como siempre: arrastrándolos desde
+drive.google.com, subiéndolos desde el celular, o mandándolos al bot.
+Sigue los pasos en orden.
 
 ---
 
@@ -21,21 +27,7 @@ depender de la cuenta personal de quien lo instaló.
 
 ---
 
-## Paso 1 — Google Drive para escritorio con esa cuenta
-
-1. Instala "Google Drive para escritorio" en la computadora donde va a
-   correr el sistema (o donde alguien lo va a correr periódicamente).
-2. Inicia sesión con la cuenta del Paso 0.
-3. Espera a que sincronice. Windows le asigna una letra de unidad a "Mi
-   unidad" (por ejemplo `G:`); anótala, la vas a necesitar en el Paso 4.
-4. Dentro de "Mi unidad", crea la carpeta raíz del negocio (por ejemplo
-   `G:\Mi unidad\<NEGOCIO>`). `init_negocio.py` (Paso 6) crea las
-   subcarpetas `00_BUZON`, `01_PROCESADO` y `02_REVISAR` dentro de esta
-   carpeta automáticamente si no existen.
-
----
-
-## Paso 2 — Proyecto de Google Cloud y credenciales OAuth
+## Paso 1 — Proyecto de Google Cloud y credenciales OAuth
 
 1. Con la cuenta del Paso 0, entra a [Google Cloud Console](https://console.cloud.google.com/)
    y crea un proyecto nuevo (o reutiliza uno si ya existe para este
@@ -43,11 +35,18 @@ depender de la cuenta personal de quien lo instaló.
 2. En "APIs y servicios" → "Biblioteca", habilita:
    - **Google Drive API**
    - **Google Sheets API**
+   - **Gmail API**
 3. En "APIs y servicios" → "Pantalla de consentimiento OAuth":
    - Tipo de usuario: Externo (o Interno si la cuenta es de Google
      Workspace).
    - Completa los datos mínimos (nombre de la app, correo de soporte).
-   - Agrega los ámbitos de Drive y Sheets si te los pide.
+   - Agrega los ámbitos de Drive, Sheets y Gmail si te los pide.
+
+   > ⚠️ Al dar el consentimiento en el navegador (Paso 5), Google va a
+   > pedir permiso de **lectura** del correo de la cuenta del Paso 0. Es
+   > para la fase de conciliación bancaria: bajar del correo del negocio
+   > los estados de cuenta y las constancias de transferencia del banco.
+   > El sistema nunca escribe, responde ni borra correo.
 
    > ⚠️ **Muy importante: al terminar, publica la aplicación ("Publish
    > App").** Si la dejas en modo **Testing**, el permiso de acceso
@@ -71,7 +70,7 @@ depender de la cuenta personal de quien lo instaló.
 
 ---
 
-## Paso 3 — Instalar las dependencias de Python
+## Paso 2 — Instalar las dependencias de Python
 
 Con Python 3.12 instalado, desde la raíz del proyecto:
 
@@ -82,14 +81,19 @@ C:\Python312\python.exe -m pip install -r requirements.txt
 
 ---
 
-## Paso 4 — Rellenar la configuración del negocio
+## Paso 3 — Rellenar la configuración del negocio
 
 1. Copia `config.ejemplo.yaml` como `config.yaml` (en la misma carpeta).
 2. Ábrelo y reemplaza cada valor de ejemplo por el dato real:
    - `negocio`: nombre corto del negocio.
    - `cuenta_google`: la cuenta del Paso 0.
-   - `drive.raiz`: la ruta local a la carpeta raíz del Paso 1 (usa la letra
-     de unidad real, por ejemplo `"G:/Mi unidad/<NEGOCIO>"`).
+   - `drive.raiz_nombre`: el nombre que va a tener la carpeta raíz del
+     negocio dentro de "Mi unidad" de la cuenta del Paso 0 (por ejemplo,
+     el mismo nombre corto del negocio). Es el único campo de texto de la
+     sección `drive`: no hace falta ninguna ruta local ni letra de unidad
+     de Windows — `init_negocio.py` (Paso 5) crea esa carpeta por API si
+     no existe, junto con `00_BUZON`, `01_PROCESADO` y `02_REVISAR` dentro
+     de ella, y guarda sus 4 ids en `drive.carpetas`.
    - `empresas`: una entrada por cada razón social (RUC) que factura a
      nombre de este negocio, con su `nombre_corto`, `razon_social`, `ruc`
      (entre comillas) y la lista de `locales` que factura ese RUC (puede
@@ -105,14 +109,52 @@ C:\Python312\python.exe -m pip install -r requirements.txt
        realidad sean del otro local se corrigen a mano en el Sheet. Ver
        `config.ejemplo.yaml` para el formato exacto y la sección "Trampas
        conocidas" de `SKILL.md` para el caso real que motivó este campo.
-   - Deja `sheets.contable` y `sheets.detalle` vacíos (`""`): los llena
-     automáticamente el Paso 6.
-3. `config.yaml` nunca se sube a un repositorio (contiene los IDs de los
-   Sheets una vez creados); ya está en `.gitignore`.
+   - `conciliacion` (opcional): solo si este negocio va a conciliar sus
+     cuentas bancarias con el sistema. **Si no aplica, borra toda la
+     sección** — `init_negocio.py` (Paso 5) no crea la carpeta
+     `CONCILIACION` en Drive si no la encuentra en `config.yaml`. Si sí
+     aplica:
+     - `carpeta`: déjalo vacío (`""`); lo llena el Paso 5.
+     - `empresas`: una entrada por cada empresa (de las de arriba) que
+       tenga cuentas bancarias propias — una razón social que solo
+       factura, sin cuenta propia, se omite (no se concilia).
+       - `nombre_corto`: debe coincidir exactamente con el `nombre_corto`
+         de la lista de `empresas` de arriba.
+       - `nombre_motor`: el string EXACTO que recibe el motor vendorizado
+         (`conciliacion/build_conciliacion.py`) como argumento posicional
+         `empresa`. No es cosmético: el motor lo usa para decidir el local
+         y el encargado de caja chica, y `conciliar.py` lo usa también
+         para filtrar el CSV de comprobantes de esa empresa. Si aquí
+         pusieras el `nombre_corto` en vez del nombre completo (por
+         ejemplo `"INSTITUCION"` en vez de `"INSTITUCION CEVICHERA"`), el
+         motor descartaría en silencio TODAS las filas de esa empresa — la
+         conciliación saldría vacía sin ningún error visible. Ver la
+         sección "Conciliación bancaria" de `SKILL.md`.
+       - `cuentas`: una entrada por cada cuenta bancaria de esta empresa,
+         con `banco` y `moneda` (informativos) y:
+         - `numero`: los ÚLTIMOS DÍGITOS con los que el banco nombra el
+           archivo del estado de cuenta (ej. `EC_4134_062026.pdf` →
+           `"4134"`), no el número completo de la cuenta. Es el criterio
+           con el que `conciliar.py` sabe a qué cuenta pertenece cada EECC
+           que encuentra en Drive.
+         - `principal: true`: marca la cuenta que va como argumento
+           posicional del motor; las demás entran con `--eecc`
+           (repetible). Solo una cuenta por empresa puede ser `principal`.
+   - `correo` (opcional, solo si `conciliacion` aplica): déjalo tal como
+     viene en `config.ejemplo.yaml` (`habilitado: false`) hasta tener a la
+     vista un correo real de cada tipo con el cual confirmar las consultas
+     de cada regla. Ver "Correo (Gmail, solo lectura)" en `SKILL.md` para
+     qué hace y qué no hace todavía.
+   - Deja `drive.carpetas.*`, `conciliacion.carpeta` y
+     `sheets.contable`/`sheets.detalle` vacíos (`""`): los llena
+     automáticamente el Paso 5.
+3. `config.yaml` nunca se sube a un repositorio (contiene los IDs de las
+   carpetas de Drive y de los Sheets una vez creados); ya está en
+   `.gitignore`.
 
 ---
 
-## Paso 5 — Clave de la API de Anthropic
+## Paso 4 — Clave de la API de Anthropic
 
 El sistema necesita una `ANTHROPIC_API_KEY` para leer PDF e imágenes con
 Claude. Se configura como variable de entorno de usuario en Windows, nunca
@@ -133,7 +175,7 @@ de usuario solo se leen al iniciar la sesión de la terminal).
 
 ---
 
-## Paso 6 — Preparar el negocio (carpetas + Sheets)
+## Paso 5 — Preparar el negocio (carpetas de Drive + Sheets)
 
 ```powershell
 C:\Python312\python.exe init_negocio.py --config config.yaml
@@ -143,12 +185,18 @@ La primera vez te va a pedir iniciar sesión en el navegador con la cuenta
 del Paso 0 y dar el consentimiento OAuth (queda guardado en `token.json`
 para las próximas corridas). Este comando:
 
-- Crea las subcarpetas `00_BUZON`, `01_PROCESADO`, `02_REVISAR` dentro de
-  `drive.raiz` (si ya existen, las reutiliza).
+- Crea por API de Drive la carpeta raíz del negocio (`drive.raiz_nombre`)
+  dentro de "Mi unidad", y las subcarpetas `00_BUZON`, `01_PROCESADO`,
+  `02_REVISAR` dentro de ella (si ya existen, las reutiliza).
+- Si `config.yaml` trae la sección `conciliacion` (Paso 3), crea además la
+  carpeta `CONCILIACION` dentro de la raíz. Si no la trae, no la crea —
+  es opcional a propósito.
 - Crea los dos Google Sheets del negocio con sus cabeceras.
-- Escribe los IDs de esos Sheets de vuelta en `config.yaml`.
+- Escribe de vuelta en `config.yaml` los ids de esas carpetas y de los 2
+  Sheets (incluido `conciliacion.carpeta`, si aplica).
 
-Puedes correrlo con `--dry-run` primero para ver qué haría sin tocar nada:
+Puedes correrlo con `--dry-run` primero para ver qué haría sin tocar nada
+(no necesita credenciales para el `--dry-run`):
 
 ```powershell
 C:\Python312\python.exe init_negocio.py --config config.yaml --dry-run
@@ -159,7 +207,7 @@ creados.
 
 ---
 
-## Paso 7 — Corrida de calibración con documentos representativos del flujo nuevo
+## Paso 6 — Corrida de calibración con documentos representativos del flujo nuevo
 
 Este sistema existe precisamente para dejar de escanear papel. No calibres
 con comprobantes escaneados históricos: eso afinaría el sistema para un
@@ -170,8 +218,10 @@ digital** o **XML de factura electrónica** (por correo o por el bot), y la
 genuinamente físicos y sin versión digital (compras en el mercado, en el
 terminal pesquero).
 
-Antes de confiar el negocio al sistema, coloca en `00_BUZON` **tres
-documentos representativos de ese flujo**:
+Antes de confiar el negocio al sistema, sube a la carpeta `00_BUZON` (del
+Drive de la cuenta del Paso 0 — desde drive.google.com, desde la app del
+celular, o mandándolos al bot; no hace falta ninguna app de escritorio)
+**tres documentos representativos de ese flujo**:
 
 1. Un **XML de factura electrónica** real de un proveedor.
 2. Un **PDF digital** recibido por correo (no un escaneo).
@@ -192,16 +242,16 @@ revísalo también, para confirmar que la razón es correcta y no un error
 del sistema.
 
 Si los tres calzan bien, puedes sumar más documentos reales de otras
-empresas/locales configurados para ampliar la muestra antes del Paso 8,
+empresas/locales configurados para ampliar la muestra antes del Paso 7,
 siempre dentro de este mismo flujo (XML, PDF digital o foto de comprobante
 físico) — nunca con escaneos históricos.
 
-No continúes al Paso 8 hasta estar conforme con la precisión de esta
+No continúes al Paso 7 hasta estar conforme con la precisión de esta
 corrida.
 
 ---
 
-## Paso 8 — Una semana en paralelo antes de confiar en el sistema nuevo
+## Paso 7 — Una semana en paralelo antes de confiar en el sistema nuevo
 
 Corre el sistema nuevo en paralelo con el proceso anterior (manual o el
 sistema previo) durante **al menos una semana**, sin dar de baja todavía
@@ -214,8 +264,17 @@ de forma consistente, deja de usar el proceso anterior.
 
 | Qué | De dónde | A dónde |
 |---|---|---|
-| Todo el código (`.py`, `requirements.txt`, `.gitignore`, `config.ejemplo.yaml`) | Este proyecto | Carpeta del negocio nuevo en el equipo que va a correrlo |
-| `credenciales.json` | Google Cloud Console del Paso 2 (cuenta del negocio nuevo) | Raíz del proyecto (nunca al repositorio) |
-| `config.yaml` | Se crea copiando `config.ejemplo.yaml` y rellenándolo (Paso 4) | Raíz del proyecto (nunca al repositorio) |
-| `ANTHROPIC_API_KEY` | La entrega quien administra la cuenta de Anthropic | Variable de entorno de usuario de Windows (Paso 5) |
-| `token.json` | Se genera solo, la primera vez que corre `init_negocio.py` o `procesar.py` | Raíz del proyecto (nunca al repositorio) |
+| Todo el código (`.py`, `conciliacion/`, `requirements.txt`, `.gitignore`, `config.ejemplo.yaml`) | Este proyecto | Carpeta del negocio nuevo en el equipo que va a correrlo |
+| `credenciales.json` | Google Cloud Console del Paso 1 (cuenta del negocio nuevo) | Raíz del proyecto (nunca al repositorio) |
+| `config.yaml` | Se crea copiando `config.ejemplo.yaml` y rellenándolo (Paso 3) | Raíz del proyecto (nunca al repositorio) |
+| `ANTHROPIC_API_KEY` | La entrega quien administra la cuenta de Anthropic | Variable de entorno de usuario de Windows (Paso 4) |
+| `token.json` | Se genera solo, la primera vez que corre `init_negocio.py`, `procesar.py` o `conciliar.py` | Raíz del proyecto (nunca al repositorio) |
+
+Nota: ya no hace falta instalar Google Drive para escritorio en ningún
+equipo para que el sistema funcione — tanto el procesamiento de
+comprobantes como la conciliación bancaria (`conciliar.py`) hablan directo
+con la API de Drive. Lo único que sigue siendo manual es descargar el
+estado de cuenta desde el portal del banco (ningún banco lo entrega por
+API) y subirlo a la carpeta `CONCILIACION/AAAA-MM/EECC` de Drive; desde
+ahí `conciliar.py` lo toma solo. Ver "Conciliación bancaria" en
+`SKILL.md` para el detalle.

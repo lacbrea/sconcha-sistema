@@ -1,4 +1,5 @@
-"""Autenticación OAuth de usuario con Google (Drive y Sheets).
+"""Autenticación OAuth de usuario con Google (Drive, Sheets y Gmail de solo
+lectura).
 
 Usa el flujo de "aplicación instalada" (InstalledAppFlow), NO una cuenta de
 servicio: las hojas y archivos quedan asociados a la cuenta de Gmail del
@@ -33,10 +34,20 @@ from googleapiclient.discovery import Resource, build
 logger = logging.getLogger("procesar.auth_google")
 
 # Ámbitos mínimos necesarios: leer/escribir en Sheets y en Drive (para mover
-# comprobantes dentro de las carpetas del negocio y obtener sus enlaces).
+# comprobantes dentro de las carpetas del negocio y obtener sus enlaces), y
+# leer Gmail (para la Fase 4, conciliación bancaria: bajar del correo del
+# negocio los estados de cuenta y las constancias de transferencia).
+#
+# gmail.readonly se agrega AHORA, aunque todavía no se use, porque token.json
+# todavía no existe: mientras no exista, el dueño da su consentimiento en el
+# navegador UNA sola vez por todos los ámbitos juntos. Si este ámbito se
+# agregara después de la primera autorización, habría que repetir todo el
+# trámite del navegador para volver a pedir consentimiento. Es de SOLO
+# LECTURA: este módulo nunca escribe, responde ni borra correo.
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
 RUTA_MODULO = pathlib.Path(__file__).resolve().parent
@@ -45,10 +56,10 @@ RUTA_TOKEN_POR_DEFECTO = RUTA_MODULO / "token.json"
 
 MENSAJE_FALTA_CREDENCIALES = (
     "No se encontró '{ruta}'.\n"
-    "Falta el secreto de cliente OAuth de Google Cloud. Sigue el paso 2 de "
+    "Falta el secreto de cliente OAuth de Google Cloud. Sigue el paso 1 de "
     "ONBOARDING.md: crea (o reutiliza) un proyecto en Google Cloud Console, "
-    "habilita 'Google Drive API' y 'Google Sheets API', crea credenciales "
-    "OAuth de tipo 'Aplicación de escritorio' y descarga el archivo JSON. "
+    "habilita 'Google Drive API', 'Google Sheets API' y 'Gmail API', crea "
+    "credenciales OAuth de tipo 'Aplicación de escritorio' y descarga el JSON. "
     "Guárdalo exactamente como 'credenciales.json' en la raíz del proyecto "
     "(junto a procesar.py). Este archivo nunca debe subirse a un "
     "repositorio: ya está incluido en .gitignore."
@@ -131,3 +142,12 @@ def servicio_drive(
     """Devuelve un recurso de la API de Google Drive (v3) autenticado."""
     credenciales = _obtener_credenciales(ruta_credenciales, ruta_token)
     return build("drive", "v3", credentials=credenciales)
+
+
+def servicio_gmail(
+    ruta_credenciales: pathlib.Path = RUTA_CREDENCIALES_POR_DEFECTO,
+    ruta_token: pathlib.Path = RUTA_TOKEN_POR_DEFECTO,
+) -> Resource:
+    """Devuelve un recurso de la API de Gmail (v1) autenticado, de solo lectura."""
+    credenciales = _obtener_credenciales(ruta_credenciales, ruta_token)
+    return build("gmail", "v1", credentials=credenciales)

@@ -17,23 +17,27 @@
 negocio: LA CALETA
 
 # Cuenta de Google dedicada y exclusiva de este negocio (ver paso 0 de
-# ONBOARDING.md). Es la cuenta con la que se instaló Google Drive para
-# escritorio y con la que se generaron las credenciales OAuth. Debe ser una
-# cuenta que NO se comparta con otro negocio ni con el uso personal de nadie.
+# ONBOARDING.md). Es la cuenta dueña de la carpeta de Drive del negocio y
+# con la que se generaron las credenciales OAuth. Debe ser una cuenta que NO
+# se comparta con otro negocio ni con el uso personal de nadie.
 cuenta_google: administracion.lacaleta@gmail.com
 
-# Carpetas de trabajo dentro de Google Drive para escritorio. "raiz" es la
-# ruta local (en este equipo) a la carpeta raíz del negocio dentro de la
-# unidad "Mi unidad" sincronizada por Drive para escritorio. La letra de
-# unidad (G:, H:, etc.) la asigna Windows al instalar Drive para escritorio;
-# ábrela y verifica cuál te tocó. "buzon", "procesado" y "revisar" son
-# subcarpetas directas de "raiz" y deben coincidir exactamente con los
-# nombres de carpeta reales (init_negocio.py las crea si no existen).
+# Carpetas de trabajo en Google Drive. El sistema habla directo con la API
+# de Drive (no hace falta instalar Google Drive para escritorio en la
+# máquina que corre el sistema). "raiz_nombre" es el único campo de texto
+# editable: el nombre que va a tener la carpeta raíz del negocio dentro de
+# "Mi unidad" de la cuenta de Google del Paso 0. Las 4 subclaves de
+# "carpetas" son IDs de Drive, no nombres ni rutas: se dejan vacías acá y
+# las rellena init_negocio.py la primera vez que se corre (crea la carpeta
+# raíz y las subcarpetas 00_BUZON/01_PROCESADO/02_REVISAR por API si no
+# existen, y guarda sus ids aquí). No los llenes a mano.
 drive:
-  raiz: "G:/Mi unidad/LA CALETA"
-  buzon: "00_BUZON"
-  procesado: "01_PROCESADO"
-  revisar: "02_REVISAR"
+  raiz_nombre: LA CALETA
+  carpetas:
+    raiz: ""
+    buzon: ""
+    procesado: ""
+    revisar: ""
 
 # Modelo de Claude usado por extractores/modelo.py para leer PDF e imágenes.
 # "esfuerzo" controla el nivel de esfuerzo de razonamiento (low/medium/high);
@@ -78,3 +82,91 @@ empresas:
 sheets:
   contable: ""
   detalle: ""
+
+# =============================================================================
+# Conciliación bancaria
+# -----------------------------------------------------------------------------
+# Opcional: si el negocio no concilia sus cuentas con este sistema, borra toda
+# esta sección. `conciliar.py` genera un .xlsx por empresa y por mes invocando
+# al motor vendorizado en `conciliacion/`, y arma sus argumentos desde acá.
+#
+# "carpeta" es un id de Drive, no una ruta: lo rellena init_negocio.py junto
+# con los demás. No lo llenes a mano.
+# =============================================================================
+conciliacion:
+  carpeta: ""
+  empresas:
+    # Una entrada por cada empresa que tenga cuentas bancarias propias. Una
+    # razón social sin cuentas (por ejemplo una usada solo para facturar) se
+    # omite: no se concilia.
+    - nombre_corto: LA CALETA CENTRO   # debe coincidir con empresas[].nombre_corto
+      # String EXACTO que recibe el motor como argumento posicional 'empresa'.
+      # No es libre ni cosmético: el motor lo usa para decidir el local y el
+      # encargado de la caja chica. Ver conciliacion/build_conciliacion.py.
+      nombre_motor: LA CALETA CENTRO
+      cuentas:
+        # "numero": los últimos dígitos con los que el banco nombra el archivo
+        # del estado de cuenta (EC_1234_062026.pdf). Es el criterio con el que
+        # conciliar.py sabe qué EECC pertenece a qué empresa, así que tiene que
+        # ser el que aparece en el nombre del archivo, no el número completo de
+        # la cuenta.
+        # "principal": la cuenta que va como argumento posicional del motor;
+        # las demás entran con --eecc. Marca solo una por empresa.
+        - banco: interbank
+          numero: "1234"
+          moneda: PEN
+          principal: true
+        - banco: bbva
+          numero: "5678"
+          moneda: PEN
+    - nombre_corto: LA CALETA NORTE
+      nombre_motor: LA CALETA NORTE
+      cuentas:
+        - banco: interbank
+          numero: "9012"
+          moneda: PEN
+          principal: true
+
+# =============================================================================
+# Correo (Gmail) — SOLO LECTURA
+# -----------------------------------------------------------------------------
+# Cuarta vía de entrada: estados de cuenta del banco, constancias de
+# transferencia y comprobantes que llegan por correo. El sistema NUNCA escribe,
+# responde ni borra correo, y no guarda el cuerpo de ningún mensaje.
+#
+# Importante: el permiso de Gmail que otorga Google abarca TODO el buzón — no
+# existe un permiso por etiqueta ni por remitente. Por eso la cuenta del Paso 0
+# debe ser exclusiva del negocio, y por eso el acotamiento se hace acá, con
+# consultas explícitas y topes de volumen.
+# =============================================================================
+correo:
+  # Déjalo en false hasta tener a la vista un correo real de cada tipo con el
+  # cual afinar las consultas de abajo. En false no se consulta Gmail.
+  habilitado: false
+  # Topes por corrida: ventana de días hacia atrás y máximo de mensajes a mirar.
+  dias_atras: 45
+  max_mensajes: 200
+  reglas:
+    # Cada regla es una consulta con la sintaxis de búsqueda de Gmail (la misma
+    # que escribirías en la barra de búsqueda) más un destino.
+    #
+    # tipo: "adjunto"  -> baja los adjuntos cuya extensión esté en la lista y
+    #                     los deja en la carpeta de Drive indicada en destino.
+    # tipo: "constancia_interbank" -> no hay adjunto: los datos vienen en el
+    #                     cuerpo. Se extraen fecha, monto, beneficiario y cuenta
+    #                     de cargo, y se escribe cons_<cuenta>.json. El cuerpo
+    #                     no se guarda.
+    #
+    # destino: EECC | CONSTANCIAS | BUZON. "BUZON" hace que un comprobante que
+    # llega por correo entre exactamente por el mismo camino que uno arrastrado
+    # a mano a 00_BUZON.
+    - nombre: eecc-banco
+      tipo: adjunto
+      destino: EECC
+      consulta: "from:banco.com.pe subject:(estado de cuenta) has:attachment"
+      extensiones: [".pdf", ".xls", ".xlsx"]
+    - nombre: comprobantes-proveedores
+      tipo: adjunto
+      destino: BUZON
+      consulta: "subject:(factura OR boleta OR comprobante) has:attachment"
+      extensiones: [".xml", ".pdf"]

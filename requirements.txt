@@ -19,6 +19,13 @@ pandas==3.0.3
 openpyxl==3.1.5
 xlrd==2.0.2
 
+# Motor de conciliación vendorizado (conciliacion/). openpyxl y xlrd ya
+# estaban arriba y cubren el export xlsx de Interbank y el .xls-que-es-HTML
+# de BBVA; pypdf es la única dependencia nueva, la usa parsers_eecc.py
+# (import diferido, dentro de la función) para leer el PDF oficial de
+# Interbank.
+pypdf==6.14.2
+
 # -----------------------------------------------------------------------------
 # Dependencia de desarrollo (no se usa en producción, solo para correr
 # tests/test_procesar.py). Instalar junto con las de arriba.

@@ -2,22 +2,28 @@
 
 Hace tres cosas, en orden, y es seguro correrlo varias veces (idempotente):
 
-1. Crea en disco la estructura de carpetas descrita en config.yaml
-   (drive.raiz / buzon, procesado, revisar). Si una carpeta ya existe, la
-   reutiliza y lo informa; nunca la recrea ni la vacía.
+1. Crea en Google Drive, por API, la carpeta raíz del negocio
+   (drive.raiz_nombre, dentro de "Mi unidad") y las subcarpetas
+   00_BUZON, 01_PROCESADO y 02_REVISAR. Si una carpeta ya existe (mismo
+   nombre y mismo padre), la reutiliza; nunca la recrea ni la vacía. Los 4
+   ids resultantes se guardan en config.yaml -> drive.carpetas.
+   Si config.yaml trae la sección 'conciliacion' (opcional), crea además la
+   carpeta CONCILIACION y guarda su id en conciliacion.carpeta.
 2. Crea los dos Google Sheets del negocio ("contable" y "detalle") con sus
    cabeceras, usando la cuenta de Google autenticada por auth_google.py. Si
    config.yaml ya trae un ID de Sheet configurado, verifica que siga siendo
    accesible y lo reutiliza en vez de crear uno nuevo.
-3. Escribe de vuelta en config.yaml los IDs de los Sheets recién creados
-   (si corresponde), sin tocar el resto del archivo (comentarios incluidos).
+3. Escribe de vuelta en config.yaml los IDs de las carpetas y de los Sheets
+   recién creados (si corresponde), sin tocar el resto del archivo
+   (comentarios incluidos).
 
 Uso:
     C:\\Python312\\python.exe init_negocio.py --config config.yaml
     C:\\Python312\\python.exe init_negocio.py --config config.yaml --dry-run
 
-Con --dry-run no se toca el disco, no se llama a la API de Google y no se
-escribe config.yaml: solo se informa qué haría cada paso.
+Con --dry-run no se llama a la API de Google (ni Drive ni Sheets) y no se
+escribe config.yaml: solo se informa qué haría cada paso. No hace falta
+tener credenciales configuradas para correr --dry-run.
 """
 from __future__ import annotations
 
@@ -29,9 +35,26 @@ import sys
 
 import yaml
 
+from almacen_drive import AlmacenDrive
 from registro_sheets import COLUMNAS_CONTABLE, COLUMNAS_DETALLE
 
 logger = logging.getLogger("procesar.init_negocio")
+
+# Nombres fijos de las subcarpetas de trabajo dentro de la carpeta raíz del
+# negocio. No son configurables por config.yaml (a diferencia de
+# drive.raiz_nombre): son una convención del sistema, igual en todos los
+# negocios que lo usan.
+NOMBRE_BUZON = "00_BUZON"
+NOMBRE_PROCESADO = "01_PROCESADO"
+NOMBRE_REVISAR = "02_REVISAR"
+
+# Carpeta de la conciliación bancaria. A diferencia de las tres anteriores,
+# esta es OPCIONAL: solo se crea si config.yaml trae la sección
+# 'conciliacion'. Un negocio que use el sistema únicamente para procesar
+# comprobantes no la necesita, y crearla igual dejaría una carpeta vacía en
+# su Drive pidiendo explicación. Su id se guarda en conciliacion.carpeta (no
+# en drive.carpetas: las de ahí son las del pipeline del buzón).
+NOMBRE_CONCILIACION = "CONCILIACION"
 
 # -----------------------------------------------------------------------------
 # Cabeceras de los dos Sheets del negocio. Fila 1 de cada spreadsheet.
@@ -67,25 +90,54 @@ def cargar_config(ruta_config: pathlib.Path) -> dict:
         return yaml.safe_load(f)
 
 
-def preparar_carpetas(config: dict, dry_run: bool) -> None:
-    raiz = pathlib.Path(config["drive"]["raiz"])
-    subcarpetas = [
-        config["drive"]["buzon"],
-        config["drive"]["procesado"],
-        config["drive"]["revisar"],
-    ]
+def preparar_carpetas(config: dict, almacen: "AlmacenDrive | None", dry_run: bool) -> dict[str, str]:
+    """Asegura (crea si hace falta) la carpeta raíz del negocio en "Mi
+    unidad" y las 3 subcarpetas de trabajo, todo por API de Drive.
 
-    print(f"\n== Carpetas ({raiz}) ==")
+    Devuelve {"raiz": id, "buzon": id, "procesado": id, "revisar": id} en
+    modo real; {} en --dry-run (no hay nada que devolver: no se llama a la
+    API, así que no hay ids que informar, solo la intención).
+
+    Nota: a diferencia de la versión anterior (basada en pathlib), esta
+    función no distingue en el mensaje impreso entre "creada" y "ya
+    existía": AlmacenDrive.asegurar_carpeta() no expone esa información (es
+    idempotente por diseño, pero no dice si encontró o creó), y el
+    contrato de la clase no incluye un método aparte para verificarlo. La
+    garantía de que no duplica carpetas se prueba por comportamiento en
+    tests/test_init_negocio.py, no por el texto impreso.
+    """
+    raiz_nombre = config["drive"]["raiz_nombre"]
+    con_conciliacion = bool(config.get("conciliacion"))
+
+    print(f"\n== Carpetas en Drive (raíz: '{raiz_nombre}') ==")
     if dry_run:
-        print(f"[DRY-RUN] se crearía (si no existe): {raiz}")
-        for nombre in subcarpetas:
-            print(f"[DRY-RUN] se crearía (si no existe): {raiz / nombre}")
-        return
+        print(f"[DRY-RUN] se aseguraría (creándola si no existe) la carpeta raíz '{raiz_nombre}' en Mi unidad")
+        nombres = [NOMBRE_BUZON, NOMBRE_PROCESADO, NOMBRE_REVISAR]
+        if con_conciliacion:
+            nombres.append(NOMBRE_CONCILIACION)
+        for nombre in nombres:
+            print(f"[DRY-RUN] se aseguraría (creándola si no existe): {raiz_nombre}/{nombre}")
+        if not con_conciliacion:
+            print("[DRY-RUN] config.yaml no trae sección 'conciliacion': no se crearía la carpeta CONCILIACION.")
+        return {}
 
-    for ruta in [raiz, *(raiz / nombre for nombre in subcarpetas)]:
-        ya_existia = ruta.exists()
-        ruta.mkdir(parents=True, exist_ok=True)
-        print(f"{'ya existía' if ya_existia else 'creada'}: {ruta}")
+    id_raiz = almacen.asegurar_carpeta(raiz_nombre)
+    print(f"raíz: {raiz_nombre} ({id_raiz})")
+    id_buzon = almacen.asegurar_carpeta(NOMBRE_BUZON, id_raiz)
+    print(f"  {NOMBRE_BUZON} ({id_buzon})")
+    id_procesado = almacen.asegurar_carpeta(NOMBRE_PROCESADO, id_raiz)
+    print(f"  {NOMBRE_PROCESADO} ({id_procesado})")
+    id_revisar = almacen.asegurar_carpeta(NOMBRE_REVISAR, id_raiz)
+    print(f"  {NOMBRE_REVISAR} ({id_revisar})")
+
+    ids = {"raiz": id_raiz, "buzon": id_buzon, "procesado": id_procesado, "revisar": id_revisar}
+
+    if con_conciliacion:
+        id_conciliacion = almacen.asegurar_carpeta(NOMBRE_CONCILIACION, id_raiz)
+        print(f"  {NOMBRE_CONCILIACION} ({id_conciliacion})")
+        ids["conciliacion"] = id_conciliacion
+
+    return ids
 
 
 def _spreadsheet_accesible(servicio_sheets, spreadsheet_id: str) -> bool:
@@ -175,21 +227,50 @@ def preparar_sheet(
     return spreadsheet_id
 
 
+def _reemplazar_clave(texto: str, clave: str, valor: str) -> str:
+    """Reescribe la línea 'clave: ...' (a cualquier profundidad de
+    indentación) dentro de 'texto', preservando el comentario al final de
+    la línea si lo hay. No toca ninguna otra línea del archivo."""
+    patron = re.compile(rf'(?m)^(\s*{clave}:\s*)(".*?"|\S*)(\s*(?:#.*)?)$')
+    if not patron.search(texto):
+        logger.warning("No se encontró la clave '%s:' en config.yaml; no se actualiza.", clave)
+        return texto
+    return patron.sub(lambda m: f'{m.group(1)}"{valor}"{m.group(3)}', texto, count=1)
+
+
 def _actualizar_ids_en_config(ruta_config: pathlib.Path, id_contable: str, id_detalle: str) -> None:
     """Reescribe solo las líneas 'contable:' y 'detalle:' dentro de config.yaml,
     preservando el resto del archivo (comentarios, orden, formato) tal cual.
     """
     texto = ruta_config.read_text(encoding="utf-8")
+    texto = _reemplazar_clave(texto, "contable", id_contable)
+    texto = _reemplazar_clave(texto, "detalle", id_detalle)
+    ruta_config.write_text(texto, encoding="utf-8")
 
-    def reemplazar(clave: str, valor: str, texto: str) -> str:
-        patron = re.compile(rf'(?m)^(\s*{clave}:\s*)(".*?"|\S*)(\s*(?:#.*)?)$')
-        if not patron.search(texto):
-            logger.warning("No se encontró la clave '%s:' en config.yaml; no se actualiza.", clave)
-            return texto
-        return patron.sub(lambda m: f'{m.group(1)}"{valor}"{m.group(3)}', texto, count=1)
 
-    texto = reemplazar("contable", id_contable, texto)
-    texto = reemplazar("detalle", id_detalle, texto)
+def _actualizar_carpetas_en_config(ruta_config: pathlib.Path, ids_carpetas: dict[str, str]) -> None:
+    """Reescribe las líneas 'raiz:'/'buzon:'/'procesado:'/'revisar:' dentro
+    de drive.carpetas en config.yaml, preservando el resto del archivo.
+    Reusa el mismo mecanismo de reemplazo por regex que
+    _actualizar_ids_en_config (_reemplazar_clave), para no duplicar esa
+    lógica.
+    """
+    texto = ruta_config.read_text(encoding="utf-8")
+    for clave in ("raiz", "buzon", "procesado", "revisar"):
+        if clave in ids_carpetas:
+            texto = _reemplazar_clave(texto, clave, ids_carpetas[clave])
+    ruta_config.write_text(texto, encoding="utf-8")
+
+
+def _actualizar_carpeta_conciliacion_en_config(ruta_config: pathlib.Path, id_carpeta: str) -> None:
+    """Reescribe la línea 'carpeta:' de la sección conciliacion en config.yaml.
+
+    Va aparte de _actualizar_carpetas_en_config porque este id no vive en
+    drive.carpetas: la conciliación es opcional y su carpeta se guarda dentro
+    de su propia sección, que un negocio sin conciliación no tiene.
+    """
+    texto = ruta_config.read_text(encoding="utf-8")
+    texto = _reemplazar_clave(texto, "carpeta", id_carpeta)
     ruta_config.write_text(texto, encoding="utf-8")
 
 
@@ -208,14 +289,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print("Modo --dry-run: no se modifica nada, solo se informa.\n")
 
-    preparar_carpetas(config, args.dry_run)
-
-    print("\n== Google Sheets ==")
     sheets_config = config.get("sheets", {}) or {}
     id_contable_actual = (sheets_config.get("contable") or "").strip()
     id_detalle_actual = (sheets_config.get("detalle") or "").strip()
 
     if args.dry_run:
+        preparar_carpetas(config, None, True)
+
+        print("\n== Google Sheets ==")
         preparar_sheet(None, config["negocio"], "contable", ENCABEZADOS_CONTABLE, id_contable_actual, True)
         preparar_sheet(None, config["negocio"], "detalle", ENCABEZADOS_DETALLE, id_detalle_actual, True)
         print("\n[DRY-RUN] no se escribe config.yaml.")
@@ -224,22 +305,47 @@ def main(argv: list[str] | None = None) -> int:
     import auth_google  # import diferido: no hace falta en --dry-run
 
     try:
-        servicio = auth_google.servicio_sheets()
+        servicio_sheets = auth_google.servicio_sheets()
+    except auth_google.ErrorAutenticacion as exc:
+        sys.exit(str(exc))
+    try:
+        servicio_drive = auth_google.servicio_drive()
     except auth_google.ErrorAutenticacion as exc:
         sys.exit(str(exc))
 
+    almacen = AlmacenDrive(servicio_drive)
+    ids_carpetas = preparar_carpetas(config, almacen, False)
+
+    print("\n== Google Sheets ==")
     id_contable = preparar_sheet(
-        servicio, config["negocio"], "contable", ENCABEZADOS_CONTABLE, id_contable_actual, False
+        servicio_sheets, config["negocio"], "contable", ENCABEZADOS_CONTABLE, id_contable_actual, False
     )
     id_detalle = preparar_sheet(
-        servicio, config["negocio"], "detalle", ENCABEZADOS_DETALLE, id_detalle_actual, False
+        servicio_sheets, config["negocio"], "detalle", ENCABEZADOS_DETALLE, id_detalle_actual, False
     )
+
+    carpetas_cfg_actual = (config.get("drive", {}).get("carpetas") or {})
+    hubo_cambios = False
+
+    if any(ids_carpetas.get(clave) != (carpetas_cfg_actual.get(clave) or "") for clave in ("raiz", "buzon", "procesado", "revisar")):
+        _actualizar_carpetas_en_config(ruta_config, ids_carpetas)
+        print(f"\nconfig.yaml actualizado con los IDs de las carpetas de Drive ({ruta_config}).")
+        hubo_cambios = True
+
+    id_conciliacion = ids_carpetas.get("conciliacion", "")
+    conciliacion_cfg_actual = ((config.get("conciliacion") or {}).get("carpeta") or "").strip()
+    if id_conciliacion and id_conciliacion != conciliacion_cfg_actual:
+        _actualizar_carpeta_conciliacion_en_config(ruta_config, id_conciliacion)
+        print(f"config.yaml actualizado con el ID de la carpeta CONCILIACION ({ruta_config}).")
+        hubo_cambios = True
 
     if id_contable != id_contable_actual or id_detalle != id_detalle_actual:
         _actualizar_ids_en_config(ruta_config, id_contable, id_detalle)
-        print(f"\nconfig.yaml actualizado con los IDs de los Sheets ({ruta_config}).")
-    else:
-        print("\nconfig.yaml ya tenía los IDs correctos; no se modifica.")
+        print(f"config.yaml actualizado con los IDs de los Sheets ({ruta_config}).")
+        hubo_cambios = True
+
+    if not hubo_cambios:
+        print("\nconfig.yaml ya tenía los valores correctos; no se modifica.")
 
     print("\nListo. El negocio está preparado para correr procesar.py.")
     return 0
