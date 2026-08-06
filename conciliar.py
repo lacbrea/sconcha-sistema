@@ -76,6 +76,23 @@ def resolver_empresa(config: dict, nombre_corto: str) -> tuple[dict | None, str 
     )
 
 
+def resolver_ruc_empresa(config: dict, nombre_corto: str) -> str | None:
+    """Busca el RUC de 'nombre_corto' en config['empresas'] (la lista de
+    comprobantes: nombre_corto/razon_social/ruc), NO en
+    config['conciliacion']['empresas'], que no tiene ese campo. Existe para
+    poder pasarle --pdf-password al motor: Interbank empezo en jul-2026 a
+    cifrar los EECC en PDF de "Cuenta Negocio" con el RUC del titular como
+    contrasena (ver conciliacion/README.md). Devuelve None si no lo
+    encuentra; el llamador sigue sin contrasena, y si el PDF de verdad viene
+    cifrado el motor fallara con un mensaje claro en vez de un traceback
+    críptico de pypdf."""
+    for empresa in config.get("empresas") or []:
+        if empresa.get("nombre_corto") == nombre_corto:
+            ruc = empresa.get("ruc")
+            return str(ruc) if ruc else None
+    return None
+
+
 def directorio_trabajo(nombre_corto: str, mes: str) -> pathlib.Path:
     return pathlib.Path("salida") / "conciliacion" / nombre_corto / mes
 
@@ -157,23 +174,52 @@ def separar_principal(
 # -----------------------------------------------------------------------------
 # Constancias: selección por cuenta, fusión en un único JSON
 # -----------------------------------------------------------------------------
+def _version_de_json_constancias(nombre: str, numero: str) -> int | None:
+    """Número de versión de un 'cons_<numero>.json' de esta cuenta, o None si
+    'nombre' no es un archivo de constancias de esa cuenta.
+
+    Mismo criterio que correo_gmail._fusionar_y_subir() usa para versionar:
+    'cons_4134.json' es la versión 1, 'cons_4134 v2.json' la 2, etc.
+    """
+    patron = re.compile(rf"^cons_{re.escape(numero)}(?: v(\d+))?\.json$", re.IGNORECASE)
+    m = patron.match(nombre)
+    if not m:
+        return None
+    return int(m.group(1)) if m.group(1) else 1
+
+
 def descargar_constancias(
     almacen: AlmacenDrive, carpeta_constancias_id: str, cuentas: list[dict], destino_dir: pathlib.Path
 ) -> pathlib.Path | None:
-    """Descarga los cons_<cuenta>.json de esta empresa y los fusiona en un
-    único archivo (el motor recibe un solo JSON, no una lista de archivos).
-    Devuelve None si no hay ninguna constancia (el motor acepta 'none')."""
+    """Descarga el cons_<cuenta>.json MÁS RECIENTE de cada cuenta de esta
+    empresa y los fusiona en un único archivo (el motor recibe un solo JSON,
+    no una lista de archivos). Devuelve None si no hay ninguna constancia (el
+    motor acepta 'none').
+
+    Toma solo la última versión por cuenta, no todas las que calcen con el
+    número: correo_gmail.py sube cons_<cuenta> v2.json, v3.json... como
+    SUPERSETS acumulativos (ya fusionados con lo anterior), nunca como
+    archivos independientes. Sumar el contenido de todas las versiones
+    duplicaría cada constancia una vez por versión existente.
+    """
     archivos = almacen.listar(carpeta_constancias_id)
     elementos: list[dict] = []
     encontrados: list[str] = []
-    for archivo in archivos:
-        nombre = archivo["name"]
-        if not nombre.lower().endswith(".json"):
+    for cuenta in cuentas:
+        numero = str(cuenta["numero"])
+        mejor_archivo = None
+        mejor_version = -1
+        for archivo in archivos:
+            version = _version_de_json_constancias(archivo["name"], numero)
+            if version is not None and version > mejor_version:
+                mejor_version = version
+                mejor_archivo = archivo
+        if mejor_archivo is None:
             continue
-        if not any(str(c["numero"]) in nombre for c in cuentas):
-            continue
+
+        nombre = mejor_archivo["name"]
         destino = destino_dir / nombre
-        almacen.descargar(archivo["id"], destino)
+        almacen.descargar(mejor_archivo["id"], destino)
         try:
             contenido = json.loads(destino.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
@@ -375,6 +421,7 @@ def construir_argumentos_motor(
     comprobantes_csv: pathlib.Path | None,
     pendientes_json: pathlib.Path,
     heredar_xlsx: pathlib.Path | None,
+    pdf_password: str | None = None,
 ) -> list[str]:
     argumentos = [
         str(eecc_principal) if eecc_principal is not None else "none",
@@ -389,6 +436,8 @@ def construir_argumentos_motor(
     argumentos += ["--pendientes", str(pendientes_json)]
     if heredar_xlsx is not None:
         argumentos += ["--heredar", str(heredar_xlsx)]
+    if pdf_password:
+        argumentos += ["--pdf-password", pdf_password]
     return argumentos
 
 
@@ -610,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
     ruta_salida_xlsx = trabajo_dir / nombre_xlsx
     ruta_pendientes = trabajo_dir / "pendientes.json"
 
+    pdf_password = resolver_ruc_empresa(config, empresa_cfg["nombre_corto"])
     argumentos_motor = construir_argumentos_motor(
         eecc_principal,
         eecc_adicionales,
@@ -619,6 +669,7 @@ def main(argv: list[str] | None = None) -> int:
         ruta_csv,
         ruta_pendientes,
         ruta_heredar,
+        pdf_password=pdf_password,
     )
     try:
         invocar_motor(argumentos_motor)

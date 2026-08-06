@@ -41,6 +41,20 @@ módulo, así que importarlo dispararía el parseo de argumentos de inmediato.
 El envoltorio que arma esos argumentos desde `config.yaml` y Google Drive es
 `conciliar.py`, en la raíz del repo.
 
+## Cambios posteriores a la copia inicial
+
+- **2026-08-05 — `--pdf-password`**: los EECC en PDF de Interbank de julio
+  2026 llegaron cifrados (los de junio no lo estaban). La contraseña que usa
+  Interbank para los PDF de "Cuenta Negocio" es el RUC del titular. Se agregó
+  un flag opcional `--pdf-password` a `build_conciliacion.py` que se pasa a
+  `parsers_eecc.parse_eecc(path, password=...)`; si el PDF no está cifrado,
+  el parámetro se ignora sin error. `conciliar.py` lo arma automáticamente
+  buscando el RUC de la empresa en `config['empresas']` (la lista de
+  comprobantes, no `config['conciliacion']['empresas']`, que no tiene RUC).
+  Arreglado primero en el original
+  (`CONCILIACION\skill\scripts\`) y vuelto a copiar aquí, siguiendo la
+  convención de este directorio.
+
 ## Qué quedó fuera, y por qué
 
 `parse_constancias.py` NO se copió: rastreaba transcripciones de sesiones de

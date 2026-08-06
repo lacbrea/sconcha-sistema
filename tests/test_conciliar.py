@@ -223,6 +223,50 @@ def test_construir_argumentos_motor_orden_posicional_y_flags():
     assert argumentos[argumentos.index("--heredar") + 1] == "heredar.xlsx"
 
 
+def test_construir_argumentos_motor_pdf_password_opcional():
+    """Bug real encontrado el 2026-08-05: los EECC en PDF de Interbank de
+    julio llegaron cifrados con el RUC del titular como contrasena (los de
+    junio no lo estaban). --pdf-password se agrega solo si hay un valor;
+    con None o cadena vacia no se agrega el flag (el motor no necesita
+    contrasena para PDFs sin cifrar ni para los otros formatos)."""
+    base = dict(
+        eecc_principal=pathlib.Path("EC_4134.pdf"),
+        eecc_adicionales=[],
+        constancias=None,
+        salida_xlsx=pathlib.Path("salida.xlsx"),
+        nombre_motor="EL TEMPLO",
+        comprobantes_csv=None,
+        pendientes_json=pathlib.Path("pendientes.json"),
+        heredar_xlsx=None,
+    )
+    con_password = conciliar.construir_argumentos_motor(**base, pdf_password="20608901494")
+    assert "--pdf-password" in con_password
+    assert con_password[con_password.index("--pdf-password") + 1] == "20608901494"
+
+    sin_password = conciliar.construir_argumentos_motor(**base, pdf_password=None)
+    assert "--pdf-password" not in sin_password
+
+    password_vacio = conciliar.construir_argumentos_motor(**base, pdf_password="")
+    assert "--pdf-password" not in password_vacio
+
+
+def test_resolver_ruc_empresa_busca_en_config_empresas_no_en_conciliacion_empresas():
+    """El RUC vive en config['empresas'] (la lista de comprobantes), no en
+    config['conciliacion']['empresas'] (que solo tiene nombre_corto/
+    nombre_motor/cuentas, sin RUC) — son dos listas distintas con el mismo
+    nombre_corto como unica clave compartida."""
+    config = {
+        "empresas": [
+            {"nombre_corto": "EL TEMPLO", "ruc": "20608901494"},
+            {"nombre_corto": "INSTITUCION", "ruc": "20612506036"},
+        ],
+        "conciliacion": {"empresas": [{"nombre_corto": "EL TEMPLO", "nombre_motor": "EL TEMPLO"}]},
+    }
+    assert conciliar.resolver_ruc_empresa(config, "EL TEMPLO") == "20608901494"
+    assert conciliar.resolver_ruc_empresa(config, "INSTITUCION") == "20612506036"
+    assert conciliar.resolver_ruc_empresa(config, "NO EXISTE") is None
+
+
 def test_construir_argumentos_motor_none_cuando_falta_principal_o_constancias():
     argumentos = conciliar.construir_argumentos_motor(
         eecc_principal=None,
@@ -547,6 +591,35 @@ def test_descargar_constancias_fusiona_varios_archivos_en_uno(tmp_path):
     contenido = json.loads(ruta.read_text(encoding="utf-8"))
     assert len(contenido) == 2
     assert {c["cuenta"] for c in contenido} == {"4134", "4388"}
+
+
+def test_descargar_constancias_con_versiones_no_duplica(tmp_path):
+    """Bug real encontrado el 2026-08-05 al correr la conciliacion de julio
+    contra Gmail real: correo_gmail.py sube cons_<cuenta> v2.json como
+    SUPERSET acumulativo de cons_<cuenta>.json (no como archivo aparte), asi
+    que si descargar_constancias() suma el contenido de ambos, cada
+    constancia real termina duplicada. Debe tomar solo la version mas alta
+    por cuenta."""
+    almacen = FakeAlmacen()
+    carpeta_id = almacen.agregar_carpeta("CONSTANCIAS")
+    almacen.agregar_archivo(
+        carpeta_id, "cons_4134.json",
+        json.dumps([{"monto": 100.0, "cuenta": "4134", "numero_solicitud": "1"}]).encode("utf-8"),
+    )
+    almacen.agregar_archivo(
+        carpeta_id, "cons_4134 v2.json",
+        json.dumps([
+            {"monto": 100.0, "cuenta": "4134", "numero_solicitud": "1"},
+            {"monto": 200.0, "cuenta": "4134", "numero_solicitud": "2"},
+        ]).encode("utf-8"),
+    )
+    cuentas = [{"numero": "4134"}]
+
+    ruta = conciliar.descargar_constancias(almacen, carpeta_id, cuentas, tmp_path)
+
+    contenido = json.loads(ruta.read_text(encoding="utf-8"))
+    assert len(contenido) == 2  # no 3: la v1 no se suma a la v2
+    assert {c["numero_solicitud"] for c in contenido} == {"1", "2"}
 
 
 def test_descargar_constancias_sin_ninguna_para_la_empresa_devuelve_none(tmp_path):

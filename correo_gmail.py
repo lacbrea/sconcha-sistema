@@ -60,7 +60,13 @@ RE_NUMERO_SOLICITUD = re.compile(r"N[uú]mero de solicitud:\s*</strong>\s*(\d+)"
 RE_FECHA = re.compile(r"Fecha:</strong>\s*(\d{2}/\d{2}/\d{4})")
 RE_PARA = re.compile(r"Para:\s*</td>\s*<td>([^<]+)</td>")
 RE_CUENTA_CARGO = re.compile(r"Cuenta de cargo:\s*</td>\s*<td>([^<]+)</td>")
-RE_MONTO = re.compile(r"Monto:\s*</td>\s*<td><strong>S/\s*([\d,]+\.\d{2})")
+# Acepta S/ (soles) y $ (dolares): verificado el 2026-08-05 contra una
+# constancia real de la cuenta USD 5965 de INSTITUCION ('$ 2,426.00'), que el
+# patron original (solo 'S/') descartaba en silencio por no traer campos
+# obligatorios. El signo de moneda no se conserva en el registro porque el
+# motor de conciliacion no lo consume (solo lee fecha/monto/para); la cuenta
+# de cargo ya identifica a que libro de la empresa pertenece el monto.
+RE_MONTO = re.compile(r"Monto:\s*</td>\s*<td><strong>(?:S/|US\$|\$)\s*([\d,]+\.\d{2})")
 
 # Tipos de regla declarados en config.yaml que todavía NO se implementan (ver
 # ALCANCE): sus consultas son una suposición mientras no llegue correo real.

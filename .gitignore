@@ -1,6 +1,9 @@
 # Secretos y credenciales de Google (nunca al repositorio)
 credenciales.json
-token.json
+# token*.json y no token.json a secas: si algun dia se autoriza una segunda
+# cuenta de correo (token_personal.json), el patron amplio evita que ese token
+# quede fuera del ignore y termine en el repositorio.
+token*.json
 
 # Configuración específica del negocio (contiene los IDs de los Sheets)
 config.yaml

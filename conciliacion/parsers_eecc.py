@@ -213,9 +213,27 @@ def _dm_to_ddmmyyyy(dm, mes_stmt, anio_stmt):
     return f'{dd}/{mm}/{anio}' if anio else f'{dd}/{mm}'
 
 
-def parse_eecc_interbank_pdf(path):
+def parse_eecc_interbank_pdf(path, password=None):
+    """password: contrasena del PDF si Interbank lo protegio (jul-2026: los
+    PDF de "Cuenta Negocio" empezaron a venir cifrados con el RUC del titular
+    como contrasena; los de jun-2026 no la traian, asi que este caso no
+    se habia visto hasta ahora). Si el PDF no esta cifrado, el parametro se
+    ignora sin error."""
     import pypdf
     reader = pypdf.PdfReader(path)
+    if reader.is_encrypted:
+        if not password:
+            raise ValueError(
+                f'{path}: el PDF esta protegido con contrasena y no se paso ninguna '
+                f'(--pdf-password). Interbank suele usar el RUC del titular de la '
+                f'cuenta como contrasena de los EECC de "Cuenta Negocio".'
+            )
+        resultado = reader.decrypt(password)
+        if resultado == 0:  # 0 = ni user ni owner password calzaron
+            raise ValueError(
+                f'{path}: la contrasena provista no abrio el PDF cifrado '
+                f'(se intento como --pdf-password).'
+            )
     full_text = '\n'.join((p.extract_text() or '') for p in reader.pages)
 
     m = re.search(r'Mes:\s*([A-Za-z\xc0-\xff]+)\s+(\d{4})', full_text)
@@ -473,15 +491,18 @@ def parse_eecc_bbva_html(path):
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
-def parse_eecc(path):
+def parse_eecc(path, password=None):
     """Detecta el formato y devuelve (movimientos, meta). Lanza ValueError con
     mensaje claro si el formato no esta soportado (ej. .xls binario real -
-    xlrd esta instalado pero NO sirve para abrir estos archivos, ver SKILL.md)."""
+    xlrd esta instalado pero NO sirve para abrir estos archivos, ver SKILL.md).
+
+    password: ver parse_eecc_interbank_pdf. Se ignora para los formatos que
+    no son PDF (xlsx, bbva_html no vienen cifrados)."""
     fmt = detect_format(path)
     if fmt == 'xlsx':
         return parse_eecc_interbank_xlsx(path)
     if fmt == 'pdf':
-        return parse_eecc_interbank_pdf(path)
+        return parse_eecc_interbank_pdf(path, password=password)
     if fmt == 'bbva_html':
         return parse_eecc_bbva_html(path)
     if fmt == 'xls_biff_unsupported':

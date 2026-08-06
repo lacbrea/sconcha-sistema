@@ -74,6 +74,11 @@ ap.add_argument('--heredar', default=None, metavar='XLSX_ANTERIOR',
                       'corrida no los determina automaticamente (ITF/COMISION/JUDICIAL/traspasos siempre ganan la '
                       'regla nueva). Util para regenerar un mes (ej. cambio de formato de EECC, o se perdio el '
                       'JSON de constancias de Gmail) sin perder la depuracion previa.')
+ap.add_argument('--pdf-password', default=None, metavar='CONTRASENA',
+                 help='Contrasena para abrir los EECC en PDF que vengan cifrados (jul-2026: Interbank empezo a '
+                      'proteger los PDF de "Cuenta Negocio" con el RUC del titular). Se aplica a TODOS los PDF '
+                      'de esta corrida (bank_eecc + --eecc); si alguno no esta cifrado, se ignora para ese '
+                      'archivo sin error.')
 args = ap.parse_args()
 
 if args.banco:
@@ -321,7 +326,7 @@ def alias_de(meta):
 
 cuentas = []
 for path in eecc_paths:
-    movs, meta = parsers_eecc.parse_eecc(path)
+    movs, meta = parsers_eecc.parse_eecc(path, password=args.pdf_password)
     cuentas.append({'path': path, 'movs': movs, 'meta': meta, 'alias': None})
 
 principal_idx = elegir_principal(cuentas)
