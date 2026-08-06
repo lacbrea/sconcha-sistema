@@ -4,7 +4,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from esquema import ComprobanteExtraido, ItemExtraido
+from esquema import ComprobanteExtraido, ESQUEMA_JSON, ItemExtraido, _ITEM_JSON
 
 
 def _comprobante_base(**overrides) -> ComprobanteExtraido:
@@ -85,6 +85,36 @@ def test_validar_tolera_diferencia_de_centimos_por_redondeo():
     assert not any("no cuadra" in a for a in advertencias)
 
 
+def test_validar_acepta_lineas_con_igv_incluido():
+    """Caso real (jul-2026, TAI LOY F581-0280271, el primer comprobante que el
+    sistema proceso de verdad): subtotal 7.11 + IGV 1.29 = total 8.40, y la
+    unica linea trae 8.40 porque el proveedor imprime precio de venta al
+    publico. La extraccion era correcta campo por campo, pero exigir que las
+    lineas cuadren solo contra el subtotal lo mandaba a revision manual."""
+    comp = _comprobante_base(
+        subtotal=7.11,
+        igv=1.29,
+        total=8.40,
+        items=[ItemExtraido(orden=1, descripcion="FORRO ADH TRANSP", cantidad=2,
+                            precio_unitario=4.20, total_linea=8.40)],
+    )
+    assert not any("no cuadra" in a for a in comp.validar())
+
+
+def test_validar_detecta_diferencia_cuando_no_cuadra_ni_con_subtotal_ni_con_total():
+    """Relajar la regla para aceptar lineas con IGV no puede dejar pasar un
+    descuadre real: 50 no es ni el subtotal (100) ni el total (118)."""
+    comp = _comprobante_base(
+        subtotal=100.00,
+        igv=18.00,
+        total=118.00,
+        items=[ItemExtraido(orden=1, descripcion="Item 1", total_linea=50.00)],
+    )
+    advertencias = comp.validar()
+    assert any("no cuadra" in a for a in advertencias)
+    assert any("100" in a and "118" in a for a in advertencias)
+
+
 def test_validar_detecta_diferencia_real_entre_items_y_subtotal():
     comp = _comprobante_base(
         subtotal=100.00,
@@ -147,3 +177,43 @@ def test_validar_nunca_lanza_excepcion_con_comprobante_vacio():
     # No debe lanzar, incluso sin ningún dato.
     advertencias = comp.validar()
     assert isinstance(advertencias, list)
+
+
+# --- límite de uniones de la API --------------------------------------------
+#
+# La API de Anthropic rechazó con HTTP 400 el esquema original (24 propiedades
+# con unión de tipos) con este mensaje real:
+#   "Schemas contains too many parameters with union types (24 parameters with
+#   type arrays or anyOf). This causes exponential compilation cost. Reduce
+#   the number of nullable or union-typed parameters (limit: 16 parameters
+#   with unions)."
+# Este test cuenta las propiedades con unión (raíz + ítems) para que nadie
+# vuelva a pasarse del límite sin enterarse hasta que la API lo rechace en
+# producción.
+
+def _contar_uniones(propiedades: dict) -> int:
+    total = 0
+    for definicion in propiedades.values():
+        tipo = definicion.get("type")
+        if isinstance(tipo, list) or "anyOf" in definicion:
+            total += 1
+    return total
+
+
+def test_esquema_json_no_supera_el_limite_de_16_uniones_de_la_api():
+    uniones_raiz = _contar_uniones(ESQUEMA_JSON["properties"])
+    uniones_item = _contar_uniones(_ITEM_JSON["properties"])
+    assert uniones_raiz + uniones_item <= 16
+
+
+def test_campos_de_texto_de_la_raiz_ya_no_son_nullable():
+    # Los 11 campos de texto de la raíz deben ser {"type": "string"} a secas
+    # -- si alguno vuelve a tener unión con "null" se pasa de 16 otra vez.
+    campos_texto = [
+        "proveedor_ruc", "proveedor_razon_social", "cliente_ruc", "cliente_razon_social",
+        "tipo_documento", "serie_numero", "fecha_emision", "fecha_vencimiento", "condicion",
+        "detraccion_codigo", "documento_referencia",
+    ]
+    for campo in campos_texto:
+        assert ESQUEMA_JSON["properties"][campo] == {"type": "string"}
+    assert _ITEM_JSON["properties"]["unidad"] == {"type": "string"}

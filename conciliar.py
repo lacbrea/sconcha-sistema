@@ -28,6 +28,7 @@ import pathlib
 import re
 import subprocess
 import sys
+from typing import Any
 
 from almacen_drive import AlmacenDrive
 from procesar import cargar_config
@@ -281,12 +282,34 @@ def _rango_mes_con_margen(mes: str, margen_dias: int) -> tuple[datetime.date, da
     return inicio_mes - datetime.timedelta(days=margen_dias), fin_mes + datetime.timedelta(days=margen_dias)
 
 
-def leer_filas_sheet_contable(servicio_sheets, spreadsheet_id: str, rango: str) -> list[dict[str, str]]:
+def leer_filas_sheet_contable(servicio_sheets, spreadsheet_id: str, rango: str) -> list[dict[str, Any]]:
     """Lee el Sheet contable y lo devuelve como lista de dicts (cabecera de
     la fila 1 como llaves). Separado de filtrar_y_escribir_csv() para poder
     testear cada mitad por separado: esta función solo sabe hablar con la
-    API de Sheets; la otra solo sabe de filtrado y CSV."""
-    resp = servicio_sheets.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rango).execute()
+    API de Sheets; la otra solo sabe de filtrado y CSV.
+
+    Las dos opciones de renderizado no son cosméticas, son correctitud de los
+    importes. `registro_sheets` escribe con USER_ENTERED, así que el Sheet
+    guarda números y fechas de verdad, no texto; al leerlos, el modo por
+    defecto (FORMATTED_VALUE) los devuelve según el idioma del Sheet y un
+    subtotal sale como "686,44" con COMA decimal. El motor parsea importes con
+    `float(str(x).replace(',', ''))` (build_conciliacion.py, fnum), que sobre
+    "1507,16" da 150716.0: el monto queda inflado x100 y ningún cargo cruza.
+    UNFORMATTED_VALUE arregla el número pero devuelve la fecha como serial de
+    Sheets (46214), que `pdate_flex` no sabe leer. La combinación de abajo es
+    la única que devuelve las dos cosas bien — verificado contra el Sheet real
+    el 2026-08-06, no deducido de la documentación."""
+    resp = (
+        servicio_sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=rango,
+            valueRenderOption="UNFORMATTED_VALUE",
+            dateTimeRenderOption="FORMATTED_STRING",
+        )
+        .execute()
+    )
     valores = resp.get("values", [])
     if not valores:
         return []
@@ -298,7 +321,7 @@ def leer_filas_sheet_contable(servicio_sheets, spreadsheet_id: str, rango: str) 
 
 
 def filtrar_y_escribir_csv(
-    filas: list[dict[str, str]],
+    filas: list[dict[str, Any]],
     nombre_corto: str,
     nombre_motor: str,
     mes: str,
@@ -333,9 +356,44 @@ def filtrar_y_escribir_csv(
         for fila in filtradas:
             salida = {columna: fila.get(columna, "") for columna in COLUMNAS_CONTABLE}
             salida["EMPRESA"] = nombre_motor
+            salida["ESTADO_PAGO"] = _estado_pago_para_el_motor(fila)
             escritor.writerow(salida)
 
     return len(filtradas)
+
+
+def _estado_pago_para_el_motor(fila: dict[str, Any]) -> str:
+    """ESTADO_PAGO con el que la fila entra al CSV que consume el motor.
+
+    El motor SOLO intenta cruzar filas con ESTADO_PAGO == 'PAGADA'
+    (build_conciliacion.py:484): un comprobante "pendiente" todavía no generó
+    el cargo, y cruzarlo daría falsos positivos por coincidencia de monto y
+    fecha. Ese diseño asume que alguien marca a mano cuándo se pagó, que es lo
+    que se hacía en el backfill de junio (59 de 66 filas en PAGADA).
+
+    En el flujo nuevo nadie marca nada: `procesar.py` extrae el comprobante del
+    documento y el documento no dice si ya se pagó, así que ESTADO_PAGO llega
+    vacío y el motor ignoraría TODOS los comprobantes — que es exactamente lo
+    que pasó al conciliar julio 2026 la primera vez (8 filas en el CSV, 0
+    cruces nuevos).
+
+    Lo que sí trae el documento es la CONDICION (contado/crédito), que
+    `procesar.py` ahora extrae. Un comprobante al contado se paga contra
+    entrega, así que se ofrece al motor como candidato a cruzar; uno a crédito
+    no, porque su cargo puede caer semanas después y ahí sí el riesgo de falso
+    positivo es real.
+
+    Esto es una INFERENCIA y vive solo en el CSV de la corrida: no se escribe
+    de vuelta al Sheet contable, que debe seguir diciendo la verdad ("no se
+    sabe si se pagó"). Es la conciliación la que descubre el pago al encontrar
+    el cargo del banco. Un ESTADO_PAGO que ya venga puesto (por ejemplo
+    corregido a mano en el Sheet) siempre gana sobre esta inferencia.
+    """
+    estado = str(fila.get("ESTADO_PAGO") or "").strip()
+    if estado:
+        return estado
+    condicion = str(fila.get("CONDICION") or "").strip().lower()
+    return "PAGADA" if condicion == "contado" else ""
 
 
 def contar_filas_csv(ruta: pathlib.Path) -> int:

@@ -162,3 +162,67 @@ def test_respuesta_refusal_lanza_respuesta_rechazada():
     respuesta = _respuesta("refusal", "")
     with pytest.raises(modelo.RespuestaRechazadaError):
         modelo._procesar_respuesta(respuesta, "pdf")
+
+
+# --- (d) "" de texto del modelo se normaliza a None en el dataclass --------
+#
+# El esquema (esquema.py) ya no permite null en los campos de texto -- lo
+# sacó de la unión para no pasarse del límite de 16 uniones de la API -- así
+# que ahora el modelo devuelve "" cuando el campo no aparece en el
+# comprobante. _procesar_respuesta debe convertir esa "" a None antes de
+# armar el dataclass, porque clave() y validar() tratan "" distinto de None
+# (ej. _ruc_valido("") dispara "RUC inválido" en vez de "no hay RUC").
+
+def _datos_minimos(**overrides) -> dict:
+    datos = {
+        "proveedor_ruc": "", "proveedor_razon_social": "",
+        "cliente_ruc": "", "cliente_razon_social": "",
+        "tipo_documento": "", "serie_numero": "",
+        "fecha_emision": "", "fecha_vencimiento": "", "condicion": "",
+        "moneda": "PEN", "tipo_cambio": None,
+        "subtotal": None, "igv": None, "icbper": None, "descuento_global": None,
+        "total": None, "detraccion_pct": None, "detraccion_monto": None,
+        "detraccion_codigo": "", "retencion": None, "documento_referencia": "",
+        "confianza": 0.5, "items": [],
+    }
+    datos.update(overrides)
+    return datos
+
+
+def test_texto_vacio_del_modelo_se_normaliza_a_none_en_el_dataclass():
+    respuesta = _respuesta("end_turn", json.dumps(_datos_minimos()))
+
+    comp = modelo._procesar_respuesta(respuesta, "pdf")
+
+    assert comp.proveedor_ruc is None
+    assert comp.proveedor_razon_social is None
+    assert comp.cliente_ruc is None
+    assert comp.cliente_razon_social is None
+    assert comp.tipo_documento is None
+    assert comp.serie_numero is None
+    assert comp.fecha_emision is None
+    assert comp.fecha_vencimiento is None
+    assert comp.condicion is None
+    assert comp.detraccion_codigo is None
+    assert comp.documento_referencia is None
+
+
+def test_texto_vacio_de_ruc_no_dispara_advertencia_falsa_de_ruc_invalido():
+    respuesta = _respuesta("end_turn", json.dumps(_datos_minimos()))
+
+    comp = modelo._procesar_respuesta(respuesta, "pdf")
+    advertencias = comp.validar()
+
+    assert not any("RUC" in a for a in advertencias)
+
+
+def test_unidad_vacia_del_item_se_normaliza_a_none():
+    datos = _datos_minimos(items=[
+        {"orden": 1, "descripcion": "Item 1", "cantidad": 1.0, "unidad": "",
+         "precio_unitario": 10.0, "total_linea": 10.0},
+    ])
+    respuesta = _respuesta("end_turn", json.dumps(datos))
+
+    comp = modelo._procesar_respuesta(respuesta, "pdf")
+
+    assert comp.items[0].unidad is None

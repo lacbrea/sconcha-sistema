@@ -209,7 +209,9 @@ o similar: luz, agua, internet, telefonía), "nota_credito" (anula o corrige un 
 "nota_debito" (incrementa el valor de un comprobante anterior), "guia_remision" (traslado de bienes, sin \
 importes de venta), "otro" si no calza en ninguno de los anteriores o no se puede determinar.
 - Si es nota de crédito o nota de débito, busca a qué comprobante hace referencia (suele decir "Doc. que \
-modifica" o similar) y ponlo en documento_referencia con el mismo formato serie-número del original.
+modifica" o similar) y ponlo en documento_referencia con el mismo formato serie-número del original. Si no \
+aplica (no es nota de crédito/débito, o no encuentras la referencia), deja documento_referencia como \
+cadena vacía "".
 
 CANTIDAD Y UNIDAD (REGLA CRÍTICA — el error más común):
 - "cantidad" debe ser la cantidad TOTAL en la unidad base (kg, L o unid), NUNCA el número de \
@@ -226,13 +228,16 @@ envases/latas/botellas.
   combínalos con las unidades compradas para obtener el total.
 - Ítems indivisibles (cajas de cartón, bolsas, cinta, etiquetas): deja cantidad =
   número de piezas, unidad: "unid". Ej: 21 cajas → cantidad: 21, unidad: "unid".
+- "unidad" es texto y siempre debe llevar algún valor ("kg", "L", "unid", etc.); si de verdad no
+  se puede determinar, usa cadena vacía "" (nunca null).
 
 total_linea Y PRECIO:
 - "total_linea" = importe FINAL de la línea YA con el descuento aplicado (la cifra de
   importe a la derecha de cada renglón).
   Ejemplo: 6 × 35.00 con 10% de descuento → total_linea: 189.00 (no 210.00)
 - Si hay columna de descuento (Dcto %), aplícalo: total_linea = cantidad_envases × precio − descuento.
-- "precio_unitario": déjalo null si no estás seguro; el sistema deriva el costo con total_linea / cantidad.
+- "precio_unitario" es numérico: déjalo null si no estás seguro; el sistema deriva el costo con \
+total_linea / cantidad.
 - Los precios son en soles peruanos, sin símbolo, salvo que el documento indique explícitamente USD.
 - Las fechas vienen en formato dd/mm/yyyy en la factura — conviértelas a YYYY-MM-DD
 
@@ -240,30 +245,54 @@ DETRACCIÓN:
 - Busca la leyenda típica "Operación sujeta al Sistema de Pago de Obligaciones Tributarias (SPOT)" o \
 "Operación sujeta a detracción". Extrae detraccion_pct (número, ej. 12 para 12%, o 4 para 4%) y \
 detraccion_monto (el importe en soles depositado). Si el documento trae un código del bien/servicio \
-detraído, ponlo en detraccion_codigo.
-- Si no hay ninguna mención de detracción, deja los tres campos en null.
+detraído, ponlo en detraccion_codigo (texto).
+- Si no hay ninguna mención de detracción: detraccion_pct y detraccion_monto (numéricos) van en null; \
+detraccion_codigo (texto) va en cadena vacía "".
 
 RETENCIÓN E ICBPER:
-- "retencion": monto retenido si el documento menciona un régimen de retención de IGV (leyenda "Sujeto a \
-retención" o similar). Si no aparece, null.
-- "icbper": Impuesto al Consumo de Bolsas Plásticas, suele aparecer como una línea o cargo adicional de \
-S/ 0.50 por bolsa. Si no aparece, null.
+- "retencion" es numérico: monto retenido si el documento menciona un régimen de retención de IGV (leyenda \
+"Sujeto a retención" o similar). Si no aparece, null.
+- "icbper" es numérico: Impuesto al Consumo de Bolsas Plásticas, suele aparecer como una línea o cargo \
+adicional de S/ 0.50 por bolsa. Si no aparece, null.
 
 CONDICIÓN Y MONEDA:
-- "condicion": "contado" o "credito" según lo indicado en el documento (busca "Contado"/"Crédito", forma \
-de pago o cuotas). Si no se menciona, null.
+- "condicion" es texto: "contado" o "credito" según lo indicado en el documento (busca "Contado"/"Crédito", \
+forma de pago o cuotas). Si no se menciona, cadena vacía "" (nunca null).
 - "moneda": "PEN" (soles) o "USD" (dólares) según el documento. Si no se indica, asume "PEN".
-- "tipo_cambio": si el documento está en USD y muestra un tipo de cambio, extráelo; si no, null.
+- "tipo_cambio" es numérico: si el documento está en USD y muestra un tipo de cambio, extráelo; si no, null.
 
 CONFIANZA:
 - Agrega tu propia estimación en "confianza" (número entre 0 y 1) de qué tan segura está la extracción \
 completa. Usa valores bajos (0.3-0.5) si el documento está borroso, cortado o con campos ambiguos; \
 valores altos (0.9-1.0) si es claro y completo.
 
-GENERAL:
-- Si un campo no es legible o no aparece, usa null.
+GENERAL — REGLA DE "CAMPO AUSENTE" SEGÚN EL TIPO:
+- Todos los campos de TEXTO (proveedor_ruc, proveedor_razon_social, cliente_ruc, cliente_razon_social, \
+tipo_documento, serie_numero, fecha_emision, fecha_vencimiento, condicion, detraccion_codigo, \
+documento_referencia, y unidad dentro de cada ítem): si no son legibles o no aparecen en el documento, usa \
+cadena vacía "" — NUNCA la palabra null ni el string "null".
+- Todos los campos NUMÉRICOS (tipo_cambio, subtotal, igv, icbper, descuento_global, total, detraccion_pct, \
+detraccion_monto, retencion, y cantidad/precio_unitario/total_linea dentro de cada ítem): si no son legibles \
+o no aparecen, usa null (nunca 0, salvo que el documento realmente muestre 0).
 - Los códigos de barras al inicio de cada línea NO van en la descripción del ítem.
 - Devuelve el JSON siguiendo exactamente el esquema indicado."""
+
+
+def _texto_o_none(valor: str | None) -> str | None:
+    """Normaliza un campo de texto del JSON del modelo al `str | None` del dataclass.
+
+    El esquema (`esquema.py`) ya no permite `null` en los campos de texto —lo saca
+    de la unión para no pasarse del límite de 16 uniones de la API— así que el
+    modelo devuelve "" cuando el campo no aparece en el comprobante. Sin este paso
+    esa cadena vacía llegaría tal cual hasta el Sheet como celda vacía-pero-presente
+    y, peor, `clave()` y `validar()` tratan "" distinto de None (por ejemplo
+    `_ruc_valido("")` dispara "RUC inválido" en vez de "no hay RUC"). Cadenas con
+    solo espacios se tratan igual que "": ausente.
+    """
+    if valor is None:
+        return None
+    texto = valor.strip()
+    return texto if texto else None
 
 
 def _construir_bloque_documento(ruta: pathlib.Path, tipo: str) -> dict:
@@ -322,7 +351,7 @@ def _procesar_respuesta(respuesta, tipo: str) -> ComprobanteExtraido:
             orden=item.get("orden", posicion),
             descripcion=item.get("descripcion") or "",
             cantidad=item.get("cantidad"),
-            unidad=item.get("unidad"),
+            unidad=_texto_o_none(item.get("unidad")),
             precio_unitario=item.get("precio_unitario"),
             total_linea=item.get("total_linea"),
         )
@@ -332,15 +361,15 @@ def _procesar_respuesta(respuesta, tipo: str) -> ComprobanteExtraido:
     return ComprobanteExtraido(
         origen=origen,
         confianza=float(confianza),
-        proveedor_ruc=datos.get("proveedor_ruc"),
-        proveedor_razon_social=datos.get("proveedor_razon_social"),
-        cliente_ruc=datos.get("cliente_ruc"),
-        cliente_razon_social=datos.get("cliente_razon_social"),
-        tipo_documento=datos.get("tipo_documento"),
-        serie_numero=datos.get("serie_numero"),
-        fecha_emision=datos.get("fecha_emision"),
-        fecha_vencimiento=datos.get("fecha_vencimiento"),
-        condicion=datos.get("condicion"),
+        proveedor_ruc=_texto_o_none(datos.get("proveedor_ruc")),
+        proveedor_razon_social=_texto_o_none(datos.get("proveedor_razon_social")),
+        cliente_ruc=_texto_o_none(datos.get("cliente_ruc")),
+        cliente_razon_social=_texto_o_none(datos.get("cliente_razon_social")),
+        tipo_documento=_texto_o_none(datos.get("tipo_documento")),
+        serie_numero=_texto_o_none(datos.get("serie_numero")),
+        fecha_emision=_texto_o_none(datos.get("fecha_emision")),
+        fecha_vencimiento=_texto_o_none(datos.get("fecha_vencimiento")),
+        condicion=_texto_o_none(datos.get("condicion")),
         moneda=datos.get("moneda") or "PEN",
         tipo_cambio=datos.get("tipo_cambio"),
         subtotal=datos.get("subtotal"),
@@ -350,9 +379,9 @@ def _procesar_respuesta(respuesta, tipo: str) -> ComprobanteExtraido:
         total=datos.get("total"),
         detraccion_pct=datos.get("detraccion_pct"),
         detraccion_monto=datos.get("detraccion_monto"),
-        detraccion_codigo=datos.get("detraccion_codigo"),
+        detraccion_codigo=_texto_o_none(datos.get("detraccion_codigo")),
         retencion=datos.get("retencion"),
-        documento_referencia=datos.get("documento_referencia"),
+        documento_referencia=_texto_o_none(datos.get("documento_referencia")),
         items=items,
         advertencias=advertencias,
     )

@@ -106,8 +106,19 @@ class FakeAlmacen:
 # Doble en memoria del Resource de sheets v4, solo para leer_filas_sheet_contable.
 # -----------------------------------------------------------------------------
 class FakeServicioSheets:
+    """Doble del Resource de sheets v4, solo lo que usa conciliar.py.
+
+    Registra las opciones de renderizado con las que se pidieron los valores:
+    no son cosméticas, son correctitud de los importes. Leer con el modo por
+    defecto devuelve los números según el idioma del Sheet ("686,44" con coma),
+    y el motor los parsea con `float(str(x).replace(',', ''))`, que sobre
+    "1507,16" da 150716.0 — el importe queda inflado x100 y ningún cargo cruza.
+    Ver el docstring de leer_filas_sheet_contable().
+    """
+
     def __init__(self, valores: list[list[str]]):
         self._valores = valores
+        self.opciones_ultima_lectura: dict = {}
 
     def spreadsheets(self):
         return self
@@ -115,7 +126,11 @@ class FakeServicioSheets:
     def values(self):
         return self
 
-    def get(self, spreadsheetId, range):  # noqa: N803, A002
+    def get(self, spreadsheetId, range, valueRenderOption=None, dateTimeRenderOption=None):  # noqa: N803, A002
+        self.opciones_ultima_lectura = {
+            "valueRenderOption": valueRenderOption,
+            "dateTimeRenderOption": dateTimeRenderOption,
+        }
         return self
 
     def execute(self):
@@ -567,6 +582,57 @@ def test_leer_filas_sheet_contable_arma_dicts_desde_la_cabecera():
     filas = conciliar.leer_filas_sheet_contable(servicio, "sheet-id", "A1:AF")
 
     assert filas == [{"FECHA_EMISION": "15/06/2026", "EMPRESA": "EL TEMPLO", "TOTAL": "118.00"}]
+
+
+def test_estado_pago_infiere_pagada_solo_para_contado():
+    """El motor solo cruza filas con ESTADO_PAGO == 'PAGADA'. En el flujo nuevo
+    nadie lo marca a mano (el documento no dice si ya se pago), asi que llegaba
+    vacio y el motor ignoraba TODOS los comprobantes: julio 2026 se concilio con
+    8 filas en el CSV y 0 cruces nuevos. Se infiere desde CONDICION, que si
+    viene en el documento, y solo para 'contado': un credito puede cargarse
+    semanas despues y ahi el falso positivo por monto+fecha si es un riesgo."""
+    assert conciliar._estado_pago_para_el_motor({"CONDICION": "contado"}) == "PAGADA"
+    assert conciliar._estado_pago_para_el_motor({"CONDICION": "credito"}) == ""
+    assert conciliar._estado_pago_para_el_motor({"CONDICION": ""}) == ""
+    # Mayusculas/espacios no deberian cambiar la decision.
+    assert conciliar._estado_pago_para_el_motor({"CONDICION": " CONTADO "}) == "PAGADA"
+    # Un ESTADO_PAGO ya puesto (corregido a mano en el Sheet) gana siempre.
+    assert conciliar._estado_pago_para_el_motor(
+        {"ESTADO_PAGO": "PENDIENTE", "CONDICION": "contado"}
+    ) == "PENDIENTE"
+
+
+def test_filtrar_y_escribir_csv_aplica_la_inferencia_de_estado_pago(tmp_path):
+    filas = [
+        {"EMPRESA": "EL TEMPLO", "FECHA_EMISION": "2026-07-01", "CONDICION": "contado", "TOTAL": 8.4},
+        {"EMPRESA": "EL TEMPLO", "FECHA_EMISION": "2026-07-08", "CONDICION": "credito", "TOTAL": 188.8},
+    ]
+    destino = tmp_path / "comprobantes.csv"
+
+    conciliar.filtrar_y_escribir_csv(filas, "EL TEMPLO", "EL TEMPLO", "2026-07", destino)
+
+    with destino.open(encoding="utf-8-sig", newline="") as f:
+        escritas = list(csv.DictReader(f))
+    assert [r["ESTADO_PAGO"] for r in escritas] == ["PAGADA", ""]
+
+
+def test_leer_filas_sheet_contable_pide_numeros_crudos_y_fechas_como_texto():
+    """Bug real encontrado el 2026-08-06 al derivar el CSV del Sheet de verdad:
+    con el modo de lectura por defecto, un subtotal volvia como "686,44" (coma
+    decimal, idioma del Sheet) y el motor lo parsea con
+    `float(str(x).replace(',', ''))`, o sea "1507,16" -> 150716.0. El importe
+    quedaba inflado x100 y ningun cargo cruzaba. UNFORMATTED_VALUE arregla el
+    numero pero devuelve la fecha como serial de Sheets (46214), que el motor
+    no sabe leer; la combinacion con FORMATTED_STRING es la unica que devuelve
+    las dos cosas bien (verificado contra el Sheet real, no deducido)."""
+    servicio = FakeServicioSheets([["TOTAL"], [810]])
+
+    conciliar.leer_filas_sheet_contable(servicio, "sheet-id", "A1:AF")
+
+    assert servicio.opciones_ultima_lectura == {
+        "valueRenderOption": "UNFORMATTED_VALUE",
+        "dateTimeRenderOption": "FORMATTED_STRING",
+    }
 
 
 def test_leer_filas_sheet_contable_hoja_vacia_devuelve_lista_vacia():

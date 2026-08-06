@@ -86,12 +86,28 @@ class ComprobanteExtraido:
 
         if self.items:
             totales_linea = [item.total_linea for item in self.items if item.total_linea is not None]
-            if totales_linea and self.subtotal is not None:
+            if totales_linea and (self.subtotal is not None or self.total is not None):
                 suma_items = sum(totales_linea)
-                if not _valores_cercanos(suma_items, self.subtotal):
+                # La suma de líneas puede cuadrar contra el subtotal (detalle
+                # SIN IGV) o contra el total (detalle CON IGV incluido): las dos
+                # formas de imprimir el detalle existen y ninguna es un error.
+                # Caso real (jul-2026, TAI LOY F581-0280271): subtotal 7.11 +
+                # IGV 1.29 = total 8.40, y la única línea trae 8.40 porque el
+                # proveedor imprime precio de venta al público. Exigir solo el
+                # subtotal mandaba a revisión manual comprobantes perfectamente
+                # extraídos. Si no cuadra con ninguno de los dos, ahí sí hay
+                # algo mal, y la advertencia nombra ambas referencias.
+                cuadra_subtotal = self.subtotal is not None and _valores_cercanos(suma_items, self.subtotal)
+                cuadra_total = self.total is not None and _valores_cercanos(suma_items, self.total)
+                if not cuadra_subtotal and not cuadra_total:
+                    referencias = []
+                    if self.subtotal is not None:
+                        referencias.append(f"el subtotal (S/ {round(self.subtotal, 2)})")
+                    if self.total is not None:
+                        referencias.append(f"el total (S/ {round(self.total, 2)})")
                     advertencias.append(
-                        f"La suma de los ítems (S/ {round(suma_items, 2)}) no cuadra con el "
-                        f"subtotal (S/ {round(self.subtotal, 2)})"
+                        f"La suma de los ítems (S/ {round(suma_items, 2)}) no cuadra con "
+                        + " ni con ".join(referencias)
                     )
 
         if self.proveedor_ruc is not None and not _ruc_valido(self.proveedor_ruc):
@@ -147,6 +163,23 @@ def _fecha_valida(fecha: str) -> bool:
 # en false en todo objeto, y "required" debe listar TODAS las propiedades del
 # objeto (incluidas las que pueden venir null) — no se admiten minimum,
 # maximum, minLength ni esquemas recursivos.
+#
+# LÍMITE DE UNIONES DE LA API — NO REVERTIR A NULL EN LOS CAMPOS DE TEXTO:
+# la API de Anthropic rechaza con HTTP 400 un esquema con más de 16 propiedades
+# de tipo union (`{"type": [..., "null"]}` o `anyOf`) porque el costo de
+# compilación crece exponencialmente con cada una:
+#   "Schemas contains too many parameters with union types (24 parameters with
+#   type arrays or anyOf). This causes exponential compilation cost. Reduce
+#   the number of nullable or union-typed parameters (limit: 16 parameters
+#   with unions)."
+# Antes de este cambio había 24 (20 en la raíz + 4 en los ítems), muy por
+# encima del límite. Los campos de TEXTO se sacaron de la unión y usan
+# cadena vacía "" como valor de "ausente" (ver `_texto_o_none` en
+# `extractores/modelo.py`, que la vuelve a convertir en None para el
+# dataclass). Los campos NUMÉRICOS siguen aceptando null porque no existe un
+# centinela numérico seguro: 0 es un valor legítimo (un IGV de 0, un
+# descuento de 0) y confundirlo con "no aparece" corrompería los importes.
+# Con esto quedan 12 uniones (9 en la raíz + 3 en los ítems), bajo el límite.
 _ITEM_JSON: dict = {
     "type": "object",
     "additionalProperties": False,
@@ -155,7 +188,7 @@ _ITEM_JSON: dict = {
         "orden": {"type": "integer"},
         "descripcion": {"type": "string"},
         "cantidad": {"type": ["number", "null"]},
-        "unidad": {"type": ["string", "null"]},
+        "unidad": {"type": "string"},
         "precio_unitario": {"type": ["number", "null"]},
         "total_linea": {"type": ["number", "null"]},
     },
@@ -190,15 +223,15 @@ ESQUEMA_JSON: dict = {
         "items",
     ],
     "properties": {
-        "proveedor_ruc": {"type": ["string", "null"]},
-        "proveedor_razon_social": {"type": ["string", "null"]},
-        "cliente_ruc": {"type": ["string", "null"]},
-        "cliente_razon_social": {"type": ["string", "null"]},
-        "tipo_documento": {"type": ["string", "null"]},
-        "serie_numero": {"type": ["string", "null"]},
-        "fecha_emision": {"type": ["string", "null"]},
-        "fecha_vencimiento": {"type": ["string", "null"]},
-        "condicion": {"type": ["string", "null"]},
+        "proveedor_ruc": {"type": "string"},
+        "proveedor_razon_social": {"type": "string"},
+        "cliente_ruc": {"type": "string"},
+        "cliente_razon_social": {"type": "string"},
+        "tipo_documento": {"type": "string"},
+        "serie_numero": {"type": "string"},
+        "fecha_emision": {"type": "string"},
+        "fecha_vencimiento": {"type": "string"},
+        "condicion": {"type": "string"},
         "moneda": {"type": "string"},
         "tipo_cambio": {"type": ["number", "null"]},
         "subtotal": {"type": ["number", "null"]},
@@ -208,9 +241,9 @@ ESQUEMA_JSON: dict = {
         "total": {"type": ["number", "null"]},
         "detraccion_pct": {"type": ["number", "null"]},
         "detraccion_monto": {"type": ["number", "null"]},
-        "detraccion_codigo": {"type": ["string", "null"]},
+        "detraccion_codigo": {"type": "string"},
         "retencion": {"type": ["number", "null"]},
-        "documento_referencia": {"type": ["string", "null"]},
+        "documento_referencia": {"type": "string"},
         "confianza": {"type": "number"},
         "items": {"type": "array", "items": _ITEM_JSON},
     },
