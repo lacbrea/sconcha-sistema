@@ -23,16 +23,43 @@ CARPETAS = {"EECC": "eecc-id", "CONSTANCIAS": "constancias-id", "BUZON": "buzon-
 # -----------------------------------------------------------------------------
 # Doble en memoria del Resource de gmail v1 (googleapiclient), sin red.
 #
-# Reproduce la cadena real: servicio.users().messages().list(...).execute()
-# y servicio.users().messages().get(...).execute(). attachments() existe
-# solo para poder comprobar que NUNCA se llama (tipo 'adjunto' no está
-# implementado todavía).
+# Reproduce la cadena real: servicio.users().messages().list(...).execute(),
+# servicio.users().messages().get(...).execute() y
+# servicio.users().messages().attachments().get(...).execute() (esta última
+# la usa el tipo de regla 'adjunto' para bajar adjuntos grandes, que Gmail no
+# manda inline en el mensaje completo).
 # -----------------------------------------------------------------------------
+class _FakeAdjuntosResource:
+    """Doble de servicio.users().messages().attachments(): un recurso
+    aparte porque su get() tiene una firma distinta (messageId + id) a la
+    de messages().get() (id + format), aunque ambos viven bajo el mismo
+    'servicio' en la API real."""
+
+    def __init__(self, servicio: "FakeServicioGmail"):
+        self._servicio = servicio
+        self._pendiente_id: str | None = None
+
+    def get(self, userId=None, messageId=None, id=None):  # noqa: N803,A002
+        self._servicio.llamadas_attachments.append((messageId, id))
+        self._pendiente_id = id
+        return self
+
+    def execute(self):
+        if self._pendiente_id in self._servicio._fallos_adjunto:
+            raise self._servicio._fallos_adjunto[self._pendiente_id]
+        contenido = self._servicio._adjuntos.get(self._pendiente_id)
+        if contenido is None:
+            raise AssertionError(f"adjunto '{self._pendiente_id}' no fue registrado con agregar_adjunto()")
+        return {"attachmentId": self._pendiente_id, "size": len(contenido), "data": _b64url_bytes(contenido)}
+
+
 class FakeServicioGmail:
     def __init__(self):
         self._mensajes: dict[str, dict] = {}
         self._orden_ids: list[str] = []
         self._fallos: dict[str, Exception] = {}
+        self._adjuntos: dict[str, bytes] = {}
+        self._fallos_adjunto: dict[str, Exception] = {}
         self.llamadas_list: list[dict] = []
         self.llamadas_get: list[str] = []
         self.llamadas_attachments: list[tuple] = []
@@ -48,6 +75,15 @@ class FakeServicioGmail:
         simular un error de la API de Gmail."""
         self._orden_ids.append(msg_id)
         self._fallos[msg_id] = excepcion
+
+    def agregar_adjunto(self, attachment_id: str, contenido: bytes) -> None:
+        """Registra el contenido que devuelve attachments().get() para ese
+        attachment_id -- imita a Gmail entregando el adjunto aparte del
+        mensaje completo."""
+        self._adjuntos[attachment_id] = contenido
+
+    def fallar_en_attachment(self, attachment_id: str, excepcion: Exception) -> None:
+        self._fallos_adjunto[attachment_id] = excepcion
 
     # -- interfaz que imita googleapiclient -------------------------------
     def users(self):
@@ -66,9 +102,8 @@ class FakeServicioGmail:
         self._pendiente = ("get", id)
         return self
 
-    def attachments(self, *a, **k):  # nunca debería llamarse en este módulo
-        self.llamadas_attachments.append((a, k))
-        raise AssertionError("attachments() no debería llamarse: tipo 'adjunto' no está implementado")
+    def attachments(self):
+        return _FakeAdjuntosResource(self)
 
     def execute(self):
         accion = self._pendiente[0]
@@ -124,6 +159,26 @@ class FakeAlmacenDrive:
         self.llamadas_descargar.append((file_id, destino))
         return destino
 
+    def buscar_por_nombre(self, carpeta_id: str, nombre: str) -> dict | None:
+        """Mismo contrato que AlmacenDrive.buscar_por_nombre: el archivo de esa
+        carpeta con ese nombre exacto, o None si no está.
+
+        El doble no lo tenía y la regla `adjunto` sí lo usa (comprueba si el
+        adjunto ya está en Drive antes de subirlo, que es lo que hace
+        idempotente la bajada de correo). Sin este método, 11 tests fallaban
+        con un AttributeError que parecía un bug del módulo cuando en realidad
+        era el doble el que se había quedado atrás.
+        """
+        for archivo in self._archivos.values():
+            if archivo["name"] == nombre and carpeta_id in archivo["parents"]:
+                return {
+                    "id": archivo["id"],
+                    "name": archivo["name"],
+                    "mimeType": "application/octet-stream",
+                    "size": str(len(archivo["content"])),
+                }
+        return None
+
     def subir(self, carpeta_id: str, nombre: str, origen, mimetype: str = "application/octet-stream") -> str:
         contenido = bytes(origen) if isinstance(origen, (bytes, bytearray)) else pathlib.Path(origen).read_bytes()
         self._contador += 1
@@ -142,6 +197,12 @@ def _b64url(texto: str) -> str:
     """Codifica como Gmail: base64 URL-safe SIN relleno. Ejercita a propósito
     el arreglo de padding de correo_gmail._decodificar_base64url."""
     return base64.urlsafe_b64encode(texto.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _b64url_bytes(datos: bytes) -> str:
+    """Igual que _b64url pero para bytes crudos (el contenido de un
+    adjunto), sin pasar por texto/utf-8."""
+    return base64.urlsafe_b64encode(datos).decode("ascii").rstrip("=")
 
 
 def _html_constancia(
@@ -191,6 +252,71 @@ def _payload_anidado(html: str) -> dict:
                 ],
             },
         ],
+    }
+
+
+def _parte_adjunto(
+    filename: str,
+    contenido: bytes,
+    mime_type: str = "application/pdf",
+    attachment_id: str | None = "attach-1",
+    inline: bool = False,
+) -> dict:
+    """Parte de un mensaje con un adjunto: 'filename' no vacío, como los
+    identifica _partes_con_adjunto. Por defecto trae 'body.attachmentId'
+    (el caso normal, verificado el 2026-08-05 contra un correo real: Gmail
+    no manda el contenido de adjuntos dentro del mensaje completo). Con
+    inline=True en cambio simula el caso de un adjunto chico que sí trae
+    'body.data' directo."""
+    if inline:
+        body = {"size": len(contenido), "data": _b64url_bytes(contenido)}
+    else:
+        body = {"attachmentId": attachment_id, "size": len(contenido)}
+    return {"mimeType": mime_type, "filename": filename, "body": body}
+
+
+def _payload_con_adjunto(
+    filename: str,
+    contenido: bytes,
+    attachment_id: str | None = "attach-1",
+    anidado: bool = False,
+    inline: bool = False,
+    mime_type: str = "application/pdf",
+) -> dict:
+    """multipart/mixed con la parte de texto (multipart/alternative, se
+    ignora) y el adjunto como hermano -misma estructura que la verificada
+    el 2026-08-05 contra un correo real de Interbank con un EECC adjunto.
+    Con anidado=True el adjunto queda un nivel más abajo (multipart/mixed >
+    multipart/mixed > adjunto), para ejercitar la recursión de
+    _partes_con_adjunto más allá de un solo nivel."""
+    parte_texto = {
+        "mimeType": "multipart/alternative",
+        "parts": [
+            {"mimeType": "text/plain", "body": {"data": _b64url("cuerpo de correo, se ignora")}},
+            {"mimeType": "text/html", "body": {"data": _b64url("<html><body>cuerpo html, se ignora</body></html>")}},
+        ],
+    }
+    parte_adjunto = _parte_adjunto(filename, contenido, mime_type=mime_type, attachment_id=attachment_id, inline=inline)
+    if anidado:
+        return {
+            "mimeType": "multipart/mixed",
+            "parts": [parte_texto, {"mimeType": "multipart/mixed", "parts": [parte_adjunto]}],
+        }
+    return {"mimeType": "multipart/mixed", "parts": [parte_texto, parte_adjunto]}
+
+
+def _regla_adjunto(
+    nombre: str = "eecc-interbank",
+    destino: str = "EECC",
+    extensiones=(".pdf",),
+    consulta: str = "subject:(te enviamos el estado) has:attachment",
+) -> dict:
+    return {
+        "nombre": nombre,
+        "tipo": "adjunto",
+        "destino": destino,
+        "consulta": consulta,
+        "extensiones": list(extensiones),
     }
 
 
@@ -326,14 +452,15 @@ def test_html_anidado_en_parts_dentro_de_parts_se_encuentra():
 
 
 # -----------------------------------------------------------------------------
-# Regla de tipo 'adjunto': no implementada todavía
+# Regla de tipo desconocido (ni implementado, ni declarado como pendiente):
+# el mecanismo de saltar-con-advertencia sigue vivo para el próximo tipo que
+# se agregue a config.yaml sin código todavía.
 # -----------------------------------------------------------------------------
-def test_regla_adjunto_se_salta_con_advertencia_y_suma_omitidos_sin_attachments(caplog):
+def test_regla_de_tipo_desconocido_se_salta_con_advertencia_sin_consultar_gmail(caplog):
     reglas = [
         {
-            "nombre": "eecc-interbank", "tipo": "adjunto", "destino": "EECC",
-            "consulta": "from:interbank.pe subject:(estado de cuenta) has:attachment",
-            "extensiones": [".pdf"],
+            "nombre": "algo-nuevo", "tipo": "tipo_que_no_existe", "destino": "EECC",
+            "consulta": "subject:(lo que sea) has:attachment",
         },
     ]
     config = _config(reglas=reglas)
@@ -349,8 +476,308 @@ def test_regla_adjunto_se_salta_con_advertencia_y_suma_omitidos_sin_attachments(
     assert servicio.llamadas_attachments == []
     assert servicio.llamadas_list == []  # ni siquiera se consulta Gmail para esta regla
     assert any(
-        "eecc-interbank" in m and "adjunto" in m and "todavía no implementado" in m for m in caplog.messages
+        "algo-nuevo" in m and "tipo_que_no_existe" in m and "desconocido" in m for m in caplog.messages
     )
+
+
+# -----------------------------------------------------------------------------
+# Regla de tipo 'adjunto': adjunto anidado se encuentra y se sube
+# -----------------------------------------------------------------------------
+def test_adjunto_anidado_en_parts_dentro_de_parts_se_encuentra_y_se_sube():
+    contenido_pdf = b"%PDF-1.4 contenido de prueba, no es un pdf real"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("estado.pdf", contenido_pdf, attachment_id="attach-1", anidado=True))
+    servicio.agregar_adjunto("attach-1", contenido_pdf)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["errores"] == []
+    assert resultado["adjuntos"] == 1
+    assert resultado["omitidos"] == 0
+    assert len(almacen.llamadas_subir) == 1
+
+    subida = almacen.llamadas_subir[0]
+    assert subida["carpeta_id"] == CARPETAS["EECC"]
+    assert subida["nombre"] == "estado.pdf"
+    assert subida["contenido"] == contenido_pdf
+    assert subida["mimetype"] == "application/pdf"
+
+    assert resultado["archivos"][0]["destino"] == "EECC"
+    assert resultado["archivos"][0]["regla"] == "eecc-interbank"
+    assert resultado["archivos"][0]["archivo"] == "estado.pdf"
+    assert resultado["archivos"][0]["mensaje"] == "msg-1"
+    assert resultado["archivos"][0]["id"] in almacen._archivos  # id real que devolvió AlmacenDrive.subir()
+
+
+# -----------------------------------------------------------------------------
+# Adjunto con 'body.data' inline (adjuntos chicos), sin attachmentId
+# -----------------------------------------------------------------------------
+def test_adjunto_con_data_inline_sin_attachment_id_se_sube_sin_llamar_a_attachments():
+    contenido = b"contenido chico, viene inline"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("chico.pdf", contenido, inline=True))
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["errores"] == []
+    assert resultado["adjuntos"] == 1
+    assert almacen.llamadas_subir[0]["contenido"] == contenido
+    assert servicio.llamadas_attachments == []  # no hizo falta pedirlo aparte
+
+
+# -----------------------------------------------------------------------------
+# Filtro por extensión
+# -----------------------------------------------------------------------------
+def test_adjunto_con_extension_no_permitida_se_omite_y_no_se_sube():
+    contenido_zip = b"PK\x03\x04 contenido zip de prueba"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("comprimido.zip", contenido_zip, mime_type="application/zip"))
+    servicio.agregar_adjunto("attach-1", contenido_zip)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto(extensiones=(".pdf",))], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["errores"] == []
+    assert resultado["adjuntos"] == 0
+    assert resultado["omitidos"] == 1
+    assert almacen.llamadas_subir == []
+
+
+def test_adjunto_extension_no_distingue_mayusculas():
+    contenido_pdf = b"%PDF-1.4 contenido de prueba"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("ESTADO.PDF", contenido_pdf))
+    servicio.agregar_adjunto("attach-1", contenido_pdf)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto(extensiones=(".pdf",))], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 1
+    assert almacen.llamadas_subir[0]["nombre"] == "ESTADO.PDF"
+
+
+# -----------------------------------------------------------------------------
+# Idempotencia: correr dos veces no duplica nada en Drive
+# -----------------------------------------------------------------------------
+def test_adjunto_idempotente_segunda_corrida_no_vuelve_a_subir():
+    contenido_pdf = b"%PDF-1.4 contenido de prueba"
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    servicio1 = FakeServicioGmail()
+    servicio1.agregar("msg-1", _payload_con_adjunto("estado.pdf", contenido_pdf))
+    servicio1.agregar_adjunto("attach-1", contenido_pdf)
+    resultado1 = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio1)
+    assert resultado1["adjuntos"] == 1
+    assert len(almacen.llamadas_subir) == 1
+
+    # Segunda corrida: mismo correo (por ejemplo, sigue calzando con la
+    # consulta porque todavía está dentro de dias_atras). subir() NO debe
+    # llamarse de nuevo.
+    servicio2 = FakeServicioGmail()
+    servicio2.agregar("msg-1", _payload_con_adjunto("estado.pdf", contenido_pdf))
+    servicio2.agregar_adjunto("attach-1", contenido_pdf)
+    resultado2 = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio2)
+
+    assert resultado2["adjuntos"] == 0
+    assert resultado2["omitidos"] == 1
+    assert resultado2["errores"] == []
+    assert len(almacen.llamadas_subir) == 1  # sigue en 1: no se volvió a llamar a subir()
+
+
+# -----------------------------------------------------------------------------
+# Nombre de adjunto malicioso: no puede escapar de la carpeta que le toca
+# -----------------------------------------------------------------------------
+def test_nombre_de_adjunto_con_path_traversal_se_sanea():
+    contenido = b"contenido cualquiera"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("../../evil.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["errores"] == []
+    assert len(almacen.llamadas_subir) == 1
+    nombre_subido = almacen.llamadas_subir[0]["nombre"]
+    assert "/" not in nombre_subido
+    assert "\\" not in nombre_subido
+    assert ".." not in nombre_subido
+    assert nombre_subido.endswith("evil.pdf")
+
+
+def test_nombre_de_adjunto_con_caracteres_de_control_se_sanea():
+    contenido = b"contenido cualquiera"
+    nombre_crudo = "estado\x00\x0a\x1f.pdf"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto(nombre_crudo, contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["errores"] == []
+    nombre_subido = almacen.llamadas_subir[0]["nombre"]
+    assert "\x00" not in nombre_subido
+    assert "\x0a" not in nombre_subido
+    assert "\x1f" not in nombre_subido
+    assert nombre_subido == "estado.pdf"
+
+
+def test_sanear_nombre_archivo_directo():
+    """Prueba unitaria de _sanear_nombre_archivo, incluido el caso donde el
+    nombre queda vacío después de sanear (solo caracteres de control, o
+    solo separadores/puntos dobles): usa el fallback con el id del mensaje,
+    en vez de tumbar la corrida con un nombre inservible."""
+    assert correo_gmail._sanear_nombre_archivo("estado.pdf", "msg-1") == "estado.pdf"
+    assert correo_gmail._sanear_nombre_archivo("../../evil.pdf", "msg-1") == "evil.pdf"
+    assert correo_gmail._sanear_nombre_archivo("", "msg-1") == "adjunto_sin_nombre_msg-1"
+    assert correo_gmail._sanear_nombre_archivo(None, "msg-2") == "adjunto_sin_nombre_msg-2"
+    assert correo_gmail._sanear_nombre_archivo("\x00\x01\x02", "msg-3") == "adjunto_sin_nombre_msg-3"
+    assert correo_gmail._sanear_nombre_archivo("..", "msg-4") == "adjunto_sin_nombre_msg-4"
+
+
+# -----------------------------------------------------------------------------
+# Nombre de adjunto vacío no tumba la corrida
+# -----------------------------------------------------------------------------
+def test_nombre_de_adjunto_vacio_no_tumba_la_corrida():
+    """Un adjunto cuyo nombre sanea a vacío (aquí: solo caracteres de
+    control, sin extensión reconocible) no revienta la corrida: cae a
+    'omitidos' -el nombre de respaldo no tiene extensión, así que nunca
+    calza con 'extensiones'- y el resto de los mensajes se procesa igual."""
+    contenido_malo = b"nombre inservible"
+    contenido_bueno = b"%PDF-1.4 este si tiene nombre util"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-malo", _payload_con_adjunto("\x00\x01\x02", contenido_malo, attachment_id="attach-malo"))
+    servicio.agregar_adjunto("attach-malo", contenido_malo)
+    servicio.agregar("msg-bueno", _payload_con_adjunto("estado.pdf", contenido_bueno, attachment_id="attach-bueno"))
+    servicio.agregar_adjunto("attach-bueno", contenido_bueno)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["errores"] == []
+    assert resultado["omitidos"] == 1
+    assert resultado["adjuntos"] == 1
+    assert len(almacen.llamadas_subir) == 1
+    assert almacen.llamadas_subir[0]["nombre"] == "estado.pdf"
+
+
+# -----------------------------------------------------------------------------
+# dry_run
+# -----------------------------------------------------------------------------
+def test_adjunto_dry_run_no_llama_a_subir():
+    contenido = b"contenido cualquiera"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("estado.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio, dry_run=True)
+
+    assert almacen.llamadas_subir == []
+    assert resultado["adjuntos"] == 1  # se reporta lo que habría subido
+    assert resultado["archivos"][0]["archivo"] == "estado.pdf"
+    assert "id" not in resultado["archivos"][0]
+    assert servicio.llamadas_attachments == []  # dry-run no baja el contenido, no hace falta
+
+
+# -----------------------------------------------------------------------------
+# Un mensaje que revienta se anota en errores y los siguientes se procesan
+# -----------------------------------------------------------------------------
+def test_adjunto_mensaje_que_revienta_se_anota_en_errores_y_siguientes_se_procesan():
+    contenido_bueno = b"%PDF-1.4 contenido bueno"
+    servicio = FakeServicioGmail()
+    servicio.fallar_en_get("msg-api-error", RuntimeError("500 backend error"))
+    servicio.agregar("msg-bueno", _payload_con_adjunto("estado.pdf", contenido_bueno, attachment_id="attach-bueno"))
+    servicio.agregar_adjunto("attach-bueno", contenido_bueno)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 1
+    assert len(resultado["errores"]) == 1
+    assert "msg-api-error" in resultado["errores"][0]
+    assert almacen.llamadas_subir[0]["contenido"] == contenido_bueno
+
+
+def test_adjunto_falla_al_bajar_contenido_se_anota_en_errores_y_no_tumba_la_corrida():
+    contenido_bueno = b"%PDF-1.4 contenido bueno"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-falla", _payload_con_adjunto("falla.pdf", b"", attachment_id="attach-falla"))
+    servicio.fallar_en_attachment("attach-falla", RuntimeError("adjunto no disponible"))
+    servicio.agregar("msg-bueno", _payload_con_adjunto("estado.pdf", contenido_bueno, attachment_id="attach-bueno"))
+    servicio.agregar_adjunto("attach-bueno", contenido_bueno)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 1
+    assert len(resultado["errores"]) == 1
+    assert "msg-falla" in resultado["errores"][0]
+    assert len(almacen.llamadas_subir) == 1
+    assert almacen.llamadas_subir[0]["contenido"] == contenido_bueno
+
+
+# -----------------------------------------------------------------------------
+# Destino inexistente en carpetas: error reportado, no excepción
+# -----------------------------------------------------------------------------
+def test_adjunto_con_destino_inexistente_en_carpetas_se_reporta_como_error():
+    contenido = b"contenido cualquiera"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("estado.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto(destino="NO_EXISTE")], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 0
+    assert len(resultado["errores"]) == 1
+    assert "NO_EXISTE" in resultado["errores"][0]
+    assert almacen.llamadas_subir == []
+    assert servicio.llamadas_list == []  # ni siquiera se consultó Gmail: no hay dónde subir
+
+
+# -----------------------------------------------------------------------------
+# Ningún cuerpo de correo llega a Drive (tampoco con adjuntos de por medio)
+# -----------------------------------------------------------------------------
+def test_adjunto_ningun_cuerpo_de_correo_llega_a_drive(caplog):
+    marca = "MARCA_DISTINTIVA_QUE_NUNCA_DEBE_GUARDARSE_EN_DRIVE_NI_EN_EL_LOG"
+    contenido_pdf = "%PDF-1.4 contenido real del adjunto, sin la marca".encode("utf-8")
+    servicio = FakeServicioGmail()
+    payload = _payload_con_adjunto("estado.pdf", contenido_pdf)
+    # Inserta la marca en el cuerpo (texto plano / HTML) del mensaje, para
+    # confirmar que nunca sale de ahí.
+    payload["parts"][0]["parts"][0]["body"]["data"] = _b64url(f"cuerpo con {marca}")
+    payload["parts"][0]["parts"][1]["body"]["data"] = _b64url(f"<html><body>{marca}</body></html>")
+    servicio.agregar("msg-1", payload)
+    servicio.agregar_adjunto("attach-1", contenido_pdf)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto()], numeros_cuenta=None)
+
+    with caplog.at_level(logging.DEBUG):
+        resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 1
+    assert len(almacen.llamadas_subir) == 1
+    # Lo subido son EXACTAMENTE los bytes del adjunto, nunca el cuerpo.
+    assert almacen.llamadas_subir[0]["contenido"] == contenido_pdf
+
+    for registro in caplog.records:
+        assert marca not in registro.getMessage()
 
 
 # -----------------------------------------------------------------------------

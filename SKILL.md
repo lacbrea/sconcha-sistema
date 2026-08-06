@@ -25,7 +25,7 @@ config.yaml             datos del negocio (empresas, RUCs, locales, IDs de carpe
 config.ejemplo.yaml      plantilla comentada para dar de alta OTRO negocio
 
 conciliar.py            envoltorio de conciliación bancaria: arma los argumentos del motor desde config.yaml y sube el .xlsx a Drive (ver "Conciliación bancaria" más abajo)
-correo_gmail.py          lectura de Gmail de solo lectura, para bajar constancias de transferencia (y, cuando se implemente, EECC y comprobantes)
+correo_gmail.py          lectura de Gmail de solo lectura, para bajar constancias de transferencia (cuerpo del correo) y EECC/comprobantes (adjuntos)
 conciliacion/             motor de conciliación bancaria vendorizado (ver conciliacion/README.md)
 
 esquema.py               (otro agente) dataclasses ComprobanteExtraido / ItemExtraido
@@ -243,13 +243,41 @@ puede ser `principal`.
 ### Correo (Gmail, solo lectura)
 
 `correo_gmail.py` lee Gmail de la cuenta del negocio (ámbito
-`gmail.readonly`, agregado en `auth_google.py`) para bajar constancias de
-transferencia a `CONSTANCIAS`. Nunca escribe, responde ni borra correo, y
-nunca guarda el cuerpo de un mensaje (ver el docstring de
-`correo_gmail.py` para el detalle de esa garantía). `conciliar.py` lo
+`gmail.readonly`, agregado en `auth_google.py`) para bajar dos cosas:
+constancias de transferencia (tipo de regla `constancia_interbank`, viven
+en el CUERPO del correo, van a `CONSTANCIAS`) y adjuntos (tipo de regla
+`adjunto`: EECC, comprobantes de proveedores, van a la carpeta que declare
+`destino` en cada regla). Nunca escribe, responde ni borra correo, y nunca
+guarda el cuerpo de un mensaje — los adjuntos SÍ se guardan (son el
+objetivo de esa regla), el cuerpo del mensaje no, nunca (ver el docstring
+de `correo_gmail.py` para el detalle de esa garantía). `conciliar.py` lo
 invoca antes de juntar los archivos, solo si `correo.habilitado` es
 `true` y no se pasó `--dry-run`; si falla, no aborta la conciliación —
 sigue con lo que ya haya en Drive.
+
+Cómo baja un adjunto (tipo de regla `adjunto`): recorre las partes del
+mensaje recursivamente buscando las que traen nombre de archivo (pueden
+venir anidadas varios niveles), filtra por la lista `extensiones` de la
+regla, y sube el contenido tal cual —bytes en memoria, nunca toca
+disco— a `carpetas[regla.destino]`. Es idempotente por nombre de archivo
+dentro de esa carpeta (`AlmacenDrive.buscar_por_nombre`): correr la misma
+regla dos veces no duplica nada. El nombre del adjunto se sanea antes de
+subirlo (viene de fuera del sistema, no es confiable): se descarta
+cualquier componente de ruta y los caracteres de control, y si el
+resultado queda vacío se usa un nombre de respaldo con el id del mensaje.
+
+**Limitación conocida y a propósito no resuelta: el mes del correo no es
+el mes del documento.** El destino de un adjunto es la carpeta que decide
+quien llama (`conciliar.py` la resuelve por el mes que se está
+conciliando), no el periodo real del documento. Verificado el 2026-08-05:
+el EECC de julio 2026 de Interbank llegó por correo el 2026-08-03, y su
+nombre de archivo (`202607010012003007064134.pdf`) codifica el periodo
+`202607` en los primeros 6 dígitos — pero esa numeración es específica de
+Interbank, no sirve para BBVA, Izipay ni proveedores, así que
+`correo_gmail.py` no intenta leer el periodo del nombre del archivo. Con
+`dias_atras: 45` (el valor por defecto) un EECC recién llegado cae en el
+mes que se está conciliando, que es el caso normal; correr un mes viejo
+mucho después de que llegó el correo no lo va a encontrar.
 
 Estado actual, sin ambigüedad:
 
@@ -257,14 +285,17 @@ Estado actual, sin ambigüedad:
   consentimiento todavía**: no existe `token.json`.
 - `correo.habilitado` está en `false` en `config.yaml`; mientras esté así,
   `conciliar.py` nunca llama a Gmail.
-- De las reglas declaradas en `config.yaml -> correo.reglas`, **solo el
-  tipo `constancia_interbank` está implementado**. Las reglas de tipo
-  `adjunto` (EECC de Interbank y BBVA, comprobantes de proveedores por
-  correo) están declaradas pero sin implementar, a propósito: sus
-  consultas de remitente y asunto son una suposición mientras no llegue
-  correo real a la cuenta del negocio (creada el 2026-08-03, todavía
-  vacía) con el que confirmarlas. Una regla de un tipo no implementado se
-  salta con una advertencia que la nombra, nunca en silencio.
+- De las reglas declaradas en `config.yaml -> correo.reglas`, **los tipos
+  `constancia_interbank` y `adjunto` ya están implementados** en
+  `correo_gmail.py`. Eso no quiere decir que todas las reglas estén
+  calibradas: `eecc-bbva` y `comprobantes-proveedores` siguen marcadas
+  `PROVISIONAL` en `config.yaml` porque su consulta (remitente/asunto) es
+  una suposición mientras no llegue un correo real de BBVA o de un
+  proveedor con el que verificarla — solo `eecc-interbank` y
+  `constancias-interbank` están verificadas contra correo real. Una regla
+  de un tipo que no exista en el código se sigue saltando con una
+  advertencia que la nombra, nunca en silencio (mecanismo que queda listo
+  para el próximo tipo que se agregue).
 - El permiso de Gmail abarca **todo el buzón** — no existe permiso por
   etiqueta ni por remitente —, así que la cuenta debe ser exclusiva del
   negocio y el acotamiento (qué se lee, cuánto) se hace en el código y en

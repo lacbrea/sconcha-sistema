@@ -489,6 +489,178 @@ def parse_eecc_bbva_html(path):
 
 
 # ---------------------------------------------------------------------------
+# 4) BBVA - PDF "MOVIMIENTO Y SALDO A LA FECHA"
+#
+# Desde jul-2026 el estado de cuenta de BBVA llega en PDF; hasta jun-2026
+# llegaba como .xls (HTML disfrazado, ver parse_eecc_bbva_html). Sin este
+# parser, un PDF de BBVA caia en parse_eecc_interbank_pdf y salia con 0
+# movimientos, banco 'INTERBANK' y anchor_ok=True: la conciliacion reportaba
+# que todo cuadraba mientras ignoraba el mes entero de esa cuenta.
+# ---------------------------------------------------------------------------
+_RE_BBVA_FILA = re.compile(r'^(\d{2}-\d{2})\s+(\d{2}-\d{2})\s+(.*)$')
+# Un importe siempre trae 2 decimales; el numero de operacion (17422) no. Ese
+# es el discriminador para separar montos de identificadores dentro de la fila.
+_RE_BBVA_IMPORTE = re.compile(r'-?[\d,]*\d\.\d{2}(?![\d])')
+# Lineas informativas del detalle de consumo en dolares: no son movimientos.
+_RE_BBVA_INFORMATIVA = re.compile(r'^\s*IMP\s*\.?\s*OP', re.I)
+
+
+def _texto_pdf(path, password=None):
+    """Texto completo de un PDF, descifrandolo si hace falta. Comparte el
+    criterio de parse_eecc_interbank_pdf (ver ahi el porque del descifrado)."""
+    import pypdf
+    reader = pypdf.PdfReader(path)
+    if reader.is_encrypted:
+        if not password:
+            raise ValueError(
+                f'{path}: el PDF esta protegido con contrasena y no se paso ninguna '
+                f'(--pdf-password).'
+            )
+        if reader.decrypt(password) == 0:
+            raise ValueError(f'{path}: la contrasena provista no abrio el PDF cifrado.')
+    return '\n'.join((p.extract_text() or '') for p in reader.pages)
+
+
+def _normalizar_importes_pdf(texto):
+    """Pega los importes que la extraccion de texto parte antes del punto
+    decimal ('4,327 .15' -> '4,327.15', '7 .58' -> '7.58').
+
+    Solo toca digito-espacios-punto-2digitos, asi que no altera 'T .C:' ni
+    ninguna abreviatura con punto: ahi lo que precede al espacio es una letra."""
+    return re.sub(r'(\d)\s+\.(\d{2})\b', r'\1.\2', texto)
+
+
+def _filas_logicas_bbva(texto):
+    """Agrupa las lineas fisicas en filas logicas. Una fila empieza con dos
+    fechas 'DD-MM DD-MM'; lo que viene despues, hasta la siguiente fecha doble,
+    pertenece a la misma fila.
+
+    Hace falta porque la extraccion parte una fila en varias lineas cuando la
+    descripcion es larga: 'DEPOS. EN CTA. ... OF DOMINGO' / 'CU' /
+    'VEN 17425 1,550.00 0.05 5,877.10' son una sola fila, y los importes viven
+    en el ultimo pedazo."""
+    # El pie del estado ('TOTALES POR ITF' y lo que sigue) trae importes que no
+    # son movimientos. Si no se corta ahi, se pegan a la ULTIMA fila y la
+    # arruinan: sus importes desplazan al saldo real y la fila entera se
+    # descarta. Peor aun, el saldo final se calcula de lo parseado, asi que la
+    # fila faltante no descuadra nada y el error pasa desapercibido. Mismo corte
+    # que hace parse_eecc_bbva_html.
+    corte = re.search(r'TOTALES\s+POR\s+ITF', texto, re.I)
+    if corte:
+        texto = texto[:corte.start()]
+
+    filas = []
+    actual = None
+    for linea in texto.split('\n'):
+        if _RE_BBVA_INFORMATIVA.match(linea):
+            continue
+        m = _RE_BBVA_FILA.match(linea.strip())
+        if m:
+            if actual is not None:
+                filas.append(actual)
+            actual = [m.group(1), m.group(2), m.group(3).strip()]
+        elif actual is not None and linea.strip():
+            actual[2] += ' ' + linea.strip()
+    if actual is not None:
+        filas.append(actual)
+    return filas
+
+
+def parse_eecc_bbva_pdf(path, password=None):
+    texto = _normalizar_importes_pdf(_texto_pdf(path, password))
+
+    mes, anio = guess_period_from_filename(path)
+
+    cuenta = ''
+    mc = re.search(r'DEPOS\.\s*EN\s*CTA\.\s*(\d{10,})', texto, re.I)
+    if mc:
+        cuenta = mc.group(1)
+    else:
+        mfn = re.search(r'_BBVA_(\d+)_', os.path.basename(path), re.I)
+        cuenta = mfn.group(1) if mfn else ''
+
+    cliente = ''
+    mcli = re.search(r'TITULARES:\s*\n\s*(.+)', texto)
+    if mcli:
+        cliente = mcli.group(1).strip()
+
+    moneda = 'USD' if re.search(r'MONEDA:\s*D[O\xd3]LARES', texto, re.I) else 'PEN'
+
+    msi = re.search(r'SALDO\s+ANTERIOR\s+(-?[\d,]+\.\d{2})', texto, re.I)
+    saldo_inicial = _fnum(msi.group(1)) if msi else None
+
+    movimientos = []
+    unparsed = []
+    mismatches = []
+    anchor_ok = True
+    corriente = saldo_inicial
+
+    for fop, fval, resto in _filas_logicas_bbva(texto):
+        importes = _RE_BBVA_IMPORTE.findall(resto)
+        if len(importes) < 2 or corriente is None:
+            unparsed.append(f'{fop} {fval} {resto}')
+            continue
+
+        saldo = _fnum(importes[-1])
+        elegido = None
+        # El saldo del propio documento decide que numero es el monto y cual el
+        # ITF: probar la lectura simple primero y quedarse con la que cierra la
+        # cadena. Distinguirlos por posicion seria fragil (la columna ITF a
+        # veces esta y a veces no).
+        candidatos = [(_fnum(importes[-2]), 0.0)]
+        if len(importes) >= 3:
+            candidatos.append((_fnum(importes[-3]), _fnum(importes[-2]) or 0.0))
+        for monto, itf in candidatos:
+            if monto is None or saldo is None:
+                continue
+            if abs(round(corriente + monto - itf, 2) - round(saldo, 2)) <= 0.01:
+                elegido = (monto, itf)
+                break
+        if elegido is None:
+            unparsed.append(f'{fop} {fval} {resto}')
+            anchor_ok = False
+            mismatches.append({'fecha': fop, 'desc': resto[:60],
+                                'esperado': None, 'reportado': saldo})
+            continue
+
+        monto, itf = elegido
+        prefijo = resto[:resto.rfind(importes[-3 if itf else -2])]
+        mnro = re.findall(r'\b(\d{4,7})\b', prefijo)
+        nro = mnro[-1] if mnro else None
+        desc = re.sub(r'\s+', ' ', prefijo.replace(nro, '') if nro else prefijo).strip()
+
+        fop_full = _dashdate_to_ddmmyyyy(fop, mes, anio)
+        fval_full = _dashdate_to_ddmmyyyy(fval, mes, anio)
+        base = {'fop': fop_full, 'fpr': fval_full, 'nro': nro, 'mov': '',
+                'canal': '', '_id': _next_id()}
+
+        saldo_tras_monto = round(corriente + monto, 2)
+        movimientos.append(dict(base, desc=desc,
+                                 cargo=abs(monto) if monto < 0 else None,
+                                 abono=monto if monto >= 0 else None,
+                                 saldo=saldo_tras_monto if itf else saldo))
+        if itf:
+            # Mismo criterio que el parser de BBVA en HTML: el ITF se abre como
+            # su propio cargo para que sea visible en la conciliacion.
+            movimientos.append({'fop': fop_full, 'fpr': fval_full, 'nro': None,
+                                 'mov': '', 'desc': 'ITF', 'canal': '',
+                                 'cargo': round(itf, 2), 'abono': None,
+                                 'saldo': saldo, '_id': _next_id()})
+        corriente = saldo
+
+    saldo_final = movimientos[-1]['saldo'] if movimientos else saldo_inicial
+
+    meta = {
+        'banco': 'BBVA', 'formato': 'bbva_pdf', 'cuenta': cuenta, 'moneda': moneda,
+        'cliente': cliente, 'periodo_mes': mes, 'periodo_anio': anio,
+        'saldo_inicial': saldo_inicial, 'saldo_final': saldo_final,
+        'anchor_ok': anchor_ok, 'anchor_mismatches': mismatches,
+        'n_movimientos': len(movimientos), 'unparsed_lines': unparsed,
+    }
+    return movimientos, meta
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 def parse_eecc(path, password=None):
@@ -497,14 +669,24 @@ def parse_eecc(path, password=None):
     xlrd esta instalado pero NO sirve para abrir estos archivos, ver SKILL.md).
 
     password: ver parse_eecc_interbank_pdf. Se ignora para los formatos que
-    no son PDF (xlsx, bbva_html no vienen cifrados)."""
+    no son PDF (xlsx, bbva_html no vienen cifrados).
+
+    Un PDF se enruta al parser de su banco mirando el CONTENIDO, no el nombre
+    del archivo: el nombre lo pone quien descarga y no es confiable (el EECC de
+    BBVA de jul-2026 llego como 'EC_Julio 2026.pdf', sin banco ni cuenta).
+
+    Ademas valida que el resultado no sea un parseo vacio disfrazado de exito:
+    ver _validar_parseo."""
     fmt = detect_format(path)
     if fmt == 'xlsx':
-        return parse_eecc_interbank_xlsx(path)
+        return _validar_parseo(path, *parse_eecc_interbank_xlsx(path))
     if fmt == 'pdf':
-        return parse_eecc_interbank_pdf(path, password=password)
+        texto = _texto_pdf(path, password)
+        if re.search(r'\bBBVA\b', texto):
+            return _validar_parseo(path, *parse_eecc_bbva_pdf(path, password=password))
+        return _validar_parseo(path, *parse_eecc_interbank_pdf(path, password=password))
     if fmt == 'bbva_html':
-        return parse_eecc_bbva_html(path)
+        return _validar_parseo(path, *parse_eecc_bbva_html(path))
     if fmt == 'xls_biff_unsupported':
         raise ValueError(
             f'{path}: es un .xls binario (BIFF) real, no un HTML disfrazado de BBVA. '
@@ -513,3 +695,31 @@ def parse_eecc(path, password=None):
             '(BBVA) o como .xlsx (Interbank), o pasar el PDF oficial.'
         )
     raise ValueError(f'Formato no reconocido para {path}: {fmt}')
+
+
+def _validar_parseo(path, movimientos, meta):
+    """Impide que un parseo fallido se reporte como exito.
+
+    Un EECC que sale con CERO movimientos tiene dos causas muy distintas:
+
+    1. La cuenta de verdad no tuvo movimientos en el periodo (paso en jun-2026
+       con la cuenta 4388 de EL TEMPLO). En ese caso el documento SI trae sus
+       saldos, y el motor lo reporta como 'SIN MOVIMIENTOS' sin que sea error.
+    2. El parser no entendio el documento (formato nuevo, banco equivocado). Ahi
+       no hay saldo inicial ni final, porque no se encontro nada. Es el caso que
+       hay que gritar: con anchor_ok=True y 0 movimientos, la conciliacion
+       reportaria que la cuenta cuadra perfecto mientras ignora el mes entero.
+       Paso de verdad con el EECC de BBVA de jul-2026, que llego en PDF y cayo
+       en el parser de Interbank.
+
+    Distinguirlos por los saldos es lo unico fiable: un documento leido bien
+    siempre trae al menos uno de los dos."""
+    if not movimientos and meta.get('saldo_inicial') is None and meta.get('saldo_final') is None:
+        raise ValueError(
+            f'{path}: se parseo a 0 movimientos y sin saldo inicial ni final '
+            f'(banco detectado: {meta.get("banco")}, formato: {meta.get("formato")}). '
+            f'El documento no corresponde a ese parser o cambio de plantilla. '
+            f'Revisar antes de conciliar: un EECC ignorado en silencio deja fuera '
+            f'todos los movimientos de esa cuenta.'
+        )
+    return movimientos, meta

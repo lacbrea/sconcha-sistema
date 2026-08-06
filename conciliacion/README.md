@@ -55,6 +55,22 @@ El envoltorio que arma esos argumentos desde `config.yaml` y Google Drive es
   (`CONCILIACION\skill\scripts\`) y vuelto a copiar aquí, siguiendo la
   convención de este directorio.
 
+- **2026-08-06 — parser de BBVA en PDF y guarda contra el parseo vacío**: desde
+  julio 2026 el estado de cuenta de BBVA llega en PDF (hasta junio llegaba como
+  `.xls`, que es HTML disfrazado). Como el despachador mandaba todo PDF al
+  parser de Interbank, un EECC de BBVA salía con **0 movimientos,
+  `banco: 'INTERBANK'` y `anchor_ok: True`**: la conciliación reportaba que la
+  cuenta cuadraba mientras ignoraba el mes entero. Se agregó
+  `parse_eecc_bbva_pdf`, la detección de banco por CONTENIDO del PDF (no por el
+  nombre del archivo, que lo pone quien descarga: el de julio llegó como
+  `EC_Julio 2026.pdf`), y `_validar_parseo`, que hace fallar cualquier EECC que
+  se parsee a 0 movimientos SIN saldos — distinguiéndolo de una cuenta
+  legítimamente sin movimientos, que sí trae sus saldos. Verificado contra el
+  estado real de julio de la cuenta 8579: 45 movimientos, la cadena de saldos
+  cierra fila a fila, y el cuadre da exacto
+  (`4,294.64 + 9,543.29 − 13,828.49 = 9.44`). Arreglado primero en el original y
+  vuelto a copiar aquí. Tests en `tests/test_parsers_eecc.py`.
+
 ## Qué quedó fuera, y por qué
 
 `parse_constancias.py` NO se copió: rastreaba transcripciones de sesiones de
