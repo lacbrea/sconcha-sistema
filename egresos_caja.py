@@ -82,10 +82,30 @@ class _TableRowParser(_htmlparser.HTMLParser):
 
 
 _RE_SHLINK = re.compile(r'<link\s+id=["\']?shLink["\']?\s+href=["\']([^"\']+)["\']', re.I)
-_RE_LOCAL = re.compile(r'CAJA\.(\w+)', re.I)
-_RE_FECHA_HORA = re.compile(r'(\d{1,2}/\d{1,2}/\d{4})(?:\s+(\d{1,2}:\d{2}))?')
+# El separador entre CAJA y el local varia por local: LINCE exporta
+# 'CAJA.LINCE' (punto) y MIRAFLORES 'CAJA MIRAFLORES' (espacio). Verificado
+# contra los reportes reales de jul-2026 de ambos.
+_RE_LOCAL = re.compile(r'CAJA[.\s_-]*([A-Za-zÁÉÍÓÚÑáéíóúñ]+)', re.I)
+# La fecha tambien varia por local: LINCE '31/07/2026 16:20' (barras, sin
+# segundos) y MIRAFLORES '31-07-2026 16:40:05' (guiones, con segundos). Se
+# aceptan ambos separadores y los segundos son opcionales.
+_RE_FECHA_HORA = re.compile(
+    r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:\s+(\d{1,2}:\d{2})(?::\d{2})?)?'
+)
 
 N_COLUMNAS_FILA_DATOS = 10  # Fecha, Usuario, Categoria, Caja, Motivo, Entregado A, Moneda, Tarjeta, Estado, Monto
+
+# Destinos de "Entregado A" que significan "salio de la caja hacia la cuenta
+# del negocio". LINCE escribe 'BANCO'; MIRAFLORES escribe la cuenta de formas
+# libres ('CTA DE LA EMPRESA', 'CTA D LA EMPRESA', 'cta de empresa') o el
+# nombre del banco ('INTERBANK'). El dueño confirmo el 2026-08-09 que son el
+# mismo concepto y va a pedir que ambos locales usen 'BANCO' en adelante;
+# estas variantes se mantienen porque los reportes YA EXPORTADOS conservan el
+# texto viejo y hay que poder reprocesarlos.
+_RE_DESTINO_BANCO = re.compile(
+    r'^\s*(?:BANCO|INTERBANK|BBVA|CTA\.?\s*(?:DE\s+|D\s+|DEL\s+)?(?:LA\s+)?EMPRESA)\s*$',
+    re.I,
+)
 
 
 def _leer_texto(path):
@@ -138,15 +158,21 @@ def _fnum(s):
 
 
 def _fecha_hora(bruto):
-    """'31/07/2026 16:20' -> ('31/07/2026', '16:20'); sin hora -> (fecha, None).
-    El reporte trae el día sin cero a la izquierda en algunas filas
-    ('1/07/2026'); se normaliza a DD/MM/AAAA."""
+    """'31/07/2026 16:20' o '31-07-2026 16:40:05' -> ('31/07/2026', '16:20').
+    Sin hora -> (fecha, None). Se normaliza siempre a DD/MM/AAAA (el reporte
+    trae el día sin cero a la izquierda en algunas filas, y el separador
+    cambia según el local).
+
+    Devuelve (None, None) si la fecha no se reconoce. Antes devolvía el texto
+    crudo, que se colaba tal cual al JSON del motor y de ahí a la hoja CAJA
+    CHICA: el reporte de MIRAFLORES entero salió con fechas '31-07-2026
+    16:40:05' sin que nada avisara. Un dato que no se entiende tiene que
+    señalarse, no propagarse — quien llama lo manda a 'filas_ignoradas'."""
     bruto = str(bruto or '').strip()
     m = _RE_FECHA_HORA.match(bruto)
     if not m:
-        return bruto, None
-    fecha_s, hora = m.group(1), m.group(2)
-    d, mo, y = fecha_s.split('/')
+        return None, None
+    d, mo, y, hora = m.group(1), m.group(2), m.group(3), m.group(4)
     return f'{int(d):02d}/{int(mo):02d}/{y}', hora
 
 
@@ -194,6 +220,12 @@ def parsear_egresos(path):
                 local = m.group(1).upper()
 
         fecha, hora = _fecha_hora(fecha_raw)
+        if fecha is None:
+            filas_ignoradas.append(
+                f'{fecha_raw.strip()!r}: FECHA no reconocida, se ignora la fila '
+                f'(motivo {motivo.strip()[:40]!r}, monto {monto_raw})'
+            )
+            continue
         motivo_s = motivo.strip()
         entregado_s = entregado_a.strip()
         estado_s = estado.strip().upper()
@@ -216,7 +248,12 @@ def parsear_egresos(path):
             continue
 
         item = {'fecha': fecha, 'hora': hora, 'motivo': motivo_s, 'entregado_a': entregado_s, 'monto': monto}
-        es_deposito = entregado_s.upper() == 'BANCO' or motivo_s.upper().startswith('DEPOSITO DE VENTA')
+        # El motivo se conserva tal cual a proposito: entre estos depositos hay
+        # PROPINAS en efectivo (MIRAFLORES, jul-2026), que van a la misma cuenta
+        # pero no son venta. Para cruzar contra el abono del banco da igual -es
+        # plata que entra-, pero para el cuadre de ingresos (fase posterior) hay
+        # que poder separarlas, y el motivo es el unico dato que lo permite.
+        es_deposito = bool(_RE_DESTINO_BANCO.match(entregado_s)) or motivo_s.upper().startswith('DEPOSITO DE VENTA')
         (depositos if es_deposito else gastos).append(item)
 
     return {

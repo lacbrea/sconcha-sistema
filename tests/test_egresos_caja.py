@@ -232,3 +232,38 @@ def test_ruta_sin_tabla_ni_frameset_lanza_value_error(tmp_path):
 
     with pytest.raises(ValueError):
         egresos_caja.parsear_egresos(ruta)
+
+
+# -----------------------------------------------------------------------------
+# Variantes por local (verificadas contra los reportes reales de jul-2026)
+# -----------------------------------------------------------------------------
+def test_fecha_acepta_guiones_y_segundos():
+    """MIRAFLORES exporta '31-07-2026 16:40:05' y LINCE '31/07/2026 16:20'.
+    Antes solo se aceptaban barras: el reporte de MIRAFLORES entero salía con
+    la fecha en crudo, sin que nada avisara."""
+    assert egresos_caja._fecha_hora("31-07-2026 16:40:05") == ("31/07/2026", "16:40")
+    assert egresos_caja._fecha_hora("31/07/2026 16:20") == ("31/07/2026", "16:20")
+    assert egresos_caja._fecha_hora("1/7/2026") == ("01/07/2026", None)
+
+
+def test_fecha_no_reconocida_devuelve_none_en_vez_de_texto_crudo():
+    """Un dato que no se entiende se señala, no se propaga: quien llama lo
+    manda a 'filas_ignoradas'."""
+    assert egresos_caja._fecha_hora("no es fecha") == (None, None)
+
+
+def test_local_acepta_punto_y_espacio():
+    """LINCE exporta 'CAJA.LINCE' y MIRAFLORES 'CAJA MIRAFLORES'."""
+    assert egresos_caja._RE_LOCAL.search("CAJA.LINCE").group(1).upper() == "LINCE"
+    assert egresos_caja._RE_LOCAL.search("CAJA MIRAFLORES").group(1).upper() == "MIRAFLORES"
+
+
+def test_destino_banco_reconoce_las_variantes_de_miraflores():
+    """El dueño confirmó (2026-08-09) que 'cta de la empresa' en MIRAFLORES es
+    lo mismo que 'BANCO' en LINCE. Se van a estandarizar a 'BANCO', pero los
+    reportes ya exportados conservan el texto viejo y hay que reprocesarlos."""
+    for destino in ["BANCO", "banco", "CTA DE LA EMPRESA", "cta d la empresa",
+                    "cta de empresa", "INTERBANK"]:
+        assert egresos_caja._RE_DESTINO_BANCO.match(destino), destino
+    for destino in ["EDWIN", "MERCADO", "INVERSIONES", "MULTICOPY"]:
+        assert not egresos_caja._RE_DESTINO_BANCO.match(destino), destino
