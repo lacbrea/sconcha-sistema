@@ -35,7 +35,7 @@ class ComprobanteExtraido:
     proveedor_razon_social: str | None = None
     cliente_ruc: str | None = None
     cliente_razon_social: str | None = None
-    tipo_documento: str | None = None  # factura|boleta|recibo_honorarios|recibo_servicio|nota_credito|nota_debito|guia_remision|otro
+    tipo_documento: str | None = None  # factura|boleta|recibo_honorarios|recibo_servicio|nota_credito|nota_debito|guia_remision|liquidacion|otro
     serie_numero: str | None = None
     fecha_emision: str | None = None   # 'YYYY-MM-DD'
     fecha_vencimiento: str | None = None

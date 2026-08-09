@@ -77,6 +77,37 @@ COSTO_ESTIMADO_USD_POR_LLAMADA_MODELO = 0.02
 
 FORMATOS_FECHA = ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y")
 
+# -----------------------------------------------------------------------------
+# Enrutado del buzón por tipo de documento (decisión del dueño 2026-08-06;
+# ver el comentario de drive.carpetas.buzon_tipos en config.ejemplo.yaml).
+# La subcarpeta donde cae el archivo dentro de 00_BUZON le dice al sistema
+# QUÉ es, dato que el documento no siempre trae.
+# -----------------------------------------------------------------------------
+# Claves de config['drive']['carpetas']['buzon_tipos'], en el orden en que se
+# procesan cuando está configurado. 'notas_venta' se procesa con su propio
+# pipeline (procesar_nota_venta, sin modelo); las otras tres van por el
+# pipeline normal (procesar_uno) con un tipo_esperado distinto cada una.
+CLAVES_BUZON_TIPOS = ("facturas", "notas_venta", "liquidaciones", "otros")
+
+# tipo_esperado que se pasa al extractor de modelo según la subcarpeta de
+# origen. 'facturas' no aparece: no tiene tipo_esperado (None), es el
+# pipeline normal tal cual existía antes de esta migración.
+TIPO_ESPERADO_POR_CLAVE_BUZON = {
+    "liquidaciones": "liquidacion",
+    "otros": "recibo_servicio",
+}
+
+# Valor sintético de 'tipo' (no es una clave real de buzon_tipos) para los
+# archivos sueltos en la raíz de 00_BUZON cuando el negocio ya migró a
+# subcarpetas: se procesan como factura (compatibilidad durante la
+# transición) pero con una advertencia en el log, para que quien sube el
+# archivo se entere de que debería haberlo puesto en una subcarpeta.
+TIPO_RAIZ_BUZON = "_raiz"
+
+# Patrón de fecha al inicio del nombre de un respaldo de caja chica
+# (NOTAS_DE_VENTA), ej. "01.07 BOLETAS.pdf" -> día 01, mes 07.
+_PATRON_FECHA_NOMBRE_NOTA_VENTA = re.compile(r"^(\d{2})\.(\d{2})")
+
 
 @dataclasses.dataclass
 class ResultadoArchivo:
@@ -166,6 +197,64 @@ def construir_planes(
     return planes
 
 
+def resolver_buzon_tipos_ids(carpetas_cfg: dict) -> dict[str, str]:
+    """Ids de Drive de las subcarpetas de 00_BUZON por tipo, a partir de
+    config['drive']['carpetas'] (carpetas_cfg). Siempre devuelve las 4 claves
+    de CLAVES_BUZON_TIPOS, con "" para la que no esté configurada — así quien
+    llama no tiene que volver a defender contra 'buzon_tipos' ausente o con
+    alguna clave faltante."""
+    buzon_tipos_cfg = carpetas_cfg.get("buzon_tipos") or {}
+    return {clave: (buzon_tipos_cfg.get(clave) or "").strip() for clave in CLAVES_BUZON_TIPOS}
+
+
+def construir_planes_enrutados(
+    almacen: AlmacenDrive,
+    carpeta_buzon_id: str,
+    buzon_tipos_ids: dict[str, str],
+) -> list[tuple[ArchivoDrive, list[ArchivoDrive], str | None]]:
+    """Arma la lista de (principal, respaldos, tipo) a procesar en la
+    corrida, enrutando por subcarpeta de 00_BUZON cuando el negocio migró a
+    buzon_tipos (ver config.yaml -> drive.carpetas.buzon_tipos).
+
+    'tipo' es la clave de buzon_tipos que corresponde al archivo
+    ('facturas'|'notas_venta'|'liquidaciones'|'otros'), TIPO_RAIZ_BUZON si el
+    archivo estaba suelto en la raíz de 00_BUZON (compatibilidad durante la
+    transición: se procesa como factura, con advertencia — ver
+    procesar_uno), o None si el negocio no tiene ningún id de buzon_tipos
+    configurado (comportamiento histórico intacto: solo se lista la raíz,
+    sin agrupar por subcarpeta y sin la advertencia de raíz, porque un
+    negocio que no migró no tiene por qué verla en cada corrida).
+
+    'notas_venta' NO pasa por construir_planes(): el agrupado XML+respaldo
+    no aplica a un respaldo de caja chica (nunca hay XML de por medio), así
+    que cada archivo de esa subcarpeta se procesa suelto, sin respaldos.
+    """
+    if not any(buzon_tipos_ids.values()):
+        planes = construir_planes(listar_buzon(almacen, carpeta_buzon_id))
+        return [(principal, respaldos, None) for principal, respaldos in planes]
+
+    resultado: list[tuple[ArchivoDrive, list[ArchivoDrive], str | None]] = []
+
+    for clave in CLAVES_BUZON_TIPOS:
+        carpeta_id = buzon_tipos_ids.get(clave)
+        if not carpeta_id:
+            continue
+        archivos = listar_buzon(almacen, carpeta_id)
+        if clave == "notas_venta":
+            for archivo in archivos:
+                resultado.append((archivo, [], clave))
+        else:
+            for principal, respaldos in construir_planes(archivos):
+                resultado.append((principal, respaldos, clave))
+
+    # Archivos sueltos en la raíz del buzón: compatibilidad durante la
+    # transición (ver TIPO_RAIZ_BUZON).
+    for principal, respaldos in construir_planes(listar_buzon(almacen, carpeta_buzon_id)):
+        resultado.append((principal, respaldos, TIPO_RAIZ_BUZON))
+
+    return resultado
+
+
 # -----------------------------------------------------------------------------
 # Fechas y nombres de destino
 # -----------------------------------------------------------------------------
@@ -189,6 +278,29 @@ def anio_mes(comp: "ComprobanteExtraido") -> str:
 
 def nombre_empresa_carpeta(nombre_corto: str) -> str:
     return nombre_corto.strip().replace(" ", "_")
+
+
+def extraer_fecha_nombre_archivo(nombre: str, hoy: datetime.date | None = None) -> str:
+    """Extrae DD.MM del inicio del nombre de un respaldo de caja chica (ej.
+    '01.07 BOLETAS.pdf' -> día 01, mes 07) y arma 'YYYY-MM-DD' con el año EN
+    CURSO: el nombre del archivo nunca trae el año, y el sistema no tiene
+    forma de saber a qué año corresponde más que asumir el año en que se
+    sube — nunca se inventa uno distinto.
+
+    Devuelve "" (nunca un valor aproximado) si el nombre no trae el patrón,
+    o si el DD/MM que trae no forma una fecha válida (ej. '31.02...').
+    'hoy' es un parámetro de prueba (default None -> datetime.date.today()).
+    """
+    stem = pathlib.PurePosixPath(nombre).stem
+    coincidencia = _PATRON_FECHA_NOMBRE_NOTA_VENTA.match(stem)
+    if not coincidencia:
+        return ""
+    dia, mes = coincidencia.group(1), coincidencia.group(2)
+    anio = (hoy or datetime.date.today()).year
+    try:
+        return datetime.date(anio, int(mes), int(dia)).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
 
 
 def nombre_destino(comp: "ComprobanteExtraido", extension: str) -> str:
@@ -361,11 +473,38 @@ def resolver_local(empresa_cfg: dict) -> tuple[str | None, str | None]:
     )
 
 
+def resolver_empresa_local_nota_venta(config: dict) -> tuple[str, str, str | None]:
+    """Devuelve (empresa, local, advertencia) para un respaldo de caja chica
+    (NOTAS_DE_VENTA). A diferencia de un comprobante normal, este archivo
+    NUNCA dice a qué empresa pertenece (no se lee con el modelo, ver
+    procesar_nota_venta): si el negocio tiene una sola empresa configurada,
+    se asigna esa, sin ambigüedad. Si tiene varias -como SCONCHA hoy, con EL
+    TEMPLO/INSTITUCION/ILLAWARA- NO se adivina cuál: asignar la empresa
+    equivocada a un respaldo de caja chica sería inventar un dato financiero.
+    En ese caso se devuelve empresa y local vacíos junto con una advertencia
+    para el log; el dueño corrige EMPRESA (y LOCAL) a mano en RESPALDOS_CAJA.
+    """
+    empresas = config.get("empresas") or []
+    if len(empresas) != 1:
+        return "", "", (
+            f"hay {len(empresas)} empresas configuradas; no se puede asignar automáticamente la empresa de "
+            f"un respaldo de caja chica (NOTAS_DE_VENTA); EMPRESA y LOCAL quedan vacíos en RESPALDOS_CAJA, "
+            f"corregir a mano"
+        )
+
+    empresa_cfg = empresas[0]
+    nombre_corto = str(empresa_cfg.get("nombre_corto") or "")
+    local, motivo_local = resolver_local(empresa_cfg)
+    if local is None:
+        return nombre_corto, "", motivo_local
+    return nombre_corto, local, None
+
+
 # -----------------------------------------------------------------------------
 # Extracción
 # -----------------------------------------------------------------------------
 def extraer_comprobante(
-    ruta: pathlib.Path, extension: str, config: dict | None = None
+    ruta: pathlib.Path, extension: str, config: dict | None = None, tipo_esperado: str | None = None
 ) -> tuple["ComprobanteExtraido | None", int]:
     """Devuelve (comprobante, llamadas_al_modelo). Puede lanzar excepción.
 
@@ -374,13 +513,19 @@ def extraer_comprobante(
     config el extractor funciona igual, pero con los valores por defecto y
     sin poder decirle al modelo cuáles RUCs son del lado cliente — por eso
     conviene pasarlo siempre desde la corrida real.
+
+    `tipo_esperado` (opcional) viaja tal cual a extractores.modelo.extraer():
+    el contexto "este archivo llegó a la carpeta de X" que aporta la
+    subcarpeta de origen dentro del buzón (ver TIPO_ESPERADO_POR_CLAVE_BUZON).
+    No aplica al XML (extractor_xml.extraer no lo necesita: el XML de SUNAT
+    ya trae su propio tipo de comprobante, determinístico).
     """
     if extension in EXT_XML:
         return extractor_xml.extraer(ruta), 0
     if extension in EXT_PDF:
-        return extractor_modelo.extraer(ruta, tipo="pdf", config=config), 1
+        return extractor_modelo.extraer(ruta, tipo="pdf", config=config, tipo_esperado=tipo_esperado), 1
     if extension in EXT_IMAGEN:
-        return extractor_modelo.extraer(ruta, tipo="imagen", config=config), 1
+        return extractor_modelo.extraer(ruta, tipo="imagen", config=config, tipo_esperado=tipo_esperado), 1
     raise ValueError(f"extensión no manejada por extraer_comprobante: {extension}")
 
 
@@ -427,8 +572,33 @@ def procesar_uno(
     carpeta_procesado_id: str,
     carpeta_revisar_id: str,
     dry_run: bool,
+    tipo: str | None = None,
 ) -> ResultadoArchivo:
+    """'tipo' es la clave de buzon_tipos de la que salió el archivo
+    ('facturas'|'notas_venta'|'liquidaciones'|'otros'), TIPO_RAIZ_BUZON si
+    vino suelto de la raíz del buzón durante la transición, o None si el
+    negocio no tiene buzon_tipos configurado (comportamiento histórico,
+    equivalente a 'facturas' pero sin la advertencia de raíz). Ver
+    construir_planes_enrutados().
+    """
     nombre = principal.name
+
+    if tipo == "notas_venta":
+        return procesar_nota_venta(
+            principal,
+            config=config,
+            registro=registro,
+            almacen=almacen,
+            nombres_por_carpeta=nombres_por_carpeta,
+            carpeta_procesado_id=carpeta_procesado_id,
+            dry_run=dry_run,
+        )
+
+    if tipo == TIPO_RAIZ_BUZON:
+        logger.warning("%s: archivo en la raíz del buzón; muévelo a una subcarpeta por tipo", nombre)
+
+    tipo_esperado = TIPO_ESPERADO_POR_CLAVE_BUZON.get(tipo)
+
     todos_los_archivos = [principal, *respaldos]
     extension = principal.suffix.lower()
 
@@ -453,7 +623,7 @@ def procesar_uno(
             return ResultadoArchivo(nombre, "revisar", motivo)
 
         try:
-            comp, llamadas_modelo = extraer_comprobante(ruta_local, extension, config)
+            comp, llamadas_modelo = extraer_comprobante(ruta_local, extension, config, tipo_esperado=tipo_esperado)
         except Exception as exc:
             motivo = f"error al extraer datos del comprobante: {exc}"
             logger.exception("Error al extraer '%s'", principal.name)
@@ -550,6 +720,61 @@ def procesar_uno(
     return ResultadoArchivo(
         nombre, "procesado", None, n_items=len(getattr(comp, "items", None) or []), llamadas_modelo=llamadas_modelo
     )
+
+
+def procesar_nota_venta(
+    archivo: ArchivoDrive,
+    *,
+    config: dict,
+    registro,
+    almacen: AlmacenDrive,
+    nombres_por_carpeta: dict[str, set[str]],
+    carpeta_procesado_id: str,
+    dry_run: bool,
+) -> ResultadoArchivo:
+    """Registra un respaldo de caja chica (subcarpeta NOTAS_DE_VENTA del
+    buzón) SIN pasar por el modelo: costo S/0. El dato de fondo (montos,
+    insumos) vive en el reporte de egresos del sistema de ventas, no en este
+    archivo — acá solo se deja constancia en RESPALDOS_CAJA de que el
+    respaldo llegó, con qué fecha (si el nombre la trae) y a qué empresa/
+    local se asignó, y se mueve a 01_PROCESADO con su nombre original (no
+    hay RUC/serie con los que renombrar, a diferencia del pipeline normal).
+    """
+    nombre = archivo.name
+    fecha = extraer_fecha_nombre_archivo(nombre)
+    empresa, local, motivo_empresa = resolver_empresa_local_nota_venta(config)
+    if motivo_empresa:
+        logger.warning("%s: %s", nombre, motivo_empresa)
+
+    try:
+        link_drive = almacen.enlace(archivo.id)
+    except Exception as exc:
+        logger.warning("No se pudo obtener el link de Drive de '%s': %s", nombre, exc)
+        link_drive = ""
+
+    try:
+        escrito = registro.registrar_respaldo_caja(fecha, empresa, local, nombre, link_drive)
+    except Exception as exc:
+        motivo = f"error al registrar el respaldo de caja chica: {exc}"
+        logger.exception("Error al registrar '%s' en RESPALDOS_CAJA", nombre)
+        return ResultadoArchivo(nombre, "revisar", motivo)
+
+    if not escrito:
+        logger.info("%s: ya estaba registrado en RESPALDOS_CAJA, no se duplica el registro.", nombre)
+
+    nombre_mes = fecha[:7] if fecha else "SIN_FECHA"
+    nombre_empresa = nombre_empresa_carpeta(empresa) if empresa else "SIN_EMPRESA"
+    if dry_run:
+        carpeta_destino_id = f"[DRY-RUN] {carpeta_procesado_id}/{nombre_mes}/{nombre_empresa}"
+    else:
+        carpeta_mes_id = almacen.asegurar_carpeta(nombre_mes, carpeta_procesado_id)
+        carpeta_destino_id = almacen.asegurar_carpeta(nombre_empresa, carpeta_mes_id)
+
+    destino_nombre = mover_archivo(almacen, archivo, carpeta_destino_id, nombre, nombres_por_carpeta, dry_run)
+    if destino_nombre is None:
+        logger.error("'%s' se registró correctamente pero no se pudo mover; queda en el buzón.", nombre)
+
+    return ResultadoArchivo(nombre, "procesado", None, n_items=0, llamadas_modelo=0)
 
 
 # -----------------------------------------------------------------------------
@@ -684,8 +909,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         logger.warning("No se encontró '%s'; se seguirá sin emparejar ítems contra el catálogo.", ruta_catalogo)
 
-    archivos = listar_buzon(almacen, carpeta_buzon_id)
-    planes = construir_planes(archivos)
+    buzon_tipos_ids = resolver_buzon_tipos_ids(carpetas_cfg)
+    if any(buzon_tipos_ids.values()):
+        logger.info(
+            "Enrutando 00_BUZON por subcarpeta de tipo (buzon_tipos configurado): %s",
+            ", ".join(f"{clave}={id_}" for clave, id_ in buzon_tipos_ids.items() if id_),
+        )
+    planes = construir_planes_enrutados(almacen, carpeta_buzon_id, buzon_tipos_ids)
 
     if args.solo:
         objetivo = args.solo.strip().lower()
@@ -704,7 +934,7 @@ def main(argv: list[str] | None = None) -> int:
     nombres_por_carpeta: dict[str, set[str]] = {}
     resultados: list[ResultadoArchivo] = []
 
-    for principal, respaldos in planes:
+    for principal, respaldos, tipo in planes:
         try:
             resultado = procesar_uno(
                 principal,
@@ -718,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
                 carpeta_procesado_id=carpeta_procesado_id,
                 carpeta_revisar_id=carpeta_revisar_id,
                 dry_run=args.dry_run,
+                tipo=tipo,
             )
         except Exception as exc:
             # Red de seguridad final: un archivo que falla de cualquier forma

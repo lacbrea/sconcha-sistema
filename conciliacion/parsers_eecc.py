@@ -712,9 +712,19 @@ def _validar_parseo(path, movimientos, meta):
        Paso de verdad con el EECC de BBVA de jul-2026, que llego en PDF y cayo
        en el parser de Interbank.
 
-    Distinguirlos por los saldos es lo unico fiable: un documento leido bien
-    siempre trae al menos uno de los dos."""
-    if not movimientos and meta.get('saldo_inicial') is None and meta.get('saldo_final') is None:
+    El discriminador NO son los saldos: verificado contra el EECC real de la
+    4388 de jun-2026, un estado legitimamente vacio tampoco trae saldo inicial
+    ni final (no hay ninguna linea de la que sacarlos). Lo que si trae es su
+    IDENTIFICACION: cuenta '200-3008494388' y cliente 'EL TEMPLO SAC'. El
+    mismo parser sobre un documento que no le corresponde devuelve cuenta y
+    cliente vacios, porque no reconocio nada. Esa es la senal fiable: un
+    documento leido bien se identifica, aunque no tenga movimientos.
+
+    (La primera version de esta guarda miraba solo los saldos y hacia fallar
+    la conciliacion de junio, que es la regresion de referencia del proyecto.)"""
+    sin_identificar = not str(meta.get('cuenta') or '').strip() and not str(meta.get('cliente') or '').strip()
+    if (not movimientos and sin_identificar
+            and meta.get('saldo_inicial') is None and meta.get('saldo_final') is None):
         raise ValueError(
             f'{path}: se parseo a 0 movimientos y sin saldo inicial ni final '
             f'(banco detectado: {meta.get("banco")}, formato: {meta.get("formato")}). '

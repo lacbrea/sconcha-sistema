@@ -719,6 +719,7 @@ def _config_base() -> dict:
                 {
                     "nombre_corto": "EL TEMPLO",
                     "nombre_motor": "EL TEMPLO",
+                    "caja_chica": {"reposicion_semanal": 250},
                     "cuentas": [{"banco": "interbank", "numero": "4134", "moneda": "PEN", "principal": True}],
                 },
             ],

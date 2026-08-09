@@ -60,6 +60,19 @@ COLUMNAS_DETALLE = [
     "PRECIO_UNITARIO", "TOTAL_LINEA", "MATCH", "FECHA_REGISTRO",
 ]
 
+# --- Pestaña RESPALDOS_CAJA ---------------------------------------------------
+# Respaldos de gastos de caja chica (carpeta NOTAS_DE_VENTA del buzón, ver
+# config.yaml -> drive.carpetas.buzon_tipos): fotos/PDF/xls de boletas de
+# compras menores que NO se leen con el modelo -el dato de fondo (montos,
+# insumos) vive en el reporte de egresos del sistema de ventas, no en este
+# archivo-, así que solo se deja constancia de que el respaldo llegó. Va en
+# una pestaña propia del MISMO spreadsheet contable (no un spreadsheet
+# nuevo): es el mismo negocio, y un spreadsheet aparte solo agregaría un ID
+# más que sincronizar en config.yaml sin necesidad real.
+COLUMNAS_RESPALDOS_CAJA = ["FECHA", "EMPRESA", "LOCAL", "ARCHIVO", "LINK_DRIVE", "FECHA_REGISTRO"]
+
+NOMBRE_HOJA_RESPALDOS_CAJA = "RESPALDOS_CAJA"
+
 REGISTRADO_POR = "skill-comprobantes"
 
 
@@ -79,6 +92,26 @@ def _clave(ruc: Any, serie_numero: Any, total: Any) -> str | None:
     except (TypeError, ValueError):
         return None
     return f"{ruc_s}|{serie_s}|{total_f:.2f}"
+
+
+def _clave_respaldo(archivo: Any, empresa: Any) -> str | None:
+    """'ARCHIVO|EMPRESA' en mayúsculas y sin espacios, para que
+    registrar_respaldo_caja() sea idempotente: registrar el mismo archivo dos
+    veces para la misma empresa no duplica fila en RESPALDOS_CAJA.
+
+    A diferencia de _clave() (RUC+SERIE+TOTAL), un respaldo de caja chica no
+    tiene esos datos -no se lee con el modelo-, así que la única pareja de
+    campos que dos registros del mismo archivo van a compartir siempre es su
+    nombre y la empresa a la que se asignó. EMPRESA puede legítimamente venir
+    vacía (ver resolver_empresa_local_nota_venta en procesar.py, cuando el
+    negocio tiene más de una empresa y no se puede asignar automáticamente);
+    solo ARCHIVO es obligatorio para calcular la clave.
+    """
+    archivo_s = str(archivo or "").strip().upper()
+    empresa_s = str(empresa or "").strip().upper()
+    if not archivo_s:
+        return None
+    return f"{archivo_s}|{empresa_s}"
 
 
 class Registro:
@@ -125,6 +158,13 @@ class Registro:
         # spreadsheet cuando el rango no lleva nombre de hoja.
         self._rango_contable = sheets_cfg.get("rango_contable", "A1:AF")
         self._rango_detalle = sheets_cfg.get("rango_detalle", "A1:O")
+        # RESPALDOS_CAJA vive en una pestaña propia del MISMO spreadsheet
+        # contable (self.id_contable), así que su rango SÍ lleva el nombre de
+        # hoja ("HOJA!A1:F"): a diferencia de rango_contable/rango_detalle,
+        # que apuntan a la primera hoja de sus respectivos spreadsheets, acá
+        # hace falta decirle a la API a cuál de las varias pestañas del mismo
+        # spreadsheet escribir.
+        self._rango_respaldos_caja = f"{NOMBRE_HOJA_RESPALDOS_CAJA}!A1:F"
 
         # Servicio de Sheets: si se inyecta (tests, doble de prueba) se usa
         # tal cual; si no, se crea de forma perezosa la primera vez que hace
@@ -138,6 +178,7 @@ class Registro:
         salida_dir = pathlib.Path(config.get("salida_dir", RAIZ / "salida"))
         self._csv_contable = salida_dir / "contable.csv"
         self._csv_detalle = salida_dir / "detalle.csv"
+        self._csv_respaldos_caja = salida_dir / "respaldos_caja.csv"
 
     # -- API publica -----------------------------------------------------
 
@@ -188,6 +229,86 @@ class Registro:
 
         fila_contable = self._fila_contable(comp, empresa, local, link_drive, archivo, fecha_registro)
         self._append(self.id_contable, self._rango_contable, COLUMNAS_CONTABLE, [fila_contable], self._csv_contable)
+
+    def respaldos_existentes(self) -> set[str]:
+        """Claves ('ARCHIVO|EMPRESA') ya presentes en la pestaña RESPALDOS_CAJA
+        del spreadsheet contable (o en salida/respaldos_caja.csv si dry_run),
+        para que registrar_respaldo_caja() sea idempotente.
+
+        Si la pestaña todavía no existe (negocio recién migrado a
+        NOTAS_DE_VENTA, primera corrida) la API devuelve un error al pedir un
+        rango de una hoja inexistente; se interpreta como "todavía no hay
+        nada registrado" en vez de propagar la excepción, porque
+        _asegurar_hoja_respaldos_caja() la crea de todas formas en el primer
+        registrar_respaldo_caja() que corra.
+        """
+        if self.dry_run:
+            return self._respaldos_desde_csv(self._csv_respaldos_caja)
+
+        servicio = self._obtener_servicio()
+        try:
+            resp = (
+                servicio.spreadsheets()
+                .values()
+                .get(spreadsheetId=self.id_contable, range=self._rango_respaldos_caja)
+                .execute()
+            )
+        except Exception:
+            return set()
+        return self._respaldos_desde_filas(resp.get("values", []))
+
+    def registrar_respaldo_caja(
+        self, fecha: str, empresa: str, local: str, archivo: str, link_drive: str
+    ) -> bool:
+        """Registra un respaldo de caja chica (NOTAS_DE_VENTA) en la pestaña
+        RESPALDOS_CAJA del spreadsheet contable, SIN pasar por el modelo:
+        costo S/0. El dato de fondo (montos, insumos) vive en el reporte de
+        egresos del sistema de ventas — esto solo deja constancia de que el
+        respaldo llegó, cuándo y a qué empresa/local se asignó.
+
+        Idempotente por ARCHIVO+EMPRESA: si ya hay una fila con esa
+        combinación, no escribe una nueva. Devuelve True si escribió una fila
+        nueva, False si ya estaba registrado.
+        """
+        clave = _clave_respaldo(archivo, empresa)
+        if clave is not None and clave in self.respaldos_existentes():
+            return False
+
+        fecha_registro = datetime.datetime.now().isoformat(timespec="seconds")
+        fila = [fecha, empresa, local, archivo, link_drive, fecha_registro]
+
+        if self.dry_run:
+            self._append_csv(self._csv_respaldos_caja, COLUMNAS_RESPALDOS_CAJA, [fila])
+            return True
+
+        servicio = self._obtener_servicio()
+        self._asegurar_hoja_respaldos_caja(servicio)
+        self._asegurar_cabecera(servicio, self.id_contable, self._rango_respaldos_caja, COLUMNAS_RESPALDOS_CAJA)
+        servicio.spreadsheets().values().append(
+            spreadsheetId=self.id_contable,
+            range=self._rango_respaldos_caja,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [fila]},
+        ).execute()
+        return True
+
+    def _asegurar_hoja_respaldos_caja(self, servicio) -> None:
+        """Crea la pestaña RESPALDOS_CAJA en el spreadsheet contable si
+        todavía no existe. Idempotente: consulta la lista de pestañas y solo
+        crea si NOMBRE_HOJA_RESPALDOS_CAJA no aparece en ella."""
+        info = (
+            servicio.spreadsheets()
+            .get(spreadsheetId=self.id_contable, fields="sheets.properties.title")
+            .execute()
+        )
+        titulos = {hoja["properties"]["title"] for hoja in info.get("sheets", [])}
+        if NOMBRE_HOJA_RESPALDOS_CAJA in titulos:
+            return
+        servicio.spreadsheets().batchUpdate(
+            spreadsheetId=self.id_contable,
+            body={"requests": [{"addSheet": {"properties": {"title": NOMBRE_HOJA_RESPALDOS_CAJA}}}]},
+        ).execute()
 
     # -- Construccion de filas -------------------------------------------
 
@@ -393,6 +514,37 @@ class Registro:
                 return fila[i] if i < len(fila) else ""
 
             clave = _clave(valor(i_ruc), valor(i_serie), valor(i_total))
+            if clave:
+                claves.add(clave)
+        return claves
+
+    def _respaldos_desde_csv(self, csv_path: pathlib.Path) -> set[str]:
+        if not csv_path.exists():
+            return set()
+        claves: set[str] = set()
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            for fila in csv.DictReader(f):
+                clave = _clave_respaldo(fila.get("ARCHIVO"), fila.get("EMPRESA"))
+                if clave:
+                    claves.add(clave)
+        return claves
+
+    def _respaldos_desde_filas(self, valores: list[list[Any]]) -> set[str]:
+        if not valores:
+            return set()
+        header = valores[0]
+        try:
+            i_archivo = header.index("ARCHIVO")
+            i_empresa = header.index("EMPRESA")
+        except ValueError:
+            return set()
+
+        claves: set[str] = set()
+        for fila in valores[1:]:
+            def valor(i: int) -> str:
+                return fila[i] if i < len(fila) else ""
+
+            clave = _clave_respaldo(valor(i_archivo), valor(i_empresa))
             if clave:
                 claves.add(clave)
         return claves

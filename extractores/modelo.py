@@ -65,7 +65,9 @@ class RespuestaRechazadaError(ErrorModeloClaude):
     """El modelo se negó a procesar el comprobante (`stop_reason == 'refusal'`)."""
 
 
-def extraer(ruta: pathlib.Path, tipo: str, config: dict | None = None) -> ComprobanteExtraido:
+def extraer(
+    ruta: pathlib.Path, tipo: str, config: dict | None = None, tipo_esperado: str | None = None
+) -> ComprobanteExtraido:
     """Extrae un comprobante con el modelo Claude a partir de un PDF o una foto.
 
     `tipo` es `'pdf'` o `'imagen'`. `config` es opcional (default `None`, para
@@ -78,6 +80,20 @@ def extraer(ruta: pathlib.Path, tipo: str, config: dict | None = None) -> Compro
       ahí, así que no es indispensable.
     - `config['modelo']`: nombre del modelo (default `claude-opus-5`).
     - `config['esfuerzo']`: `effort` de structured outputs (default `low`).
+
+    `tipo_esperado` es opcional (default `None`) y viene de procesar.py cuando
+    el archivo llegó a una subcarpeta del buzón por tipo (ver
+    drive.carpetas.buzon_tipos en config.yaml): por ejemplo `'liquidacion'`
+    para un archivo que cayó en 00_BUZON/LIQUIDACIONES. Es solo contexto, NO
+    una imposición — el modelo puede y debe contradecirlo si el documento
+    claramente es de otro tipo (alguien puede arrastrar un recibo de luz a la
+    carpeta equivocada por error). Por eso viaja en el turno del usuario, NO
+    en el bloque de system: el bloque de system lleva `cache_control` y tiene
+    que ser BYTE-IDÉNTICO entre llamadas del mismo `config` para que el
+    cacheo de prompt sirva de algo (ver docstring de `_construir_prompt`);
+    `tipo_esperado` cambia de un archivo a otro dentro de la misma corrida
+    (una liquidación seguida de un recibo de servicio), así que meterlo en el
+    system invalidaría el cache en cada llamada distinta.
 
     Lanza `ErrorModeloClaude` (o una de sus subclases) ante cualquier fallo
     irrecuperable — no hay resultado parcial razonable que devolver si la
@@ -111,6 +127,16 @@ def extraer(ruta: pathlib.Path, tipo: str, config: dict | None = None) -> Compro
     system = [
         {"type": "text", "text": _construir_prompt(empresas), "cache_control": {"type": "ephemeral"}},
     ]
+    texto_instruccion = (
+        "Extrae la información estructurada de este comprobante en JSON, "
+        "siguiendo exactamente las reglas del system prompt."
+    )
+    if tipo_esperado:
+        texto_instruccion += (
+            f" Contexto (no una imposición): este documento llegó a la carpeta de '{tipo_esperado}', así "
+            f"que se espera que tipo_documento sea '{tipo_esperado}'. Si el documento claramente es de otro "
+            f"tipo, ignora este contexto y extrae el tipo_documento real que ves."
+        )
     mensajes = [
         {
             "role": "user",
@@ -118,8 +144,7 @@ def extraer(ruta: pathlib.Path, tipo: str, config: dict | None = None) -> Compro
                 bloque_documento,
                 {
                     "type": "text",
-                    "text": "Extrae la información estructurada de este comprobante en JSON, "
-                    "siguiendo exactamente las reglas del system prompt.",
+                    "text": texto_instruccion,
                 },
             ],
         }
@@ -207,7 +232,10 @@ TIPO DE DOCUMENTO:
 (recibo por honorarios profesionales, cuarta categoría), "recibo_servicio" (recibo de un servicio público \
 o similar: luz, agua, internet, telefonía), "nota_credito" (anula o corrige un comprobante anterior), \
 "nota_debito" (incrementa el valor de un comprobante anterior), "guia_remision" (traslado de bienes, sin \
-importes de venta), "otro" si no calza en ninguno de los anteriores o no se puede determinar.
+importes de venta), "liquidacion" (compra de mercado o terminal pesquero SIN comprobante formal de SUNAT: \
+un pantallazo de transferencia o Yape/Plin, una nota manuscrita del vendedor, o un resumen/liquidación de \
+compras del día — no trae RUC de SUNAT ni serie F###/B### porque el vendedor informal no emite ese tipo de \
+comprobante), "otro" si no calza en ninguno de los anteriores o no se puede determinar.
 - Si es nota de crédito o nota de débito, busca a qué comprobante hace referencia (suele decir "Doc. que \
 modifica" o similar) y ponlo en documento_referencia con el mismo formato serie-número del original. Si no \
 aplica (no es nota de crédito/débito, o no encuentras la referencia), deja documento_referencia como \

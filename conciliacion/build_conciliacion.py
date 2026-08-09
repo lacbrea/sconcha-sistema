@@ -22,6 +22,17 @@ agrega (ver ../SKILL.md "Que hace"):
   N_COMPROBANTE="NO APLICA (TRASPASO INTERNO)".
 - VERIFICACION: cuadre EXACTO por cuenta (SALDO INICIAL + ABONOS - CARGOS =
   SALDO FINAL, marca OK/ERROR) usando el saldo corrido que cada parser valida.
+- --egresos <json> (2026-08, opcional): JSON intermedio armado por
+  egresos_caja.py (via conciliar.py) con el reporte de egresos de caja del
+  sistema de ventas (Restaurant.pe). Reemplaza, SOLO cuando se pasa este
+  flag, la regla vieja de CAJA CHICA (fondo fijo S/500 + boletas del CSV de
+  comprobantes) por la regla vigente desde ago-2026: rendiciones = gastos
+  del reporte, reposicion = S/reposicion_semanal (del JSON, no hardcodeada)
+  desde el banco. Tambien cruza los DEPOSITOS DE VENTA EN EFECTIVO del
+  reporte contra los ABONOS del banco (monto exacto +/-0.05, fecha +/-1 dia,
+  en cualquier cuenta cargada) y marca el abono que cruza en su propia hoja
+  ABONOS. Sin --egresos, el comportamiento es EXACTAMENTE el de antes (ver
+  FONDO_CAJA_CHICA mas abajo).
 
 Todo lo de v2/v3 se conserva: reglas de categorias/proveedores, TIPO para
 EGP/flujo de caja, hojas CARGOS/ABONOS/FLUJO CAJA/EGP/CAJA CHICA/VERIFICACION/EECC,
@@ -79,6 +90,13 @@ ap.add_argument('--pdf-password', default=None, metavar='CONTRASENA',
                       'proteger los PDF de "Cuenta Negocio" con el RUC del titular). Se aplica a TODOS los PDF '
                       'de esta corrida (bank_eecc + --eecc); si alguno no esta cifrado, se ignora para ese '
                       'archivo sin error.')
+ap.add_argument('--egresos', default=None, metavar='JSON',
+                 help='JSON intermedio (armado por egresos_caja.py via conciliar.py) con el reporte de egresos '
+                      'de caja del sistema de ventas: {"gastos": [...], "depositos": [...], '
+                      '"reposicion_semanal": N}. Si se pasa, la hoja CAJA CHICA usa la regla vigente desde '
+                      'ago-2026 (rendiciones = gastos del reporte, reposicion semanal desde banco) en vez de la '
+                      'regla vieja de fondo fijo S/500, y se cruzan los DEPOSITOS DE VENTA EN EFECTIVO del '
+                      'reporte contra los ABONOS del banco. Sin este flag, el comportamiento es el de siempre.')
 args = ap.parse_args()
 
 if args.banco:
@@ -104,6 +122,12 @@ MESES_ES = ['ENERO', 'FEBRERO', 'MARZO', 'ABRIL', 'MAYO', 'JUNIO', 'JULIO', 'AGO
             'SEPTIEMBRE', 'OCTUBRE', 'NOVIEMBRE', 'DICIEMBRE']
 
 cons = json.load(open(cj)) if cj.lower() != 'none' and os.path.exists(cj) else []
+
+# EGRESOS_DATA es None cuando no se paso --egresos: ese es el interruptor que
+# decide toda la rama vieja vs nueva de CAJA CHICA (ver esa seccion). El JSON
+# lo arma conciliar.py (gastos/depositos ya separados por egresos_caja.py +
+# reposicion_semanal leido de config.yaml, nunca hardcodeado aca).
+EGRESOS_DATA = json.load(open(args.egresos, encoding='utf-8')) if args.egresos else None
 
 HEREDAR_MAP = heredar_categorias.build_map(args.heredar) if args.heredar else None
 HEREDAR_STATS = {'prov': 0, 'cat': 0, 'reclasificaciones': []}
@@ -210,6 +234,23 @@ def semana(s):
     if not d:
         return ''
     return f'S{min((d.day - 1) // 7 + 1, 5)}'
+
+
+def _semanas_en_periodo(ini, fin):
+    """Cuenta cuantos 'buckets' S1..S5 (mismo criterio que semana(), bandas de
+    7 dias del mes calendario) toca el periodo [ini, fin]. Se usa SOLO en la
+    hoja CAJA CHICA con --egresos, para calcular la cadencia esperada de
+    reposicion_semanal sin inventar una nocion de 'semana' nueva (reutiliza
+    la misma que ya usa FLUJO CAJA)."""
+    if not ini or not fin:
+        return 0
+    semanas = set()
+    d = ini
+    un_dia = datetime.timedelta(days=1)
+    while d <= fin:
+        semanas.add(min((d.day - 1) // 7 + 1, 5))
+        d += un_dia
+    return len(semanas)
 
 
 cidx = {}
@@ -446,6 +487,95 @@ def detectar_transferencias(cuentas):
 
 
 transfer_ids, transferencias = detectar_transferencias(cuentas)
+
+# ---------------------------------------------------------------------------
+# Cruce de DEPOSITOS DE VENTA EN EFECTIVO (reporte --egresos) vs ABONOS del
+# banco. Regla del dueno (2026-08): el reporte de egresos de caja trae los
+# depositos que la caja envia al banco; cada uno deberia aparecer como un
+# abono real en el EECC. El cruce NO se restringe a la redaccion que use el
+# banco (BBVA describe "DEPOS. EN CTA." o "INGRESO EN EFECTIVO") - cualquier
+# abono que calce en monto+fecha es candidato, para no depender de un texto
+# que puede cambiar de banco a banco o de mes a mes.
+# ---------------------------------------------------------------------------
+TOL_DEPOSITO = 0.05
+
+
+def cruzar_depositos_caja_chica(cuentas, depositos):
+    """Para cada deposito del reporte busca UN abono (monto exacto +/-0.05,
+    fecha +/-1 dia) en CUALQUIERA de las cuentas cargadas, sin reutilizar un
+    abono ya asignado a otro deposito (mismo espiritu que '_ASSIGNED' en el
+    cruce de comprobantes: dos depositos del mismo monto en fechas cercanas
+    no deben pelearse por el mismo abono en silencio - el de menor
+    diferencia de dias/monto gana, procesando los depositos en orden de
+    fecha para que el resultado sea determinista).
+
+    Devuelve (match: {abono['_id']: deposito_dict}, depositos_sin_match: [dict]).
+    """
+    abonos = []
+    for c in cuentas:
+        for m in c['movs']:
+            if not m['abono']:
+                continue
+            dt = pdate(m['fop'])
+            if dt is None:
+                continue
+            abonos.append((m, dt, round(float(m['abono']), 2)))
+
+    usados = set()
+    match = {}
+    sin_match = []
+    orden = sorted(depositos, key=lambda d: pdate(d.get('fecha')) or datetime.datetime.min)
+    for dep in orden:
+        dfecha = pdate(dep.get('fecha'))
+        try:
+            dmonto = round(float(dep.get('monto')), 2)
+        except (TypeError, ValueError):
+            sin_match.append(dep)
+            continue
+        if dfecha is None:
+            sin_match.append(dep)
+            continue
+        best_idx = None; best_key = None
+        for idx, (m, dt, amt) in enumerate(abonos):
+            if idx in usados:
+                continue
+            diff_amt = round(abs(amt - dmonto), 2)
+            if diff_amt > TOL_DEPOSITO:
+                continue
+            dd = abs((dt - dfecha).days)
+            if dd > 1:
+                continue
+            key = (diff_amt, dd)
+            if best_key is None or key < best_key:
+                best_idx, best_key = idx, key
+        if best_idx is None:
+            sin_match.append(dep)
+        else:
+            usados.add(best_idx)
+            match[abonos[best_idx][0]['_id']] = dep
+    return match, sin_match
+
+
+def abonos_deposito_sin_cruzar(cuentas, deposito_match):
+    """Abonos que el banco describe como deposito de efectivo (DEPOS. EN
+    CTA. / INGRESO EN EFECTIVO) pero que ningun deposito del reporte reclamo
+    en cruzar_depositos_caja_chica() -el caso contrario al anterior-, para
+    no dejarlos pasar en silencio tampoco."""
+    encontrados = []
+    for c in cuentas:
+        for m in c['movs']:
+            if not m['abono'] or m['_id'] in deposito_match:
+                continue
+            dN = N(m['desc'])
+            if ('DEPOS' in dN and 'CTA' in dN) or 'INGRESO EN EFECTIVO' in dN:
+                encontrados.append(m)
+    return encontrados
+
+
+DEPOSITO_MATCH, DEPOSITOS_SIN_MATCH = (
+    cruzar_depositos_caja_chica(cuentas, EGRESOS_DATA.get('depositos', [])) if EGRESOS_DATA else ({}, [])
+)
+ABONOS_DEPOSITO_SIN_MATCH = abonos_deposito_sin_cruzar(cuentas, DEPOSITO_MATCH) if EGRESOS_DATA else []
 
 # ---------------------------------------------------------------------------
 # Comprobantes (Sheet "SCONCHA - Facturas" exportado a CSV)
@@ -789,22 +919,41 @@ def procesar_cuenta_cargos(sheet_name, movs, transfer_ids, heredar_map=None, her
     }
 
 
-def procesar_cuenta_abonos(sheet_name, movs, transfer_ids):
+def procesar_cuenta_abonos(sheet_name, movs, transfer_ids, deposito_match=None):
+    """deposito_match ({abono['_id']: deposito_dict}, ver
+    cruzar_depositos_caja_chica) es None/{} en el modo sin --egresos: en ese
+    caso 'dep' siempre da falsy abajo y la columna Observacion queda
+    EXACTAMENTE como antes - es lo que garantiza que el modo viejo no cambia
+    ni un byte de esta hoja. Se reutiliza la columna Observacion existente en
+    vez de agregar una nueva (menos invasivo: mismo criterio que ya usa esa
+    columna en CARGOS para varias notas distintas) - transferencia entre
+    cuentas y deposito de caja chica no deberian coincidir nunca en el mismo
+    abono (detectar_transferencias ya excluye depositos/ingresos en efectivo
+    de sus candidatos), pero por las dudas la transferencia gana la prioridad."""
     sa = wb.create_sheet(sheet_name)
     style_header(sa, ABONOS_HEADERS, ABONOS_WIDTHS)
+    deposito_match = deposito_match or {}
     row = 2; totA = 0
     for d in sorted(movs, key=lambda x: (pdate(x['fop']) or datetime.datetime.min), reverse=True):
         if d['abono'] in (None, ''): continue
         totA += abs(float(d['abono']))
         es_transferencia = d.get('_id') in transfer_ids
+        dep = deposito_match.get(d.get('_id'))
         vals = [d['fop'], dia(d['fop']), semana(d['fop']), d['fpr'], d['nro'], d['mov'], d['desc'], d['canal'], d['abono'], d['saldo']]
         for i, v in enumerate(vals, 1):
             c = sa.cell(row, i, v); c.border = border; c.font = Font(size=9); c.alignment = Alignment(vertical='center')
             if i in (9, 10): c.number_format = '#,##0.00'
         cat_cell = sa.cell(row, 11, 'TRANSFERENCIA ENTRE CUENTAS' if es_transferencia else '')
-        obs_cell = sa.cell(row, 13, 'TRASPASO INTERNO ENTRE CUENTAS DE LA MISMA EMPRESA' if es_transferencia else '')
+        if es_transferencia:
+            obs_txt = 'TRASPASO INTERNO ENTRE CUENTAS DE LA MISMA EMPRESA'
+        elif dep:
+            obs_txt = f"CONCILIADO CAJA CHICA (DEPOSITO DE VENTA {dep.get('fecha', '')} S/{float(dep.get('monto') or 0):.2f} - REPORTE EGRESOS)"
+        else:
+            obs_txt = ''
+        obs_cell = sa.cell(row, 13, obs_txt)
         for col in (11, 12, 13): sa.cell(row, col).border = border
         if es_transferencia: cat_cell.fill = trapfill
+        elif dep: obs_cell.fill = okfill
         row += 1
     sa.cell(row, 8, 'TOTAL').font = tfont; sa.cell(row, 8).fill = tfill; sa.cell(row, 8).border = border; sa.cell(row, 8).alignment = Alignment(horizontal='right')
     ta = sa.cell(row, 9, round(totA, 2)); ta.font = tfont; ta.fill = tfill; ta.number_format = '#,##0.00'; ta.border = border
@@ -849,7 +998,7 @@ for c in cuentas:
         resultados.append({'cuenta': c, 'vacia': True})
         continue
     rc = procesar_cuenta_cargos(sheet_cargos, c['movs'], transfer_ids, HEREDAR_MAP, HEREDAR_STATS)
-    ra = procesar_cuenta_abonos(sheet_abonos, c['movs'], transfer_ids)
+    ra = procesar_cuenta_abonos(sheet_abonos, c['movs'], transfer_ids, DEPOSITO_MATCH)
     eecc_info = construir_eecc_sheet(sheet_eecc, c['movs'], c['meta'])
     resultados.append({'cuenta': c, 'vacia': False, 'cargos': rc, 'abonos': ra, 'eecc_info': eecc_info,
                         'sheet_cargos': sheet_cargos, 'sheet_abonos': sheet_abonos})
@@ -980,66 +1129,202 @@ def wcc(a='', b='', c='', d='', note='', bold=False, fill=None, fmt_cols=()):
 local_key = EMP_KEY
 local_nombre, local_resp = CAJA_CHICA_LOCAL.get(local_key, ('', ''))
 wcc(f'CAJA CHICA - {EMP} - {PERIODO_LABEL}', '', '', '', '', True, tfill)
-wcc('Local', local_nombre, 'Responsable', local_resp, 'Aritmetica: SALDO TEORICO = FONDO FIJO - BOLETAS RENDIDAS + REPOSICIONES BANCARIAS', True)
-rc2 += 1
-wcc('FONDO FIJO (no cambia)', round(FONDO_CAJA_CHICA, 2), '', '', 'Monto fijo asignado al local, S/500 por local (decision del negocio)', True, tfill, fmt_cols=(2,))
-rc2 += 1
 
-boletas = []
-if COMPROBANTES_CARGADOS and local_nombre:
-    for c in comprobantes:
-        if not c['_CAJA_CHICA']: continue
-        if norm(c.get('LOCAL', '')) != norm(local_nombre): continue
-        fe = c['_FECHA_EMISION']
-        if periodo_ini and periodo_fin and fe and not (periodo_ini <= fe <= periodo_fin): continue
-        boletas.append(c)
-boletas.sort(key=lambda c: c['_FECHA_EMISION'] or datetime.datetime.min)
+if EGRESOS_DATA:
+    # -----------------------------------------------------------------------
+    # Regla vigente desde ago-2026 (decision del dueno, ver --egresos mas
+    # arriba): reposicion semanal desde el banco, sin fondo fijo. Rendiciones
+    # = gastos del reporte de egresos de caja (Restaurant.pe), no boletas del
+    # CSV de comprobantes (ese CSV puede seguir usandose para otras cosas del
+    # cruce, pero ya no es la fuente de la caja chica).
+    # -----------------------------------------------------------------------
+    reposicion_semanal = float(EGRESOS_DATA.get('reposicion_semanal') or 0)
+    wcc('Local', local_nombre, 'Responsable', local_resp,
+        'Regla vigente desde ago-2026: reposicion semanal desde el banco (sin fondo fijo, ver config.yaml). '
+        'Rendiciones = gastos del reporte de egresos de caja, no boletas del CSV.', True)
+    rc2 += 1
+    wcc('REPOSICION SEMANAL (config)', round(reposicion_semanal, 2), '', '',
+        'conciliacion.empresas[].caja_chica.reposicion_semanal en config.yaml - nunca hardcodeada en el motor',
+        True, tfill, fmt_cols=(2,))
+    rc2 += 1
 
-wcc('BOLETAS RENDIDAS (periodo del EECC)', '', '', '', '', True)
-wcc('Fecha', 'Proveedor', 'Serie', 'Monto', '', True)
-total_rendido = 0
-for c in boletas:
-    fe_str = c.get('FECHA_EMISION', '')
-    wcc(fe_str, c.get('PROVEEDOR', ''), c.get('SERIE_NUMERO', ''), round(c['_TOTAL'], 2), fmt_cols=(4,))
-    total_rendido += c['_TOTAL']
-wcc('TOTAL RENDIDO', '', '', round(total_rendido, 2), '', True, catfill, fmt_cols=(4,))
-rc2 += 1
+    gastos_reporte = EGRESOS_DATA.get('gastos') or []
+    gastos_periodo = []
+    for g in gastos_reporte:
+        gf = pdate(g.get('fecha'))
+        if periodo_ini and periodo_fin and gf and not (periodo_ini <= gf <= periodo_fin):
+            continue
+        gastos_periodo.append(g)
+    gastos_periodo.sort(key=lambda g: pdate(g.get('fecha')) or datetime.datetime.min)
 
-wcc('REPOSICIONES BANCARIAS (cargos categoria CAJA CHICA, todas las cuentas soles)', '', '', '', '', True)
-wcc('Fecha', '', '', 'Monto', '', True)
-total_repuesto = 0
-for fecha_op, monto in sorted(caja_chica_repuesto_rows, key=lambda x: pdate(x[0]) or datetime.datetime.min):
-    wcc(fecha_op, '', '', round(monto, 2), fmt_cols=(4,))
-    total_repuesto += monto
-wcc('TOTAL REPUESTO', '', '', round(total_repuesto, 2), '', True, catfill, fmt_cols=(4,))
-rc2 += 1
+    wcc('RENDICIONES (GASTOS DEL REPORTE DE EGRESOS, periodo del EECC)', '', '', '', '', True)
+    wcc('Fecha', 'Motivo', 'Entregado a', 'Monto', '', True)
+    total_gastos = 0.0
+    for g in gastos_periodo:
+        monto_g = float(g.get('monto') or 0)
+        wcc(g.get('fecha', ''), str(g.get('motivo', ''))[:80], g.get('entregado_a', ''), round(monto_g, 2), fmt_cols=(4,))
+        total_gastos += monto_g
+    wcc('TOTAL GASTOS', '', '', round(total_gastos, 2), '', True, catfill, fmt_cols=(4,))
+    rc2 += 1
 
-saldo_teorico = round(FONDO_CAJA_CHICA - total_rendido + total_repuesto, 2)
-diferencia = round(saldo_teorico - FONDO_CAJA_CHICA, 2)
-wcc('SALDO TEORICO', '', '', saldo_teorico, 'FONDO - RENDIDO + REPUESTO. Debe volver a S/500 si la reposicion cubrio exactamente lo rendido.',
-    True, okfill if abs(diferencia) < 0.01 else pendfill, fmt_cols=(4,))
-wcc('DIFERENCIA vs FONDO (S/500)', '', '', diferencia,
-    'Negativo = falta reponer a la caja; positivo = se repuso de mas o hay boletas de un periodo anterior sin registrar.',
-    True, fmt_cols=(4,))
-rc2 += 1
+    wcc('REPOSICIONES BANCARIAS (cargos categoria CAJA CHICA, todas las cuentas soles)', '', '', '', '', True)
+    wcc('Fecha', '', '', 'Monto', '', True)
+    total_repuesto = 0.0
+    for fecha_op, monto in sorted(caja_chica_repuesto_rows, key=lambda x: pdate(x[0]) or datetime.datetime.min):
+        wcc(fecha_op, '', '', round(monto, 2), fmt_cols=(4,))
+        total_repuesto += monto
+    wcc('TOTAL REPUESTO', '', '', round(total_repuesto, 2), '', True, catfill, fmt_cols=(4,))
+    rc2 += 1
 
-sin_rendicion = False
-if periodo_fin:
-    ventana_ini = periodo_fin - datetime.timedelta(days=7)
-    hay_boleta_reciente = any(c['_FECHA_EMISION'] and ventana_ini <= c['_FECHA_EMISION'] <= periodo_fin for c in boletas)
-    if not hay_boleta_reciente:
-        sin_rendicion = True
-        wcc('ALERTA', 'SIN RENDICION ESTA SEMANA', '', '',
-            f'No hay boletas de caja chica rendidas entre {ventana_ini.strftime("%d/%m/%Y")} y {periodo_fin.strftime("%d/%m/%Y")}.',
-            True, pendfill)
+    diferencia_gr = round(total_repuesto - total_gastos, 2)
+    wcc('DIFERENCIA (REPUESTO - GASTOS)', '', '', diferencia_gr,
+        'Informativo: la reposicion es un monto FIJO semanal, no un reembolso exacto de lo gastado - una diferencia no es error por si sola.',
+        True, fmt_cols=(4,))
+
+    n_semanas = _semanas_en_periodo(periodo_ini, periodo_fin)
+    cadencia_esperada = round(reposicion_semanal * n_semanas, 2)
+    diferencia_cadencia = round(total_repuesto - cadencia_esperada, 2)
+    alerta_cadencia = reposicion_semanal > 0 and abs(diferencia_cadencia) > reposicion_semanal
+    wcc('CADENCIA ESPERADA (reposicion_semanal x semanas del periodo)', '', '', cadencia_esperada,
+        f'{n_semanas} semana(s) x S/{reposicion_semanal:,.2f} vs repuesto real S/{total_repuesto:,.2f} (dif S/{diferencia_cadencia:,.2f})',
+        True, pendfill if alerta_cadencia else okfill, fmt_cols=(4,))
+    rc2 += 1
+    if alerta_cadencia:
         pendientes_caja_chica.append({
-            'fecha': periodo_fin.strftime('%d/%m/%Y'),
-            'monto': 0,
-            'descripcion': f'CAJA CHICA {local_nombre} ({local_resp}): sin rendicion en los ultimos 7 dias del periodo',
-            'motivo': 'CAJA CHICA SIN RENDIR',
+            'fecha': periodo_fin.strftime('%d/%m/%Y') if periodo_fin else None,
+            'monto': diferencia_cadencia,
+            'descripcion': (f'CAJA CHICA {local_nombre} ({local_resp}): repuesto S/{total_repuesto:,.2f} vs cadencia '
+                             f'esperada S/{cadencia_esperada:,.2f} ({n_semanas} semana(s) x S/{reposicion_semanal:,.2f})'),
+            'motivo': 'CAJA CHICA CADENCIA DE REPOSICION FUERA DE LO ESPERADO',
         })
-if not COMPROBANTES_CARGADOS:
-    wcc('NOTA', 'No se cargo --comprobantes en esta corrida: BOLETAS RENDIDAS queda en 0 por falta de datos, no por falta real de rendicion.', '', '', '', False)
+
+    # ---- Depositos de venta en efectivo (reporte) vs abonos del banco ----
+    depositos_reporte = sorted(EGRESOS_DATA.get('depositos') or [],
+                                key=lambda d: pdate(d.get('fecha')) or datetime.datetime.min)
+    sin_match_ids = {id(d) for d in DEPOSITOS_SIN_MATCH}
+    total_depositos_reporte = round(sum(float(d.get('monto') or 0) for d in depositos_reporte), 2)
+    n_cruzaron = len(depositos_reporte) - len(DEPOSITOS_SIN_MATCH)
+    wcc('DEPOSITOS DE VENTA EN EFECTIVO (REPORTE) vs ABONOS DEL BANCO', '', '', '', '', True, tfill)
+    wcc('Fecha', 'Motivo', 'Cruzo con abono', 'Monto', '', True)
+    for d in depositos_reporte:
+        cruzo = id(d) not in sin_match_ids
+        wcc(d.get('fecha', ''), str(d.get('motivo', ''))[:60], 'SI' if cruzo else 'NO', round(float(d.get('monto') or 0), 2),
+            fill=None if cruzo else pendfill, fmt_cols=(4,))
+    wcc('TOTAL DEPOSITOS DEL REPORTE', '', '', total_depositos_reporte, '', True, catfill, fmt_cols=(4,))
+    wcc('Cruzaron con un abono', f'{n_cruzaron}/{len(depositos_reporte)}', '', '', '', True,
+        okfill if depositos_reporte and n_cruzaron == len(depositos_reporte) else pendfill)
+    rc2 += 1
+
+    if DEPOSITOS_SIN_MATCH:
+        wcc('PENDIENTE: depositos del reporte SIN abono que calce (monto exacto +/-0.05, fecha +/-1 dia)', '', '', '', '', True, pendfill)
+        for d in DEPOSITOS_SIN_MATCH:
+            wcc(d.get('fecha', ''), str(d.get('motivo', ''))[:60], '', round(float(d.get('monto') or 0), 2), fmt_cols=(4,))
+            pendientes_caja_chica.append({
+                'fecha': d.get('fecha'),
+                'monto': round(float(d.get('monto') or 0), 2),
+                'descripcion': (f"CAJA CHICA {local_nombre}: deposito de venta en efectivo del reporte sin abono "
+                                f"que calce ({d.get('fecha')} S/{float(d.get('monto') or 0):,.2f})"),
+                'motivo': 'DEPOSITO CAJA CHICA SIN ABONO',
+            })
+        rc2 += 1
+
+    if ABONOS_DEPOSITO_SIN_MATCH:
+        wcc('PENDIENTE: abonos tipo deposito/ingreso en efectivo SIN deposito del reporte que los reclame', '', '', '', '', True, pendfill)
+        for m in ABONOS_DEPOSITO_SIN_MATCH:
+            wcc(m['fop'], str(m['desc'])[:60], '', round(float(m['abono']), 2), fmt_cols=(4,))
+            pendientes_caja_chica.append({
+                'fecha': m['fop'],
+                'monto': round(float(m['abono']), 2),
+                'descripcion': (f"CAJA CHICA {local_nombre}: abono {m['fop']} S/{float(m['abono']):,.2f} "
+                                f"({str(m['desc'])[:40]}) sin deposito del reporte de egresos que lo reclame"),
+                'motivo': 'ABONO DEPOSITO SIN REPORTE',
+            })
+        rc2 += 1
+
+    sin_rendicion = False
+    if periodo_fin:
+        ventana_ini = periodo_fin - datetime.timedelta(days=7)
+        hay_gasto_reciente = any(
+            pdate(g.get('fecha')) and ventana_ini <= pdate(g.get('fecha')) <= periodo_fin for g in gastos_periodo
+        )
+        if not hay_gasto_reciente:
+            sin_rendicion = True
+            wcc('ALERTA', 'SIN RENDICION ESTA SEMANA', '', '',
+                f'No hay gastos del reporte de egresos entre {ventana_ini.strftime("%d/%m/%Y")} y {periodo_fin.strftime("%d/%m/%Y")}.',
+                True, pendfill)
+            pendientes_caja_chica.append({
+                'fecha': periodo_fin.strftime('%d/%m/%Y'),
+                'monto': 0,
+                'descripcion': f'CAJA CHICA {local_nombre} ({local_resp}): sin gastos en el reporte en los ultimos 7 dias del periodo',
+                'motivo': 'CAJA CHICA SIN RENDIR',
+            })
+else:
+    # -----------------------------------------------------------------------
+    # Regla vieja, vigente hasta jul-2026 (sin --egresos): fondo fijo S/500 +
+    # boletas rendidas del CSV de comprobantes (columna CAJA_CHICA=SI) +
+    # reposiciones bancarias (cargos categoria CAJA CHICA). NO TOCAR: es el
+    # comportamiento que la regresion de junio verifica bit a bit.
+    # -----------------------------------------------------------------------
+    wcc('Local', local_nombre, 'Responsable', local_resp, 'Aritmetica: SALDO TEORICO = FONDO FIJO - BOLETAS RENDIDAS + REPOSICIONES BANCARIAS', True)
+    rc2 += 1
+    wcc('FONDO FIJO (no cambia)', round(FONDO_CAJA_CHICA, 2), '', '', 'Monto fijo asignado al local, S/500 por local (decision del negocio)', True, tfill, fmt_cols=(2,))
+    rc2 += 1
+
+    boletas = []
+    if COMPROBANTES_CARGADOS and local_nombre:
+        for c in comprobantes:
+            if not c['_CAJA_CHICA']: continue
+            if norm(c.get('LOCAL', '')) != norm(local_nombre): continue
+            fe = c['_FECHA_EMISION']
+            if periodo_ini and periodo_fin and fe and not (periodo_ini <= fe <= periodo_fin): continue
+            boletas.append(c)
+    boletas.sort(key=lambda c: c['_FECHA_EMISION'] or datetime.datetime.min)
+
+    wcc('BOLETAS RENDIDAS (periodo del EECC)', '', '', '', '', True)
+    wcc('Fecha', 'Proveedor', 'Serie', 'Monto', '', True)
+    total_rendido = 0
+    for c in boletas:
+        fe_str = c.get('FECHA_EMISION', '')
+        wcc(fe_str, c.get('PROVEEDOR', ''), c.get('SERIE_NUMERO', ''), round(c['_TOTAL'], 2), fmt_cols=(4,))
+        total_rendido += c['_TOTAL']
+    wcc('TOTAL RENDIDO', '', '', round(total_rendido, 2), '', True, catfill, fmt_cols=(4,))
+    rc2 += 1
+
+    wcc('REPOSICIONES BANCARIAS (cargos categoria CAJA CHICA, todas las cuentas soles)', '', '', '', '', True)
+    wcc('Fecha', '', '', 'Monto', '', True)
+    total_repuesto = 0
+    for fecha_op, monto in sorted(caja_chica_repuesto_rows, key=lambda x: pdate(x[0]) or datetime.datetime.min):
+        wcc(fecha_op, '', '', round(monto, 2), fmt_cols=(4,))
+        total_repuesto += monto
+    wcc('TOTAL REPUESTO', '', '', round(total_repuesto, 2), '', True, catfill, fmt_cols=(4,))
+    rc2 += 1
+
+    saldo_teorico = round(FONDO_CAJA_CHICA - total_rendido + total_repuesto, 2)
+    diferencia = round(saldo_teorico - FONDO_CAJA_CHICA, 2)
+    wcc('SALDO TEORICO', '', '', saldo_teorico, 'FONDO - RENDIDO + REPUESTO. Debe volver a S/500 si la reposicion cubrio exactamente lo rendido.',
+        True, okfill if abs(diferencia) < 0.01 else pendfill, fmt_cols=(4,))
+    wcc('DIFERENCIA vs FONDO (S/500)', '', '', diferencia,
+        'Negativo = falta reponer a la caja; positivo = se repuso de mas o hay boletas de un periodo anterior sin registrar.',
+        True, fmt_cols=(4,))
+    rc2 += 1
+
+    sin_rendicion = False
+    if periodo_fin:
+        ventana_ini = periodo_fin - datetime.timedelta(days=7)
+        hay_boleta_reciente = any(c['_FECHA_EMISION'] and ventana_ini <= c['_FECHA_EMISION'] <= periodo_fin for c in boletas)
+        if not hay_boleta_reciente:
+            sin_rendicion = True
+            wcc('ALERTA', 'SIN RENDICION ESTA SEMANA', '', '',
+                f'No hay boletas de caja chica rendidas entre {ventana_ini.strftime("%d/%m/%Y")} y {periodo_fin.strftime("%d/%m/%Y")}.',
+                True, pendfill)
+            pendientes_caja_chica.append({
+                'fecha': periodo_fin.strftime('%d/%m/%Y'),
+                'monto': 0,
+                'descripcion': f'CAJA CHICA {local_nombre} ({local_resp}): sin rendicion en los ultimos 7 dias del periodo',
+                'motivo': 'CAJA CHICA SIN RENDIR',
+            })
+    if not COMPROBANTES_CARGADOS:
+        wcc('NOTA', 'No se cargo --comprobantes en esta corrida: BOLETAS RENDIDAS queda en 0 por falta de datos, no por falta real de rendicion.', '', '', '', False)
 
 for rr in range(1, rc2):
     for cc3 in range(1, 6): scc.cell(rr, cc3).border = border

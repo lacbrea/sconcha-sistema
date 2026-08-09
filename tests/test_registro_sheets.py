@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import registro_sheets  # noqa: E402
-from registro_sheets import COLUMNAS_CONTABLE, COLUMNAS_DETALLE, Registro  # noqa: E402
+from registro_sheets import COLUMNAS_CONTABLE, COLUMNAS_DETALLE, COLUMNAS_RESPALDOS_CAJA, Registro  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Stub local del contrato de esquema.py (todavia no existe: lo crea otro
@@ -67,21 +67,36 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Doble de prueba del Resource de sheets v4 (googleapiclient), sin red.
 # ---------------------------------------------------------------------------
+def _clave_store(spreadsheet_id: str, range_: str) -> str:
+    """RESPALDOS_CAJA vive en una pestaña propia del MISMO spreadsheet que
+    contable/detalle (a diferencia de esos dos, que son spreadsheets
+    distintos), así que este doble no puede seguir usando spreadsheetId solo
+    como llave del store: dos pestañas del mismo spreadsheet compartirían
+    filas. Cuando 'range' trae nombre de hoja ("HOJA!A1:F") se compone una
+    llave distinta; los rangos sin nombre de hoja (contable/detalle) siguen
+    exactamente igual que antes, para no romper los tests existentes que
+    acceden a fake.store["SHEET_CONTABLE"] directo."""
+    if "!" in range_:
+        hoja, _ = range_.split("!", 1)
+        return f"{spreadsheet_id}::{hoja}"
+    return spreadsheet_id
+
+
 class _FakeValues:
     def __init__(self, store: dict[str, list[list]]):
         self._store = store
         self._pendiente = None
 
     def get(self, spreadsheetId, range):  # noqa: A002 - firma igual a la API real
-        self._pendiente = ("get", spreadsheetId)
+        self._pendiente = ("get", _clave_store(spreadsheetId, range))
         return self
 
     def update(self, spreadsheetId, range, valueInputOption, body):  # noqa: A002
-        self._pendiente = ("update", spreadsheetId, body["values"])
+        self._pendiente = ("update", _clave_store(spreadsheetId, range), body["values"])
         return self
 
     def append(self, spreadsheetId, range, valueInputOption, insertDataOption, body):  # noqa: A002
-        self._pendiente = ("append", spreadsheetId, body["values"])
+        self._pendiente = ("append", _clave_store(spreadsheetId, range), body["values"])
         return self
 
     def execute(self):
@@ -102,17 +117,49 @@ class _FakeValues:
 
 
 class FakeServicioSheets:
-    """Doble minimo del Resource sheets v4: guarda todo en memoria."""
+    """Doble minimo del Resource sheets v4: guarda todo en memoria.
+
+    Además de values().get/update/append (usados por contable/detalle),
+    soporta spreadsheets().get()/batchUpdate() a nivel de spreadsheet
+    (metadata de pestañas y addSheet), que es lo que usa
+    Registro._asegurar_hoja_respaldos_caja() para crear la pestaña
+    RESPALDOS_CAJA la primera vez.
+    """
 
     def __init__(self):
         self.store: dict[str, list[list]] = {}
         self._values = _FakeValues(self.store)
+        self.hojas: dict[str, set[str]] = {}
+        self._pendiente_meta = None
 
     def spreadsheets(self):
         return self
 
     def values(self):
         return self._values
+
+    def get(self, spreadsheetId, fields=None):  # noqa: A002 - firma igual a la API real
+        self._pendiente_meta = ("get", spreadsheetId)
+        return self
+
+    def batchUpdate(self, spreadsheetId, body):  # noqa: N802,A002 - firma igual a la API real
+        self._pendiente_meta = ("batchUpdate", spreadsheetId, body)
+        return self
+
+    def execute(self):
+        accion = self._pendiente_meta[0]
+        if accion == "get":
+            _, sid = self._pendiente_meta
+            titulos = ["Hoja 1"] + sorted(self.hojas.get(sid, set()))
+            return {"sheets": [{"properties": {"title": t}} for t in titulos]}
+        if accion == "batchUpdate":
+            _, sid, body = self._pendiente_meta
+            for peticion in body.get("requests", []):
+                titulo = peticion.get("addSheet", {}).get("properties", {}).get("title")
+                if titulo:
+                    self.hojas.setdefault(sid, set()).add(titulo)
+            return {}
+        raise AssertionError(f"accion no esperada: {accion}")
 
 
 # ---------------------------------------------------------------------------
@@ -332,3 +379,137 @@ def test_claves_existentes_via_servicio_fake(tmp_path):
     registro.escribir(_comprobante_con_items(), empresa="SCONCHA", local="MIRAFLORES", link_drive="", archivo="a.pdf")
 
     assert registro.claves_existentes() == {"20123456789|F001-1234|118.00"}
+
+
+# ---------------------------------------------------------------------------
+# RESPALDOS_CAJA: respaldos de caja chica (NOTAS_DE_VENTA), registrados SIN
+# pasar por el modelo. Idempotencia por ARCHIVO+EMPRESA (ver _clave_respaldo
+# en registro_sheets.py).
+# ---------------------------------------------------------------------------
+def test_columnas_respaldos_caja_orden_y_nombres_exactos():
+    assert COLUMNAS_RESPALDOS_CAJA == ["FECHA", "EMPRESA", "LOCAL", "ARCHIVO", "LINK_DRIVE", "FECHA_REGISTRO"]
+
+
+def test_registrar_respaldo_caja_dry_run_escribe_csv(tmp_path):
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+
+    escrito = registro.registrar_respaldo_caja(
+        "2026-07-01", "EL TEMPLO", "LINCE", "01.07 BOLETAS.pdf", "https://drive/x"
+    )
+
+    assert escrito is True
+    csv_respaldos = tmp_path / "salida" / "respaldos_caja.csv"
+    assert csv_respaldos.exists()
+    with csv_respaldos.open(encoding="utf-8", newline="") as f:
+        filas = list(csv.DictReader(f))
+    assert len(filas) == 1
+    assert filas[0]["FECHA"] == "2026-07-01"
+    assert filas[0]["EMPRESA"] == "EL TEMPLO"
+    assert filas[0]["LOCAL"] == "LINCE"
+    assert filas[0]["ARCHIVO"] == "01.07 BOLETAS.pdf"
+    assert filas[0]["LINK_DRIVE"] == "https://drive/x"
+    assert filas[0]["FECHA_REGISTRO"] != ""
+
+
+def test_registrar_respaldo_caja_dry_run_es_idempotente_por_archivo_y_empresa(tmp_path):
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+
+    primero = registro.registrar_respaldo_caja("2026-07-01", "EL TEMPLO", "LINCE", "01.07 BOLETAS.pdf", "")
+    segundo = registro.registrar_respaldo_caja("2026-07-01", "EL TEMPLO", "LINCE", "01.07 BOLETAS.pdf", "")
+
+    assert primero is True
+    assert segundo is False  # ya estaba: no duplica fila
+
+    csv_respaldos = tmp_path / "salida" / "respaldos_caja.csv"
+    with csv_respaldos.open(encoding="utf-8", newline="") as f:
+        filas = list(csv.DictReader(f))
+    assert len(filas) == 1
+
+
+def test_registrar_respaldo_caja_dry_run_mismo_archivo_distinta_empresa_no_es_duplicado(tmp_path):
+    """La idempotencia es por ARCHIVO+EMPRESA, no solo por ARCHIVO: dos
+    respaldos con el mismo nombre pero de empresas distintas son filas
+    distintas (ej. dos negocios que suben un archivo con el mismo nombre de
+    boleta genérico)."""
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+
+    registro.registrar_respaldo_caja("2026-07-01", "EL TEMPLO", "LINCE", "boletas.pdf", "")
+    registro.registrar_respaldo_caja("2026-07-01", "INSTITUCION", "MIRAFLORES", "boletas.pdf", "")
+
+    csv_respaldos = tmp_path / "salida" / "respaldos_caja.csv"
+    with csv_respaldos.open(encoding="utf-8", newline="") as f:
+        filas = list(csv.DictReader(f))
+    assert len(filas) == 2
+
+
+def test_respaldos_existentes_dry_run_vacio_si_no_hay_csv(tmp_path):
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+    assert registro.respaldos_existentes() == set()
+
+
+def test_registrar_respaldo_caja_via_servicio_fake_crea_hoja_cabecera_y_escribe(tmp_path):
+    fake = FakeServicioSheets()
+    config = {
+        "dry_run": False,
+        "catalogo_csv": str(_catalogo_csv_minimo(tmp_path)),
+        "sheets": {"contable": "SHEET_CONTABLE", "detalle": "SHEET_DETALLE"},
+    }
+    registro = Registro(config, servicio=fake)
+
+    escrito = registro.registrar_respaldo_caja(
+        "2026-07-01", "EL TEMPLO", "LINCE", "01.07 BOLETAS.pdf", "https://drive/x"
+    )
+
+    assert escrito is True
+    assert "RESPALDOS_CAJA" in fake.hojas["SHEET_CONTABLE"]  # la pestaña se creó
+
+    filas = fake.store["SHEET_CONTABLE::RESPALDOS_CAJA"]
+    assert filas[0] == COLUMNAS_RESPALDOS_CAJA  # cabecera
+    assert filas[1] == ["2026-07-01", "EL TEMPLO", "LINCE", "01.07 BOLETAS.pdf", "https://drive/x", filas[1][5]]
+
+    # La pestaña RESPALDOS_CAJA nunca se mezcla con las filas de contable.
+    assert "SHEET_CONTABLE" not in fake.store or all(
+        fila != filas[1] for fila in fake.store.get("SHEET_CONTABLE", [])
+    )
+
+
+def test_registrar_respaldo_caja_via_servicio_fake_es_idempotente(tmp_path):
+    fake = FakeServicioSheets()
+    config = {
+        "dry_run": False,
+        "catalogo_csv": str(_catalogo_csv_minimo(tmp_path)),
+        "sheets": {"contable": "SHEET_CONTABLE", "detalle": "SHEET_DETALLE"},
+    }
+    registro = Registro(config, servicio=fake)
+
+    primero = registro.registrar_respaldo_caja("2026-07-01", "EL TEMPLO", "LINCE", "a.pdf", "")
+    segundo = registro.registrar_respaldo_caja("2026-07-01", "EL TEMPLO", "LINCE", "a.pdf", "")
+
+    assert primero is True
+    assert segundo is False
+    filas = fake.store["SHEET_CONTABLE::RESPALDOS_CAJA"]
+    assert len(filas) == 1 + 1  # cabecera + 1 fila (no 2)
+
+
+def test_registrar_respaldo_caja_no_toca_las_pestanas_contable_ni_detalle(tmp_path):
+    """Registrar un respaldo de caja chica no debe escribir absolutamente
+    nada en las columnas de comprobantes -esta es la regresión explícita de
+    mezclar RESPALDOS_CAJA con CONTABLE en el mismo spreadsheet: si el rango
+    no llevara el nombre de hoja, las filas de un respaldo terminarían
+    apareciendo como un comprobante fantasma."""
+    fake = FakeServicioSheets()
+    config = {
+        "dry_run": False,
+        "catalogo_csv": str(_catalogo_csv_minimo(tmp_path)),
+        "sheets": {"contable": "SHEET_CONTABLE", "detalle": "SHEET_DETALLE"},
+    }
+    registro = Registro(config, servicio=fake)
+
+    registro.registrar_respaldo_caja("2026-07-01", "EL TEMPLO", "LINCE", "a.pdf", "")
+
+    assert "SHEET_CONTABLE" not in fake.store  # nada escrito en el rango de contable (sin nombre de hoja)
+    assert registro.claves_existentes() == set()

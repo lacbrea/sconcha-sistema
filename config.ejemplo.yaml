@@ -38,6 +38,22 @@ drive:
     buzon: ""
     procesado: ""
     revisar: ""
+    # Subcarpetas de 00_BUZON, una por tipo de documento. La subcarpeta donde
+    # se deja el archivo le dice al sistema QUÉ es — dato que el documento no
+    # siempre trae:
+    #   facturas       comprobantes normales (foto, xml, pdf)
+    #   notas_venta    respaldos de gastos de caja chica (foto, pdf, xls);
+    #                  NO se leen con el modelo: el dato vive en el reporte de
+    #                  egresos del sistema de ventas
+    #   liquidaciones  compras de mercado/terminal sin comprobante formal
+    #                  (pantallazos de WhatsApp, fotos, xls, pdf)
+    #   otros          recibos de servicios, municipalidad, multiformato
+    # Los ids los rellena init_negocio.py. No los llenes a mano.
+    buzon_tipos:
+      facturas: ""
+      notas_venta: ""
+      liquidaciones: ""
+      otros: ""
 
 # Modelo de Claude usado por extractores/modelo.py para leer PDF e imágenes.
 # "esfuerzo" controla el nivel de esfuerzo de razonamiento (low/medium/high);
@@ -104,6 +120,12 @@ conciliacion:
       # No es libre ni cosmético: el motor lo usa para decidir el local y el
       # encargado de la caja chica. Ver conciliacion/build_conciliacion.py.
       nombre_motor: LA CALETA CENTRO
+      # Reposición semanal de la caja chica desde el banco. El reporte de
+      # egresos del sistema de ventas (--egresos de conciliar.py) se cuadra
+      # contra estas salidas. Borra la sección si el negocio no maneja caja
+      # chica por reposición.
+      caja_chica:
+        reposicion_semanal: 250
       cuentas:
         # "numero": los últimos dígitos con los que el banco nombra el archivo
         # del estado de cuenta (EC_1234_062026.pdf). Es el criterio con el que

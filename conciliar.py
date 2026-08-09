@@ -30,6 +30,7 @@ import subprocess
 import sys
 from typing import Any
 
+import egresos_caja
 from almacen_drive import AlmacenDrive
 from procesar import cargar_config
 from registro_sheets import COLUMNAS_CONTABLE
@@ -240,6 +241,108 @@ def descargar_constancias(
     ruta_fusion.write_text(json.dumps(elementos, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("Constancias fusionadas de %d archivo(s) (%s) -> %s", len(encontrados), ", ".join(encontrados), ruta_fusion)
     return ruta_fusion
+
+
+# -----------------------------------------------------------------------------
+# Egresos de caja: reporte del sistema de ventas (Restaurant.pe) -> JSON
+# intermedio que consume --egresos del motor.
+#
+# El motor NO parsea HTML: recibe el JSON ya armado (separación limpia entre
+# "leer el reporte" -egresos_caja.py, en la raíz de este repo, se puede tocar
+# libre- y "el motor" -conciliacion/, vendorizado tal cual desde OneDrive-).
+# Formato del JSON intermedio (documentado también en conciliacion/README.md
+# y en el docstring de --egresos de build_conciliacion.py):
+#   {"gastos": [{"fecha": "DD/MM/AAAA", "hora": "HH:MM"|None, "motivo": str,
+#                "entregado_a": str, "monto": float}, ...],
+#    "depositos": [...mismo shape...],
+#    "reposicion_semanal": float}
+# reposicion_semanal sale de config.yaml (conciliacion.empresas[].caja_chica),
+# nunca hardcodeada acá ni en el motor.
+# -----------------------------------------------------------------------------
+EXTENSIONES_EGRESOS = (".xls", ".htm", ".html")
+
+
+def descargar_egresos(almacen: AlmacenDrive, carpeta_egresos_id: str, destino_dir: pathlib.Path) -> list[pathlib.Path]:
+    """Descarga todo lo que haya en CONCILIACION/<mes>/EGRESOS/ con una
+    extensión reconocible por egresos_caja.py (el reporte es un .xls que en
+    realidad es HTML, ver ese módulo). Si hay varios archivos (varios locales
+    de la misma empresa, ej. LINCE + otro local) se devuelven todos: el
+    llamador los parsea y concatena. Un archivo con extensión no reconocida
+    se ignora, pero SIEMPRE con una advertencia en el log (nunca en
+    silencio) — mismo criterio que descargar_eecc() con 'ignorados'.
+
+    Nota: si alguien sube a Drive el .xls-frameset SIN su carpeta hermana
+    '<nombre>_archivos/' (ver egresos_caja._resolver_tabla), el parseo falla
+    con un error claro más adelante en vez de silenciarse — la práctica
+    esperada es subir el 'sheet001.htm' ya extraído, o el .xls completo con
+    su carpeta hermana si Drive la preserva.
+    """
+    archivos = almacen.listar(carpeta_egresos_id)
+    rutas: list[pathlib.Path] = []
+    for archivo in archivos:
+        nombre = archivo["name"]
+        if not nombre.lower().endswith(EXTENSIONES_EGRESOS):
+            logger.warning("EGRESOS: archivo ignorado (extensión no reconocida): %s", nombre)
+            continue
+        destino = destino_dir / nombre
+        almacen.descargar(archivo["id"], destino)
+        rutas.append(destino)
+        logger.info("Reporte de egresos de caja descargado: %s", nombre)
+    return rutas
+
+
+def construir_json_egresos(
+    rutas: list[pathlib.Path], reposicion_semanal: float, destino_json: pathlib.Path
+) -> dict[str, Any]:
+    """Parsea cada reporte con egresos_caja.parsear_egresos, concatena
+    gastos/depositos de TODOS los archivos (varios locales de la misma
+    empresa comparten hoy una sola hoja CAJA CHICA en el motor, ver
+    CAJA_CHICA_LOCAL en build_conciliacion.py), arma el JSON intermedio y lo
+    escribe en destino_json. Las filas ignoradas de CADA archivo (ANULADO,
+    moneda no soportada) se loguean acá, nunca en silencio. Devuelve un
+    resumen para el log y el resumen final de main()."""
+    gastos: list[dict[str, Any]] = []
+    depositos: list[dict[str, Any]] = []
+    locales: set[str] = set()
+    for ruta in rutas:
+        resultado = egresos_caja.parsear_egresos(ruta)
+        gastos.extend(resultado["gastos"])
+        depositos.extend(resultado["depositos"])
+        if resultado["local"]:
+            locales.add(resultado["local"])
+        for ignorada in resultado["filas_ignoradas"]:
+            logger.warning("EGRESOS (%s): fila ignorada: %s", ruta.name, ignorada)
+
+    datos = {"gastos": gastos, "depositos": depositos, "reposicion_semanal": reposicion_semanal}
+    destino_json.parent.mkdir(parents=True, exist_ok=True)
+    destino_json.write_text(json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "n_archivos": len(rutas), "n_gastos": len(gastos), "n_depositos": len(depositos),
+        "locales": sorted(locales),
+    }
+
+
+def leer_cruce_depositos(ruta_xlsx: pathlib.Path) -> str | None:
+    """Lee de la hoja CAJA CHICA del .xlsx que acaba de generar el motor
+    cuántos depósitos del reporte de egresos cruzaron con un abono del banco
+    (el motor escribe esa fila SOLO cuando corrió con --egresos, ver
+    build_conciliacion.py). Devuelve el texto tal cual ("3/10") o None si la
+    fila no está (corrida sin --egresos). Se lee del .xlsx ya generado en vez
+    de intentar parsear el stdout del subproceso: el motor es la única
+    fuente de verdad de ese número (el cruce ocurre adentro, contra las
+    cuentas ya cargadas) — mismo criterio de acoplamiento explícito al motor
+    que ya usa este módulo en otros puntos (ver comentario sobre LINK_DRIVE /
+    ESTADO_PAGO más abajo)."""
+    import openpyxl
+
+    libro = openpyxl.load_workbook(ruta_xlsx, read_only=True, data_only=True)
+    if "CAJA CHICA" not in libro.sheetnames:
+        return None
+    hoja = libro["CAJA CHICA"]
+    for fila in hoja.iter_rows(values_only=True):
+        if fila and fila[0] == "CRUZARON CON UN ABONO":
+            return str(fila[1]) if len(fila) > 1 and fila[1] is not None else None
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -480,6 +583,7 @@ def construir_argumentos_motor(
     pendientes_json: pathlib.Path,
     heredar_xlsx: pathlib.Path | None,
     pdf_password: str | None = None,
+    egresos_json: pathlib.Path | None = None,
 ) -> list[str]:
     argumentos = [
         str(eecc_principal) if eecc_principal is not None else "none",
@@ -496,6 +600,8 @@ def construir_argumentos_motor(
         argumentos += ["--heredar", str(heredar_xlsx)]
     if pdf_password:
         argumentos += ["--pdf-password", pdf_password]
+    if egresos_json is not None:
+        argumentos += ["--egresos", str(egresos_json)]
     return argumentos
 
 
@@ -556,6 +662,8 @@ def imprimir_resumen(
     ruta_salida_xlsx: pathlib.Path,
     enlace_drive: str | None,
     dry_run: bool,
+    resumen_egresos: dict[str, Any] | None = None,
+    cruce_depositos: str | None = None,
 ) -> None:
     print("\n" + "=" * 60)
     print("RESUMEN DE LA CONCILIACION")
@@ -566,6 +674,16 @@ def imprimir_resumen(
     print(f"Constancias:  {'sí (' + ruta_constancias.name + ')' if ruta_constancias else 'no'}")
     print(f"Comprobantes: {n_comprobantes} en el CSV")
     print(f"Heredó:       {'sí (' + ruta_heredar.name + ')' if ruta_heredar else 'no'}")
+    if resumen_egresos:
+        cruce_txt = f", {cruce_depositos} depósitos cruzaron con abono" if cruce_depositos else ""
+        print(
+            f"Egresos caja: {resumen_egresos['n_gastos']} gasto(s), {resumen_egresos['n_depositos']} depósito(s)"
+            f"{cruce_txt} ({resumen_egresos['n_archivos']} archivo(s)"
+            + (f", local(es): {', '.join(resumen_egresos['locales'])}" if resumen_egresos['locales'] else "")
+            + ")"
+        )
+    else:
+        print("Egresos caja: sin reporte esta corrida — hoja CAJA CHICA con la regla vieja (fondo fijo).")
     print(f"Resultado:    {ruta_salida_xlsx}")
     if dry_run:
         print("[DRY-RUN] no se subió nada a Drive.")
@@ -598,6 +716,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--comprobantes", default=None,
         help="CSV de comprobantes a mano; si se indica, no se deriva del Sheet contable.",
+    )
+    parser.add_argument(
+        "--egresos", default=None,
+        help="Reporte de egresos de caja (.xls/.htm/.html) a mano; si se indica, manda sobre lo que haya en "
+             "Drive (CONCILIACION/<mes>/EGRESOS/). Útil cuando el reporte todavía no está en Drive.",
     )
     parser.add_argument("--verbose", action="store_true", help="Log detallado (DEBUG) también en consola.")
     args = parser.parse_args(argv)
@@ -634,6 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     carpeta_mes_id = almacen.asegurar_carpeta(args.mes, carpeta_conciliacion_id)
     carpeta_eecc_id = almacen.asegurar_carpeta("EECC", carpeta_mes_id)
     carpeta_constancias_id = almacen.asegurar_carpeta("CONSTANCIAS", carpeta_mes_id)
+    carpeta_egresos_id = almacen.asegurar_carpeta("EGRESOS", carpeta_mes_id)
 
     # --- correo (opcional), ANTES de juntar archivos -------------------------
     # La garantía de --dry-run ("no llama al correo") es este 'and not
@@ -676,6 +800,36 @@ def main(argv: list[str] | None = None) -> int:
     eecc_principal, eecc_adicionales = separar_principal(por_cuenta, empresa_cfg["cuentas"])
 
     ruta_constancias = descargar_constancias(almacen, carpeta_constancias_id, empresa_cfg["cuentas"], trabajo_dir)
+
+    # --- Egresos de caja (reporte del sistema de ventas) --------------------
+    # --egresos (override manual) manda sobre lo que haya en Drive: es el
+    # caso de hoy, con el reporte todavía sin subir a CONCILIACION/EGRESOS/.
+    # Sin override y sin nada en Drive, NO se pasa --egresos al motor: la
+    # hoja CAJA CHICA sale con la regla vieja (fondo fijo), y se loguea para
+    # que quede claro que no es un olvido.
+    ruta_egresos_json: pathlib.Path | None = None
+    resumen_egresos: dict[str, Any] | None = None
+    if args.egresos:
+        rutas_egresos = [pathlib.Path(args.egresos)]
+        logger.info("--egresos (override manual): %s", rutas_egresos[0])
+    else:
+        rutas_egresos = descargar_egresos(almacen, carpeta_egresos_id, trabajo_dir)
+    if rutas_egresos:
+        reposicion_semanal = (empresa_cfg.get("caja_chica") or {}).get("reposicion_semanal")
+        if reposicion_semanal is None:
+            logger.error(
+                "Hay reporte(s) de egresos de caja pero falta conciliacion.empresas[].caja_chica."
+                "reposicion_semanal en config.yaml para '%s'.", empresa_cfg["nombre_corto"],
+            )
+            return 1
+        ruta_egresos_json = trabajo_dir / "egresos.json"
+        resumen_egresos = construir_json_egresos(rutas_egresos, float(reposicion_semanal), ruta_egresos_json)
+        logger.info("Reporte de egresos de caja: %s", resumen_egresos)
+    else:
+        logger.info(
+            "Sin reporte de egresos de caja (ni en Drive/EGRESOS ni --egresos): "
+            "la hoja CAJA CHICA usa la regla vieja (fondo fijo)."
+        )
 
     if args.comprobantes:
         ruta_csv = pathlib.Path(args.comprobantes)
@@ -728,6 +882,7 @@ def main(argv: list[str] | None = None) -> int:
         ruta_pendientes,
         ruta_heredar,
         pdf_password=pdf_password,
+        egresos_json=ruta_egresos_json,
     )
     try:
         invocar_motor(argumentos_motor)
@@ -738,6 +893,13 @@ def main(argv: list[str] | None = None) -> int:
     if not ruta_salida_xlsx.exists():
         logger.error("El motor terminó sin error pero no generó '%s'.", ruta_salida_xlsx)
         return 1
+
+    cruce_depositos = None
+    if resumen_egresos:
+        try:
+            cruce_depositos = leer_cruce_depositos(ruta_salida_xlsx)
+        except Exception as exc:
+            logger.warning("No se pudo leer el cruce de depósitos del .xlsx generado: %s", exc)
 
     # Igual que con el correo: la garantía de --dry-run está en este if, no
     # solo en un comentario. Nada se sube a Drive cuando args.dry_run es True.
@@ -760,6 +922,8 @@ def main(argv: list[str] | None = None) -> int:
         ruta_salida_xlsx=ruta_salida_xlsx,
         enlace_drive=enlace_drive,
         dry_run=args.dry_run,
+        resumen_egresos=resumen_egresos,
+        cruce_depositos=cruce_depositos,
     )
     return 0
 

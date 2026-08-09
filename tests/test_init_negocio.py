@@ -101,13 +101,16 @@ class FakeServicioSheets:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _config_minima(negocio: str = "LA CALETA") -> dict:
+def _config_minima(negocio: str = "LA CALETA", con_buzon_tipos: bool = False) -> dict:
+    carpetas = {"raiz": "", "buzon": "", "procesado": "", "revisar": ""}
+    if con_buzon_tipos:
+        carpetas["buzon_tipos"] = {"facturas": "", "notas_venta": "", "liquidaciones": "", "otros": ""}
     return {
         "negocio": negocio,
         "cuenta_google": "administracion.lacaleta@gmail.com",
         "drive": {
             "raiz_nombre": negocio,
-            "carpetas": {"raiz": "", "buzon": "", "procesado": "", "revisar": ""},
+            "carpetas": carpetas,
         },
         "sheets": {"contable": "", "detalle": ""},
     }
@@ -426,6 +429,209 @@ def test_dry_run_conciliacion_no_llama_api_ni_escribe_config(tmp_path, capsys):
     assert ruta_config.read_text(encoding="utf-8") == texto_original
     salida = capsys.readouterr().out
     assert init_negocio.NOMBRE_CONCILIACION in salida
+
+
+# ---------------------------------------------------------------------------
+# Subcarpetas de 00_BUZON por tipo (drive.carpetas.buzon_tipos): igual que
+# CONCILIACION, opcionales — solo se crean si config.yaml trae la sección.
+# ---------------------------------------------------------------------------
+def test_preparar_carpetas_crea_buzon_tipos_si_la_seccion_existe():
+    config = _config_minima(con_buzon_tipos=True)
+    almacen = _FakeAlmacenCarpetas()
+
+    ids = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+
+    assert set(ids) == {"raiz", "buzon", "procesado", "revisar", "buzon_tipos"}
+    assert set(ids["buzon_tipos"]) == {"facturas", "notas_venta", "liquidaciones", "otros"}
+    assert all(ids["buzon_tipos"].values())  # ningún id vacío
+
+    # Las 4 subcarpetas cuelgan de 00_BUZON (id_buzon), no de la raíz.
+    for nombre in init_negocio.BUZON_TIPOS.values():
+        assert (nombre, ids["buzon"]) in almacen.llamadas
+
+
+def test_preparar_carpetas_no_crea_buzon_tipos_si_no_hay_seccion():
+    config = _config_minima()
+    assert "buzon_tipos" not in config["drive"]["carpetas"]
+    almacen = _FakeAlmacenCarpetas()
+
+    ids = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+
+    assert set(ids) == {"raiz", "buzon", "procesado", "revisar"}
+    assert "buzon_tipos" not in ids
+    nombres_creados = {nombre for nombre, _ in almacen.llamadas}
+    assert not nombres_creados & set(init_negocio.BUZON_TIPOS.values())
+
+
+def test_preparar_carpetas_buzon_tipos_es_idempotente():
+    config = _config_minima(con_buzon_tipos=True)
+    almacen = _FakeAlmacenCarpetas()
+
+    ids_1 = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+    llamadas_1 = len(almacen.llamadas)
+    assert llamadas_1 == 8  # raiz + buzon + procesado + revisar + 4 tipos
+
+    ids_2 = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+    assert ids_2 == ids_1
+    assert len(almacen.llamadas) == llamadas_1  # no crece: nada se duplica
+
+
+def test_preparar_carpetas_dry_run_informa_buzon_tipos_si_hay_seccion(capsys):
+    config = _config_minima(con_buzon_tipos=True)
+
+    resultado = init_negocio.preparar_carpetas(config, None, dry_run=True)
+
+    assert resultado == {}
+    salida = capsys.readouterr().out
+    for nombre in init_negocio.BUZON_TIPOS.values():
+        assert nombre in salida
+    assert "no se crearían las" not in salida
+
+
+def test_preparar_carpetas_dry_run_informa_que_no_hay_buzon_tipos_sin_seccion(capsys):
+    config = _config_minima()
+    assert "buzon_tipos" not in config["drive"]["carpetas"]
+
+    init_negocio.preparar_carpetas(config, None, dry_run=True)
+
+    salida = capsys.readouterr().out
+    assert "no se crearían las" in salida
+
+
+# ---------------------------------------------------------------------------
+# _reemplazar_clave_anidada / _actualizar_buzon_tipos_en_config: acotan el
+# reemplazo al bloque de 'buzon_tipos:' para no chocar con una clave del
+# mismo nombre en otra sección del archivo (ver docstring en init_negocio.py).
+# ---------------------------------------------------------------------------
+_CONFIG_CON_BUZON_TIPOS = """\
+negocio: LA CALETA
+cuenta_google: administracion.lacaleta@gmail.com
+drive:
+  raiz_nombre: LA CALETA
+  carpetas:
+    raiz: "id-raiz"
+    buzon: "id-buzon"
+    procesado: "id-procesado"
+    revisar: "id-revisar"
+    buzon_tipos:
+      facturas: ""       # lo rellena init_negocio.py
+      notas_venta: ""
+      liquidaciones: ""
+      otros: ""
+sheets:
+  contable: ""
+  detalle: ""
+# Sección ajena, deliberadamente con una clave "otros" que NO debe tocarse:
+# es la trampa que _reemplazar_clave_anidada tiene que esquivar.
+seccion_ajena:
+  otros: "no me toques"
+  facturas: "tampoco a mi"
+"""
+
+
+def test_actualizar_buzon_tipos_en_config_preserva_comentarios_y_resto_del_archivo(tmp_path):
+    ruta_config = tmp_path / "config_temporal.yaml"
+    ruta_config.write_text(_CONFIG_CON_BUZON_TIPOS, encoding="utf-8")
+
+    init_negocio._actualizar_buzon_tipos_en_config(
+        ruta_config,
+        {
+            "facturas": "id-facturas",
+            "notas_venta": "id-notas-venta",
+            "liquidaciones": "id-liquidaciones",
+            "otros": "id-otros",
+        },
+    )
+
+    texto_final = ruta_config.read_text(encoding="utf-8")
+
+    assert 'facturas: "id-facturas"' in texto_final
+    assert 'notas_venta: "id-notas-venta"' in texto_final
+    assert 'liquidaciones: "id-liquidaciones"' in texto_final
+    assert 'otros: "id-otros"' in texto_final
+    # El comentario junto a 'facturas:' se preserva.
+    assert "# lo rellena init_negocio.py" in texto_final
+    # El resto del archivo no cambia.
+    for linea_esperada in [
+        "negocio: LA CALETA",
+        '    raiz: "id-raiz"',
+        "sheets:",
+    ]:
+        assert linea_esperada in texto_final
+
+    data = yaml.safe_load(texto_final)
+    assert data["drive"]["carpetas"]["buzon_tipos"] == {
+        "facturas": "id-facturas",
+        "notas_venta": "id-notas-venta",
+        "liquidaciones": "id-liquidaciones",
+        "otros": "id-otros",
+    }
+    # La clave 'otros'/'facturas' de la sección ajena NUNCA debió tocarse:
+    # esta es la regresión explícita de la ambigüedad de nombres genéricos.
+    assert data["seccion_ajena"]["otros"] == "no me toques"
+    assert data["seccion_ajena"]["facturas"] == "tampoco a mi"
+
+
+def test_main_crea_buzon_tipos_y_escribe_sus_ids_si_la_seccion_existe(tmp_path, monkeypatch):
+    config = _config_minima(con_buzon_tipos=True)
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+
+    servicio = FakeServicioSheets()
+    almacen_falso = _FakeAlmacenCarpetas()
+    _parchar_auth_google(monkeypatch, servicio, almacen_falso)
+
+    codigo = init_negocio.main(["--config", str(ruta_config)])
+
+    assert codigo == 0
+    assert len(almacen_falso.llamadas) == 8  # raiz + buzon + procesado + revisar + 4 tipos
+
+    config_final = yaml.safe_load(ruta_config.read_text(encoding="utf-8"))
+    ids_finales = config_final["drive"]["carpetas"]["buzon_tipos"]
+    assert all(ids_finales.values())
+
+    # Segunda corrida: idempotente, no reescribe el config ni duplica carpetas.
+    texto_tras_primera = ruta_config.read_text(encoding="utf-8")
+    codigo_2 = init_negocio.main(["--config", str(ruta_config)])
+    assert codigo_2 == 0
+    assert ruta_config.read_text(encoding="utf-8") == texto_tras_primera
+    assert len(almacen_falso.llamadas) == 8
+
+
+def test_main_no_crea_buzon_tipos_ni_escribe_ids_si_no_hay_seccion(tmp_path, monkeypatch):
+    config = _config_minima()
+    assert "buzon_tipos" not in config["drive"]["carpetas"]
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+
+    servicio = FakeServicioSheets()
+    almacen_falso = _FakeAlmacenCarpetas()
+    _parchar_auth_google(monkeypatch, servicio, almacen_falso)
+
+    codigo = init_negocio.main(["--config", str(ruta_config)])
+
+    assert codigo == 0
+    assert len(almacen_falso.llamadas) == 4  # sin las 4 de buzon_tipos
+    nombres_creados = {nombre for nombre, _ in almacen_falso.llamadas}
+    assert not nombres_creados & set(init_negocio.BUZON_TIPOS.values())
+
+    config_final = yaml.safe_load(ruta_config.read_text(encoding="utf-8"))
+    assert "buzon_tipos" not in config_final["drive"]["carpetas"]
+
+
+def test_dry_run_buzon_tipos_no_llama_api_ni_escribe_config(tmp_path, capsys):
+    config = _config_minima(con_buzon_tipos=True)
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+    texto_original = ruta_config.read_text(encoding="utf-8")
+
+    codigo = init_negocio.main(["--config", str(ruta_config), "--dry-run"])
+
+    assert codigo == 0
+    assert ruta_config.read_text(encoding="utf-8") == texto_original
+    salida = capsys.readouterr().out
+    for nombre in init_negocio.BUZON_TIPOS.values():
+        assert nombre in salida
 
 
 # ---------------------------------------------------------------------------

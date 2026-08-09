@@ -102,7 +102,7 @@ def test_validar_parseo_lanza_si_no_hay_movimientos_ni_saldos():
     """El caso que motivó la guarda: un PDF de BBVA cayó en el parser de
     Interbank y salió con 0 movimientos y anchor_ok=True. La conciliación
     habría reportado que la cuenta cuadra mientras ignoraba el mes entero."""
-    meta = {"banco": "INTERBANK", "formato": "pdf", "saldo_inicial": None, "saldo_final": None}
+    meta = {"banco": "INTERBANK", "formato": "pdf", "cuenta": "", "cliente": "", "saldo_inicial": None, "saldo_final": None}
     with pytest.raises(ValueError) as exc:
         parsers_eecc._validar_parseo("EC_lo_que_sea.pdf", [], meta)
     assert "0 movimientos" in str(exc.value)
@@ -111,13 +111,34 @@ def test_validar_parseo_lanza_si_no_hay_movimientos_ni_saldos():
 
 def test_validar_parseo_acepta_cuenta_legitimamente_sin_movimientos():
     """Distinto del anterior: la cuenta 4388 de EL TEMPLO no tuvo movimientos en
-    junio 2026 y eso NO es un error. Un documento leído bien siempre trae sus
-    saldos; uno mal parseado no trae ninguno. Esa es la única señal fiable para
-    distinguirlos."""
-    meta = {"banco": "INTERBANK", "formato": "pdf", "saldo_inicial": 0.0, "saldo_final": 0.0}
-    movimientos, devuelto = parsers_eecc._validar_parseo("EC_4388.pdf", [], meta)
+    junio 2026 y eso NO es un error.
+
+    Los valores de este test salen del archivo REAL: `EC_4388_062026.pdf` se
+    parsea a 0 movimientos y **sin saldos** (no hay ninguna línea de la que
+    sacarlos), pero sí se identifica — cuenta '200-3008494388', cliente
+    'EL TEMPLO SAC'. Por eso el discriminador es la identificación y no los
+    saldos: la primera versión de la guarda miraba los saldos y hacía fallar la
+    conciliación de junio, que es la regresión de referencia del proyecto."""
+    meta = {
+        "banco": "INTERBANK", "formato": "pdf",
+        "cuenta": "200-3008494388", "cliente": "EL TEMPLO SAC",
+        "saldo_inicial": None, "saldo_final": None,
+    }
+    movimientos, devuelto = parsers_eecc._validar_parseo("EC_4388_062026.pdf", [], meta)
     assert movimientos == []
     assert devuelto is meta
+
+
+def test_validar_parseo_lanza_si_no_se_identifico_el_documento():
+    """El caso roto real: el PDF de BBVA de julio pasado por el parser de
+    Interbank devuelve cuenta y cliente VACÍOS — no reconoció nada."""
+    meta = {
+        "banco": "INTERBANK", "formato": "pdf",
+        "cuenta": "", "cliente": "",
+        "saldo_inicial": None, "saldo_final": None,
+    }
+    with pytest.raises(ValueError):
+        parsers_eecc._validar_parseo("EC_BBVA_julio.pdf", [], meta)
 
 
 def test_validar_parseo_devuelve_intacto_lo_que_recibe():

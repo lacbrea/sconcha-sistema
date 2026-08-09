@@ -110,6 +110,38 @@ def test_extraer_toma_modelo_y_esfuerzo_de_config(monkeypatch):
         modelo.extraer(pathlib.Path("no_existe.pdf"), "pdf", config)
 
 
+def test_extraer_acepta_tipo_esperado_sin_romper_la_firma(monkeypatch):
+    # tipo_esperado es el 4to parámetro (opcional): procesar.py lo pasa
+    # cuando el archivo llegó a una subcarpeta del buzón por tipo (ej.
+    # LIQUIDACIONES). Acá solo se confirma que la firma lo acepta y que
+    # sigue fallando por falta de ANTHROPIC_API_KEY antes de tocar la red,
+    # igual que sin él.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(modelo.ClaveApiFaltanteError):
+        modelo.extraer(pathlib.Path("no_existe.pdf"), "pdf", None, tipo_esperado="liquidacion")
+
+
+# --- (b.1) TIPO DE DOCUMENTO conoce 'liquidacion' -----------------------------
+
+def test_prompt_del_sistema_menciona_liquidacion():
+    # El system prompt (cacheado) debe conocer el tipo 'liquidacion' en
+    # general -así el modelo puede reconocerlo aunque tipo_esperado no venga
+    # (o venga equivocado)-, sin depender de tipo_esperado para saber que
+    # existe.
+    prompt = modelo._construir_prompt(None)
+    assert '"liquidacion"' in prompt
+
+
+def test_prompt_del_sistema_no_cambia_con_tipo_esperado():
+    # tipo_esperado NO debe viajar en el bloque de system (cache_control):
+    # tiene que ser byte-idéntico entre archivos de distinto tipo dentro de
+    # la misma corrida (una liquidación seguida de un recibo de servicio) o
+    # se invalida el cacheo de prompt en cada llamada. _construir_prompt no
+    # acepta tipo_esperado en absoluto -- es un parámetro de extraer(), que
+    # lo mete en el turno del usuario, no en el de system.
+    assert "tipo_esperado" not in modelo._construir_prompt(None)
+
+
 # --- (c) JSON truncado sale como ErrorModeloClaude, no JSONDecodeError -----------
 
 def test_json_truncado_por_max_tokens_se_relanza_como_error_modelo_claude():

@@ -8,7 +8,10 @@ Hace tres cosas, en orden, y es seguro correrlo varias veces (idempotente):
    nombre y mismo padre), la reutiliza; nunca la recrea ni la vacía. Los 4
    ids resultantes se guardan en config.yaml -> drive.carpetas.
    Si config.yaml trae la sección 'conciliacion' (opcional), crea además la
-   carpeta CONCILIACION y guarda su id en conciliacion.carpeta.
+   carpeta CONCILIACION y guarda su id en conciliacion.carpeta. Si config.yaml
+   trae drive.carpetas.buzon_tipos (opcional), crea además dentro de 00_BUZON
+   las subcarpetas FACTURAS, NOTAS_DE_VENTA, LIQUIDACIONES y OTROS, y guarda
+   sus ids ahí mismo.
 2. Crea los dos Google Sheets del negocio ("contable" y "detalle") con sus
    cabeceras, usando la cuenta de Google autenticada por auth_google.py. Si
    config.yaml ya trae un ID de Sheet configurado, verifica que siga siendo
@@ -55,6 +58,24 @@ NOMBRE_REVISAR = "02_REVISAR"
 # su Drive pidiendo explicación. Su id se guarda en conciliacion.carpeta (no
 # en drive.carpetas: las de ahí son las del pipeline del buzón).
 NOMBRE_CONCILIACION = "CONCILIACION"
+
+# Subcarpetas de 00_BUZON, una por tipo de documento (decisión del dueño
+# 2026-08-06; ver el comentario de drive.carpetas.buzon_tipos en
+# config.ejemplo.yaml para el detalle de qué va en cada una). Igual que
+# CONCILIACION, son OPCIONALES: solo se crean si config.yaml trae la sección
+# drive.carpetas.buzon_tipos. Un negocio que no migró todavía sigue con
+# 00_BUZON plano y procesar.py lo trata como siempre (ver procesar.py).
+# El dict mapea la clave de config.yaml (y de config['drive']['carpetas']
+# ['buzon_tipos']) al nombre de la subcarpeta real en Drive; el orden es fijo
+# (Python preserva el orden de inserción) solo para que el log y el orden de
+# asegurar_carpeta() sean predecibles entre corridas, no porque importe para
+# la idempotencia (asegurar_carpeta ya lo es, en cualquier orden).
+BUZON_TIPOS = {
+    "facturas": "FACTURAS",
+    "notas_venta": "NOTAS_DE_VENTA",
+    "liquidaciones": "LIQUIDACIONES",
+    "otros": "OTROS",
+}
 
 # -----------------------------------------------------------------------------
 # Cabeceras de los dos Sheets del negocio. Fila 1 de cada spreadsheet.
@@ -108,6 +129,7 @@ def preparar_carpetas(config: dict, almacen: "AlmacenDrive | None", dry_run: boo
     """
     raiz_nombre = config["drive"]["raiz_nombre"]
     con_conciliacion = bool(config.get("conciliacion"))
+    con_buzon_tipos = bool(((config.get("drive") or {}).get("carpetas") or {}).get("buzon_tipos"))
 
     print(f"\n== Carpetas en Drive (raíz: '{raiz_nombre}') ==")
     if dry_run:
@@ -119,6 +141,14 @@ def preparar_carpetas(config: dict, almacen: "AlmacenDrive | None", dry_run: boo
             print(f"[DRY-RUN] se aseguraría (creándola si no existe): {raiz_nombre}/{nombre}")
         if not con_conciliacion:
             print("[DRY-RUN] config.yaml no trae sección 'conciliacion': no se crearía la carpeta CONCILIACION.")
+        if con_buzon_tipos:
+            for nombre in BUZON_TIPOS.values():
+                print(f"[DRY-RUN] se aseguraría (creándola si no existe): {raiz_nombre}/{NOMBRE_BUZON}/{nombre}")
+        else:
+            print(
+                "[DRY-RUN] config.yaml no trae 'drive.carpetas.buzon_tipos': no se crearían las "
+                "subcarpetas de 00_BUZON por tipo de documento."
+            )
         return {}
 
     id_raiz = almacen.asegurar_carpeta(raiz_nombre)
@@ -136,6 +166,14 @@ def preparar_carpetas(config: dict, almacen: "AlmacenDrive | None", dry_run: boo
         id_conciliacion = almacen.asegurar_carpeta(NOMBRE_CONCILIACION, id_raiz)
         print(f"  {NOMBRE_CONCILIACION} ({id_conciliacion})")
         ids["conciliacion"] = id_conciliacion
+
+    if con_buzon_tipos:
+        ids_buzon_tipos: dict[str, str] = {}
+        for clave, nombre in BUZON_TIPOS.items():
+            id_tipo = almacen.asegurar_carpeta(nombre, id_buzon)
+            print(f"    {NOMBRE_BUZON}/{nombre} ({id_tipo})")
+            ids_buzon_tipos[clave] = id_tipo
+        ids["buzon_tipos"] = ids_buzon_tipos
 
     return ids
 
@@ -262,6 +300,64 @@ def _actualizar_carpetas_en_config(ruta_config: pathlib.Path, ids_carpetas: dict
     ruta_config.write_text(texto, encoding="utf-8")
 
 
+def _reemplazar_clave_anidada(texto: str, ancla: str, clave: str, valor: str) -> str:
+    """Como _reemplazar_clave, pero acota la búsqueda de 'clave:' al bloque
+    que cuelga de la línea 'ancla:' (todas las líneas siguientes con MÁS
+    indentación que 'ancla:', hasta la primera línea no vacía que vuelva a su
+    indentación o a una menor).
+
+    Existe por las claves de drive.carpetas.buzon_tipos: 'facturas',
+    'notas_venta', 'liquidaciones' y 'otros' son nombres genéricos — nada
+    impide que algún día otra sección de config.yaml use una clave con el
+    mismo nombre (ej. una lista de "otros" gastos, o un local llamado
+    "facturas" por casualidad). _reemplazar_clave() por sí sola reemplaza la
+    PRIMERA línea 'clave:' de TODO el archivo, sin mirar en qué sección
+    está: barato, pero exactamente el tipo de suerte que este mecanismo no
+    debe necesitar. Acotar la búsqueda al bloque de 'ancla:' elimina esa
+    ambigüedad de raíz en vez de confiar en que hoy no colisiona.
+    """
+    patron_ancla = re.compile(rf'(?m)^(\s*){ancla}:\s*(?:#.*)?$')
+    m_ancla = patron_ancla.search(texto)
+    if not m_ancla:
+        logger.warning(
+            "No se encontró la clave '%s:' en config.yaml; no se actualiza '%s' dentro de ella.", ancla, clave
+        )
+        return texto
+
+    indent_ancla = len(m_ancla.group(1))
+    inicio_bloque = m_ancla.end()
+
+    # Fin del bloque: la primera línea no vacía cuya indentación es <= la de
+    # 'ancla:' (o el final del archivo, si el bloque es lo último).
+    patron_fin = re.compile(rf'(?m)^(?!\s*$)(\s{{0,{indent_ancla}}})\S')
+    m_fin = patron_fin.search(texto, inicio_bloque)
+    fin_bloque = m_fin.start() if m_fin else len(texto)
+
+    bloque = texto[inicio_bloque:fin_bloque]
+    patron_clave = re.compile(rf'(?m)^(\s*{clave}:\s*)(".*?"|\S*)(\s*(?:#.*)?)$')
+    if not patron_clave.search(bloque):
+        logger.warning(
+            "No se encontró la clave '%s:' dentro del bloque '%s:' en config.yaml; no se actualiza.", clave, ancla
+        )
+        return texto
+
+    bloque_nuevo = patron_clave.sub(lambda m: f'{m.group(1)}"{valor}"{m.group(3)}', bloque, count=1)
+    return texto[:inicio_bloque] + bloque_nuevo + texto[fin_bloque:]
+
+
+def _actualizar_buzon_tipos_en_config(ruta_config: pathlib.Path, ids_buzon_tipos: dict[str, str]) -> None:
+    """Reescribe las claves de drive.carpetas.buzon_tipos en config.yaml,
+    preservando el resto del archivo. Usa _reemplazar_clave_anidada (no
+    _reemplazar_clave) por la ambigüedad de nombres genéricos descrita en su
+    docstring; el ancla es 'buzon_tipos', la única línea con ese nombre que
+    debe existir en el archivo.
+    """
+    texto = ruta_config.read_text(encoding="utf-8")
+    for clave, valor in ids_buzon_tipos.items():
+        texto = _reemplazar_clave_anidada(texto, "buzon_tipos", clave, valor)
+    ruta_config.write_text(texto, encoding="utf-8")
+
+
 def _actualizar_carpeta_conciliacion_en_config(ruta_config: pathlib.Path, id_carpeta: str) -> None:
     """Reescribe la línea 'carpeta:' de la sección conciliacion en config.yaml.
 
@@ -337,6 +433,15 @@ def main(argv: list[str] | None = None) -> int:
     if id_conciliacion and id_conciliacion != conciliacion_cfg_actual:
         _actualizar_carpeta_conciliacion_en_config(ruta_config, id_conciliacion)
         print(f"config.yaml actualizado con el ID de la carpeta CONCILIACION ({ruta_config}).")
+        hubo_cambios = True
+
+    ids_buzon_tipos = ids_carpetas.get("buzon_tipos") or {}
+    buzon_tipos_cfg_actual = (carpetas_cfg_actual.get("buzon_tipos") or {})
+    if ids_buzon_tipos and any(
+        ids_buzon_tipos.get(clave) != (buzon_tipos_cfg_actual.get(clave) or "") for clave in BUZON_TIPOS
+    ):
+        _actualizar_buzon_tipos_en_config(ruta_config, ids_buzon_tipos)
+        print(f"config.yaml actualizado con los IDs de las subcarpetas de {NOMBRE_BUZON} por tipo ({ruta_config}).")
         hubo_cambios = True
 
     if id_contable != id_contable_actual or id_detalle != id_detalle_actual:
