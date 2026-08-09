@@ -254,7 +254,9 @@ def descargar_constancias(
 # y en el docstring de --egresos de build_conciliacion.py):
 #   {"gastos": [{"fecha": "DD/MM/AAAA", "hora": "HH:MM"|None, "motivo": str,
 #                "entregado_a": str, "monto": float}, ...],
-#    "depositos": [...mismo shape...],
+#    "depositos": [...mismo shape, + "concepto": "propina"|"venta"|
+#                  "indeterminado" (clasificado por egresos_caja desde el
+#                  MOTIVO; los gastos no llevan este campo, no aplica)...],
 #    "reposicion_semanal": float}
 # reposicion_semanal sale de config.yaml (conciliacion.empresas[].caja_chica),
 # nunca hardcodeada acá ni en el motor.

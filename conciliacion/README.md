@@ -71,6 +71,26 @@ El envoltorio que arma esos argumentos desde `config.yaml` y Google Drive es
   (`4,294.64 + 9,543.29 − 13,828.49 = 9.44`). Arreglado primero en el original y
   vuelto a copiar aquí. Tests en `tests/test_parsers_eecc.py`.
 
+- **2026-08-09 — columna CONCEPTO en los depósitos de CAJA CHICA**: el reporte
+  de egresos de caja mezcla dos conceptos distintos dentro de "depósitos"
+  (plata que sale de la caja hacia la cuenta del negocio): venta y propina en
+  efectivo. Hallazgo real contra MIRAFLORES julio 2026: 3 de sus 5 depósitos
+  son propina (`PROPINA EN EFECTIVO 26 AL 02`, `propinas en efectivo 17 al
+  23`, `propinas en efectivo del 24 al 30`), no venta. `egresos_caja.py`
+  (fuera del motor, se toca libre) ahora clasifica cada depósito con
+  `_clasificar_concepto(motivo)` → `"propina"` | `"venta"` | `"indeterminado"`
+  (los dos `DEPOSITO`/`400` de MIRAFLORES, donde el motivo no alcanza para
+  decidir, quedan `"indeterminado"` a propósito — no se adivina). El campo
+  `concepto` viaja en el JSON de `--egresos` (solo para depósitos; los gastos
+  no lo llevan) y el motor lo agrega como columna en la sección
+  `DEPOSITOS DE VENTA EN EFECTIVO (REPORTE) vs ABONOS DEL BANCO` de la hoja
+  CAJA CHICA (reutiliza la columna E, antes solo de notas por fila, ya que
+  esas filas no traían nota) y en la sub-lista de depósitos sin abono que
+  calce. El cruce depósito↔abono NO cambia: sigue siendo solo por monto y
+  fecha, sin importar el concepto — cuadrar propinas es una fase posterior,
+  fuera de alcance. Arreglado primero en el original y vuelto a copiar aquí.
+  Tests en `tests/test_egresos_caja.py` y `tests/test_conciliar.py`.
+
 ## Qué quedó fuera, y por qué
 
 `parse_constancias.py` NO se copió: rastreaba transcripciones de sesiones de

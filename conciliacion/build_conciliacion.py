@@ -31,8 +31,11 @@ agrega (ver ../SKILL.md "Que hace"):
   desde el banco. Tambien cruza los DEPOSITOS DE VENTA EN EFECTIVO del
   reporte contra los ABONOS del banco (monto exacto +/-0.05, fecha +/-1 dia,
   en cualquier cuenta cargada) y marca el abono que cruza en su propia hoja
-  ABONOS. Sin --egresos, el comportamiento es EXACTAMENTE el de antes (ver
-  FONDO_CAJA_CHICA mas abajo).
+  ABONOS. Cada deposito trae ademas su CONCEPTO ('propina'/'venta'/
+  'indeterminado', clasificado por egresos_caja.py desde el MOTIVO del
+  reporte), que se muestra como columna en la tabla de CAJA CHICA sin alterar
+  ese cruce (sigue siendo solo por monto+fecha). Sin --egresos, el
+  comportamiento es EXACTAMENTE el de antes (ver FONDO_CAJA_CHICA mas abajo).
 
 Todo lo de v2/v3 se conserva: reglas de categorias/proveedores, TIPO para
 EGP/flujo de caja, hojas CARGOS/ABONOS/FLUJO CAJA/EGP/CAJA CHICA/VERIFICACION/EECC,
@@ -1204,12 +1207,20 @@ if EGRESOS_DATA:
     sin_match_ids = {id(d) for d in DEPOSITOS_SIN_MATCH}
     total_depositos_reporte = round(sum(float(d.get('monto') or 0) for d in depositos_reporte), 2)
     n_cruzaron = len(depositos_reporte) - len(DEPOSITOS_SIN_MATCH)
+    # CONCEPTO (2026-08, egresos_caja._clasificar_concepto via conciliar.py):
+    # 'propina' | 'venta' | 'indeterminado', clasificado por el MOTIVO del
+    # reporte - se muestra en la columna E (reutilizada aca como columna de
+    # dato, no de nota: estas filas no traian nota propia) para que quede
+    # claro a simple vista, SIN tocar el cruce de abajo, que sigue siendo
+    # solo por monto+fecha sin importar el concepto (decision del dueno: la
+    # separacion propina/venta es para el cuadre de ingresos, fase posterior,
+    # no para este cruce).
     wcc('DEPOSITOS DE VENTA EN EFECTIVO (REPORTE) vs ABONOS DEL BANCO', '', '', '', '', True, tfill)
-    wcc('Fecha', 'Motivo', 'Cruzo con abono', 'Monto', '', True)
+    wcc('Fecha', 'Motivo', 'Cruzo con abono', 'Monto', 'Concepto', True)
     for d in depositos_reporte:
         cruzo = id(d) not in sin_match_ids
         wcc(d.get('fecha', ''), str(d.get('motivo', ''))[:60], 'SI' if cruzo else 'NO', round(float(d.get('monto') or 0), 2),
-            fill=None if cruzo else pendfill, fmt_cols=(4,))
+            note=d.get('concepto') or 'indeterminado', fill=None if cruzo else pendfill, fmt_cols=(4,))
     wcc('TOTAL DEPOSITOS DEL REPORTE', '', '', total_depositos_reporte, '', True, catfill, fmt_cols=(4,))
     wcc('Cruzaron con un abono', f'{n_cruzaron}/{len(depositos_reporte)}', '', '', '', True,
         okfill if depositos_reporte and n_cruzaron == len(depositos_reporte) else pendfill)
@@ -1218,7 +1229,8 @@ if EGRESOS_DATA:
     if DEPOSITOS_SIN_MATCH:
         wcc('PENDIENTE: depositos del reporte SIN abono que calce (monto exacto +/-0.05, fecha +/-1 dia)', '', '', '', '', True, pendfill)
         for d in DEPOSITOS_SIN_MATCH:
-            wcc(d.get('fecha', ''), str(d.get('motivo', ''))[:60], '', round(float(d.get('monto') or 0), 2), fmt_cols=(4,))
+            wcc(d.get('fecha', ''), str(d.get('motivo', ''))[:60], '', round(float(d.get('monto') or 0), 2),
+                note=d.get('concepto') or 'indeterminado', fmt_cols=(4,))
             pendientes_caja_chica.append({
                 'fecha': d.get('fecha'),
                 'monto': round(float(d.get('monto') or 0), 2),

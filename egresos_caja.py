@@ -107,6 +107,30 @@ _RE_DESTINO_BANCO = re.compile(
     re.I,
 )
 
+# Clasificación de CONCEPTO dentro de los depósitos (propina vs venta vs
+# indeterminado). Es un problema distinto de gasto/depósito (_RE_DESTINO_BANCO
+# arriba): un depósito ya sabemos que salió de la caja hacia la cuenta del
+# negocio, pero eso no dice SI es plata de venta o propina entregada en
+# efectivo (ver el hallazgo real de MIRAFLORES jul-2026 en el docstring del
+# módulo). El MOTIVO es el único dato disponible para distinguirlos — no hay
+# columna separada ni otra señal en la fila — así que el criterio es
+# exclusivamente ese texto. Cuando no alcanza (ej. 'DEPOSITO' a secas o un
+# número suelto como '400', ambos reales de MIRAFLORES) no se adivina: se
+# marca 'indeterminado', que es honesto, en vez de inventar 'venta' y
+# ensuciar el cuadre de ingresos de la fase siguiente.
+_RE_PROPINA = re.compile(r'PROPINA', re.I)
+
+
+def _clasificar_concepto(motivo):
+    """Devuelve 'propina' | 'venta' | 'indeterminado' a partir del texto de
+    MOTIVO de un depósito (ver comentario arriba)."""
+    m = (motivo or '').upper()
+    if _RE_PROPINA.search(m):
+        return 'propina'
+    if m.startswith('DEPOSITO DE VENTA'):
+        return 'venta'
+    return 'indeterminado'
+
 
 def _leer_texto(path):
     with open(path, 'rb') as f:
@@ -188,6 +212,12 @@ def parsear_egresos(path):
     item = {"fecha": "DD/MM/AAAA", "hora": "HH:MM"|None, "motivo": str,
             "entregado_a": str, "monto": float}
 
+    Los items de "depositos" (solamente esos; "gastos" no lo lleva, no
+    aplica) traen además "concepto": "propina" | "venta" | "indeterminado",
+    clasificado por el texto de MOTIVO (ver _clasificar_concepto y su
+    comentario: es el único dato disponible para distinguir propina de
+    venta dentro de la plata que entra al banco).
+
     Clasificación gasto/depósito: una fila es DEPÓSITO si "Entregado A" es
     'BANCO' o el motivo empieza con 'DEPOSITO DE VENTA' (mayúsc./minúsc.
     indistinto); todo lo demás es GASTO.
@@ -254,7 +284,13 @@ def parsear_egresos(path):
         # plata que entra-, pero para el cuadre de ingresos (fase posterior) hay
         # que poder separarlas, y el motivo es el unico dato que lo permite.
         es_deposito = bool(_RE_DESTINO_BANCO.match(entregado_s)) or motivo_s.upper().startswith('DEPOSITO DE VENTA')
-        (depositos if es_deposito else gastos).append(item)
+        if es_deposito:
+            # 'concepto' solo aplica a depositos (ver _clasificar_concepto):
+            # un gasto no es ni propina ni venta, ese campo no le corresponde.
+            item['concepto'] = _clasificar_concepto(motivo_s)
+            depositos.append(item)
+        else:
+            gastos.append(item)
 
     return {
         'local': local,

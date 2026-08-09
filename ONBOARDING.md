@@ -130,6 +130,20 @@ C:\Python312\python.exe -m pip install -r requirements.txt
          motor descartaría en silencio TODAS las filas de esa empresa — la
          conciliación saldría vacía sin ningún error visible. Ver la
          sección "Conciliación bancaria" de `SKILL.md`.
+       - `caja_chica` (opcional): solo si esta entrada maneja caja chica
+         por reposición semanal desde el banco (regla vigente desde
+         ago-2026 — ver "Reporte de egresos de caja y caja chica" en
+         `SKILL.md`). **Si no aplica, borra la subsección entera.** Si
+         aplica:
+         - `reposicion_semanal`: el monto que el banco repone cada semana
+           a la caja chica. Nunca se hardcodea en el motor: sale de acá.
+           Se cruza contra el "Reporte de Egresos" que el sistema de
+           ventas del negocio exporta por local — súbelo (el `.xls`/
+           `.htm`, con su carpeta hermana `_archivos` si aplica) a
+           `CONCILIACION/AAAA-MM/EGRESOS/` en Drive, o pásalo a mano con
+           `conciliar.py --egresos <ruta>`. Sin este reporte, `conciliar.py`
+           sigue con la regla vieja (fondo fijo de S/500) sin que haga
+           falta tocar nada más.
        - `cuentas`: una entrada por cada cuenta bancaria de esta empresa,
          con `banco` y `moneda` (informativos) y:
          - `numero`: los ÚLTIMOS DÍGITOS con los que el banco nombra el

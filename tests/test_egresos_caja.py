@@ -152,6 +152,75 @@ def test_deposito_por_motivo_sin_entregado_a_banco(tmp_path):
     assert r['gastos'] == []
 
 
+# -----------------------------------------------------------------------------
+# CONCEPTO de los depositos: propina vs venta vs indeterminado (2026-08).
+# Los 4 casos de abajo son los mismos que trae el reporte real de MIRAFLORES
+# de julio 2026 (ver CLAUDE.md de la tarea): 3 de los 5 depositos son propina
+# en efectivo, no venta, y el motivo es el unico dato que lo distingue.
+# -----------------------------------------------------------------------------
+def test_concepto_propina_mayuscula_singular(tmp_path):
+    ruta = tmp_path / "tabla.htm"
+    filas = [_fila('02/07/2026 16:17', 'PROPINA EN EFECTIVO 26 AL  02', 'CTA DE LA EMPRESA', monto='120')]
+    ruta.write_text(_tabla_html(filas), encoding="utf-8")
+
+    r = egresos_caja.parsear_egresos(ruta)
+
+    assert len(r['depositos']) == 1
+    assert r['depositos'][0]['concepto'] == 'propina'
+
+
+def test_concepto_propina_minuscula_plural(tmp_path):
+    ruta = tmp_path / "tabla.htm"
+    filas = [_fila('23/07/2026 16:39', 'propinas en efectivo 17 al 23', 'cta d la empresa', monto='150')]
+    ruta.write_text(_tabla_html(filas), encoding="utf-8")
+
+    r = egresos_caja.parsear_egresos(ruta)
+
+    assert r['depositos'][0]['concepto'] == 'propina'
+
+
+def test_concepto_venta_deposito_de_venta_en_efectivo(tmp_path):
+    ruta = tmp_path / "tabla.htm"
+    filas = [_fila('29/07/2026 14:16', 'DEPOSITO DE VENTA EN EFECTIVO', 'BANCO', monto='1400')]
+    ruta.write_text(_tabla_html(filas), encoding="utf-8")
+
+    r = egresos_caja.parsear_egresos(ruta)
+
+    assert r['depositos'][0]['concepto'] == 'venta'
+
+
+def test_concepto_indeterminado_casos_reales_miraflores(tmp_path):
+    """'DEPOSITO' a secas y '400' son los dos depositos reales de MIRAFLORES
+    (jul-2026, ver CLAUDE.md de la tarea) cuyo motivo NO alcanza para decidir
+    propina o venta: no se adivina, se marca 'indeterminado' — inventar
+    'venta' ensuciaria el cuadre de ingresos de la fase siguiente."""
+    ruta = tmp_path / "tabla.htm"
+    filas = [
+        _fila('15/07/2026 16:22', 'DEPOSITO', 'INTERBANK', monto='400'),
+        _fila('30/07/2026 16:48', '400', 'cta de la empresa', monto='400'),
+    ]
+    ruta.write_text(_tabla_html(filas), encoding="utf-8")
+
+    r = egresos_caja.parsear_egresos(ruta)
+
+    assert len(r['depositos']) == 2
+    assert all(d['concepto'] == 'indeterminado' for d in r['depositos'])
+
+
+def test_gastos_no_llevan_concepto(tmp_path):
+    """'concepto' solo aplica a depositos; un gasto no es ni propina ni
+    venta, ese campo no le corresponde."""
+    ruta = tmp_path / "tabla.htm"
+    ruta.write_text(_tabla_html(FILAS_TIPICAS), encoding="utf-8")
+
+    r = egresos_caja.parsear_egresos(ruta)
+
+    assert len(r['gastos']) == 1
+    assert 'concepto' not in r['gastos'][0]
+    assert len(r['depositos']) == 1
+    assert 'concepto' in r['depositos'][0]
+
+
 def test_fecha_sin_cero_a_la_izquierda_se_normaliza(tmp_path):
     ruta = tmp_path / "tabla.htm"
     filas = [_fila('1/07/2026 09:56', 'COMPRA X', 'EDWIN', monto='30')]
@@ -256,6 +325,17 @@ def test_local_acepta_punto_y_espacio():
     """LINCE exporta 'CAJA.LINCE' y MIRAFLORES 'CAJA MIRAFLORES'."""
     assert egresos_caja._RE_LOCAL.search("CAJA.LINCE").group(1).upper() == "LINCE"
     assert egresos_caja._RE_LOCAL.search("CAJA MIRAFLORES").group(1).upper() == "MIRAFLORES"
+
+
+def test_clasificar_concepto_directo():
+    """Mismos casos que test_concepto_* de arriba, pero contra la función
+    privada directamente (mismo patrón que los demás tests de esta sección
+    para las regex/helpers privados de egresos_caja)."""
+    assert egresos_caja._clasificar_concepto('PROPINA EN EFECTIVO 26 AL  02') == 'propina'
+    assert egresos_caja._clasificar_concepto('propinas en efectivo 17 al 23') == 'propina'
+    assert egresos_caja._clasificar_concepto('DEPOSITO DE VENTA EN EFECTIVO') == 'venta'
+    assert egresos_caja._clasificar_concepto('DEPOSITO') == 'indeterminado'
+    assert egresos_caja._clasificar_concepto('400') == 'indeterminado'
 
 
 def test_destino_banco_reconoce_las_variantes_de_miraflores():

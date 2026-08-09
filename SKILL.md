@@ -196,11 +196,16 @@ C:\Python312\python.exe conciliar.py --empresa "EL TEMPLO" --mes 2026-06
 C:\Python312\python.exe conciliar.py --empresa "EL TEMPLO" --mes 2026-06 --dry-run --verbose
 C:\Python312\python.exe conciliar.py --empresa "EL TEMPLO" --mes 2026-06 --sin-heredar
 C:\Python312\python.exe conciliar.py --empresa "EL TEMPLO" --mes 2026-06 --comprobantes facturas.csv
+C:\Python312\python.exe conciliar.py --empresa "EL TEMPLO" --mes 2026-07 --egresos "C:\Users\luisa\Downloads\Egresos (18).xls"
 ```
 
 - `--empresa`: el `nombre_corto` tal como aparece en `conciliacion.empresas`
   de `config.yaml` (no el `nombre_motor` — ver la trampa más abajo).
 - `--mes`: formato `AAAA-MM`.
+- `--egresos <ruta>`: reporte de egresos de caja (.xls/.htm/.html) a mano;
+  si se indica, manda sobre lo que haya en Drive
+  (`CONCILIACION/<mes>/EGRESOS/`). Útil cuando el reporte todavía no está
+  subido a Drive (ver "Reporte de egresos de caja y caja chica" más abajo).
 - `--dry-run`: genera el `.xlsx` localmente para revisarlo, pero no sube
   nada a Drive **ni consulta el correo**, aunque `correo.habilitado` esté
   en `true`.
@@ -221,14 +226,15 @@ comprobantes, el `.xlsx` antes de subirlo) quedan en
 ```
 <RAIZ>/CONCILIACION/AAAA-MM/EECC/         estados de cuenta del banco (uno por cuenta configurada)
 <RAIZ>/CONCILIACION/AAAA-MM/CONSTANCIAS/  cons_<numero_cuenta>.json con las constancias de transferencia
+<RAIZ>/CONCILIACION/AAAA-MM/EGRESOS/      reporte(s) de egresos de caja del sistema de ventas (ver "Reporte de egresos de caja y caja chica" más abajo)
 <RAIZ>/CONCILIACION/AAAA-MM/              el .xlsx de salida: "CONCILIACION <nombre_corto> - <MES> <AÑO>.xlsx"
 ```
 
 `init_negocio.py` crea la carpeta `CONCILIACION` (y guarda su id en
 `conciliacion.carpeta`) solo si `config.yaml` trae la sección
 `conciliacion` — es opcional a propósito (ver ONBOARDING.md, paso 3). Las
-subcarpetas `AAAA-MM`, `EECC` y `CONSTANCIAS` las crea `conciliar.py`
-mismo, por API, la primera vez que corre para ese mes.
+subcarpetas `AAAA-MM`, `EECC`, `CONSTANCIAS` y `EGRESOS` las crea
+`conciliar.py` mismo, por API, la primera vez que corre para ese mes.
 
 `conciliar.py` decide qué EECC (o constancia) pertenece a qué cuenta por
 el campo `numero` de `config.yaml` — los últimos dígitos con los que el
@@ -239,6 +245,39 @@ ignora, siempre con una advertencia en el log (nunca en silencio). La
 cuenta marcada `principal: true` va como argumento posicional del motor;
 las demás entran con `--eecc` (repetible) — solo una cuenta por empresa
 puede ser `principal`.
+
+### Reporte de egresos de caja y caja chica
+
+Desde agosto 2026 la caja chica ya no se documenta escaneando boletas: el
+sistema de ventas (Restaurant.pe) exporta un "Reporte de Egresos" por
+local, y ese reporte —no la boleta física— es la fuente de los gastos de
+caja chica. La boleta pasa a ser solo respaldo: las notas de venta que
+caen en `00_BUZON/NOTAS_DE_VENTA/` no se leen con el modelo (costo S/0),
+solo se archivan en `01_PROCESADO` y quedan listadas en la pestaña
+`RESPALDOS_CAJA` del Sheet detalle —con fecha (si el nombre del archivo la
+trae), empresa y local, sin montos ni ítems, porque ese dato vive en el
+reporte de egresos— (ver `procesar.py`, `procesar_nota_venta` y
+`resolver_empresa_local_nota_venta`).
+
+`egresos_caja.py` (raíz del repo) parsea ese reporte y arma el JSON
+intermedio que consume `--egresos` de `build_conciliacion.py`; el motor
+vendorizado no toca HTML directamente, a propósito. Acepta 3 formas de
+recibir el archivo —el frameset `.xls` con su carpeta hermana
+`<nombre>_archivos/`, el `sheet001.htm` ya extraído, o un HTML de tabla
+único— con una trampa conocida sobre el frameset (ver "Trampas conocidas"
+más abajo, y el docstring de `egresos_caja.py` para el detalle completo).
+Los dos locales de EL TEMPLO exportan el reporte con diferencias de
+formato (también en "Trampas conocidas").
+
+**La regla de caja chica** vigente desde ago-2026, activada por
+`--egresos`: reposición semanal desde el banco
+(`conciliacion.empresas[].caja_chica.reposicion_semanal` de
+`config.yaml`, nunca hardcodeada en el motor), en vez del fondo fijo de
+S/500 por local que regía hasta jun-2026 (`FONDO_CAJA_CHICA` en
+`build_conciliacion.py`). Sin `--egresos` —ni override manual ni nada en
+`CONCILIACION/<mes>/EGRESOS/` de Drive—, `conciliar.py` no pasa el flag y
+el motor mantiene el comportamiento viejo (fondo fijo + boletas rendidas
+del CSV de comprobantes) sin cambios.
 
 ### Correo (Gmail, solo lectura)
 
@@ -408,3 +447,44 @@ final del propio estado de cuenta — y el mismo conteo de conciliación:
   conciliación saldría vacía sin ningún error visible. Por eso
   `filtrar_y_escribir_csv()` en `conciliar.py` reescribe la columna
   `EMPRESA` con `nombre_motor` antes de escribir el CSV.
+- **El reporte de egresos de caja: el frameset `.xls` referencia su
+  carpeta hermana por el nombre ORIGINAL del archivo, no por el actual.**
+  Excel lo exporta como frameset: un `.xls` que casi no tiene datos y un
+  `<link id=shLink href=...>` que apunta a
+  `<nombre-original>_archivos/sheet001.htm` (URL-encoded). Si alguien
+  renombra el `.xls` después de exportarlo (por ejemplo a
+  `Egresos_LINCE_2026-07.xls`), la carpeta hermana en disco queda
+  renombrada junto con él, pero esa referencia interna sigue apuntando al
+  nombre ORIGINAL (`Egresos%20(5)_archivos/sheet001.htm`) — derivar la
+  carpeta como `<stem-actual>_archivos` a partir del nombre actual falla en
+  ese caso. `egresos_caja._resolver_tabla()` por eso lee y decodifica el
+  propio `href` primero, y solo cae a la convención de nombre como
+  respaldo. Ver el docstring de `egresos_caja.py` para el detalle completo
+  y `tests/test_egresos_caja.py` para el caso verificado contra un reporte
+  real de LINCE (jul-2026).
+- **El reporte de egresos de caja no es idéntico entre locales.** Evidencia
+  real de jul-2026:
+
+  | | LINCE | MIRAFLORES |
+  |---|---|---|
+  | Estructura | Frameset + carpeta `_archivos` | Tabla HTML directa |
+  | Fecha | `31/07/2026 16:20` | `31-07-2026 16:40:05` |
+  | Columna Usuario | `CAJA.LINCE` | `CAJA MIRAFLORES` |
+  | Destino "banco" | `BANCO` | `CTA DE LA EMPRESA`, `CTA D LA EMPRESA`, `cta de empresa`, `INTERBANK` |
+
+  `egresos_caja.py` acepta ambos formatos de fecha (barra o guión, segundos
+  opcionales), ambos separadores de local en la columna Usuario (punto o
+  espacio) y todas las variantes de "banco" como destino. El dueño
+  confirmó el 2026-08-09 que "cta de la empresa" en MIRAFLORES es el mismo
+  concepto que "BANCO" en LINCE, y va a pedir que ambos locales usen
+  "BANCO" en adelante; las variantes viejas se siguen reconociendo porque
+  los reportes ya exportados conservan ese texto y hay que poder
+  reprocesarlos.
+- **Una fecha del reporte de egresos que no se reconoce descarta la fila,
+  nunca la propaga.** Antes `egresos_caja._fecha_hora()` devolvía el texto
+  crudo cuando no matcheaba el patrón esperado, y ese texto viajaba tal
+  cual hasta el JSON intermedio y de ahí a la hoja CAJA CHICA — así salió
+  el reporte completo de MIRAFLORES con fechas `31-07-2026 16:40:05` sin
+  normalizar. Ahora una fecha no reconocida devuelve `(None, None)` y la
+  fila va a `filas_ignoradas` en vez de escribirse: mismo criterio de
+  "nunca fallar en silencio" que ya usa el resto del sistema.

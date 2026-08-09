@@ -328,6 +328,66 @@ def test_construir_argumentos_motor_usa_nombre_motor_no_nombre_corto():
 
 
 # -----------------------------------------------------------------------------
+# Egresos de caja: JSON intermedio (construir_json_egresos)
+# -----------------------------------------------------------------------------
+def _tabla_egresos_htm(*filas) -> str:
+    """Mismo shape de 10 <td> por fila de datos que egresos_caja.py espera
+    (Fecha, Usuario, Categoria, Caja, Motivo, Entregado A, Moneda, Tarjeta,
+    Estado, Monto) — ver tests/test_egresos_caja.py, que prueba el parser en
+    detalle. Acá solo hace falta lo mínimo para que parsear_egresos() separe
+    depósitos con su 'concepto'; el parseo en sí no es lo que se prueba."""
+    return "<html><body><table>" + "".join(filas) + "</table></body></html>"
+
+
+def _fila_egreso(fecha, motivo, entregado_a, monto) -> str:
+    return (
+        f"<tr><td>{fecha}</td><td>CAJA.MIRAFLORES</td><td colspan=2>Otros</td><td>Caja 01</td>"
+        f"<td colspan=4>{motivo}</td><td>{entregado_a}</td><td>Soles</td><td>-</td>"
+        f"<td>ACTIVO</td><td>{monto}</td></tr>"
+    )
+
+
+def test_construir_json_egresos_propaga_el_concepto_de_cada_deposito(tmp_path):
+    """El campo 'concepto' ('propina'/'venta'/'indeterminado') que
+    egresos_caja.parsear_egresos() agrega a cada depósito tiene que viajar
+    tal cual en el JSON intermedio que consume --egresos del motor, sin
+    cambiar el resto del formato documentado en el comentario de arriba de
+    esta función y en conciliacion/README.md."""
+    filas = (
+        _fila_egreso("02/07/2026 16:17", "PROPINA EN EFECTIVO 26 AL 02", "CTA DE LA EMPRESA", "120"),
+        _fila_egreso("15/07/2026 16:22", "DEPOSITO", "INTERBANK", "400"),
+        _fila_egreso("29/07/2026 14:16", "DEPOSITO DE VENTA EN EFECTIVO", "BANCO", "1400"),
+    )
+    ruta = tmp_path / "tabla.htm"
+    ruta.write_text(_tabla_egresos_htm(*filas), encoding="utf-8")
+    destino = tmp_path / "egresos.json"
+
+    resumen = conciliar.construir_json_egresos([ruta], 250.0, destino)
+
+    assert resumen["n_depositos"] == 3
+    datos = json.loads(destino.read_text(encoding="utf-8"))
+    conceptos = {d["motivo"]: d["concepto"] for d in datos["depositos"]}
+    assert conceptos["PROPINA EN EFECTIVO 26 AL 02"] == "propina"
+    assert conceptos["DEPOSITO"] == "indeterminado"
+    assert conceptos["DEPOSITO DE VENTA EN EFECTIVO"] == "venta"
+    # el resto del shape del JSON no cambia
+    assert set(datos.keys()) == {"gastos", "depositos", "reposicion_semanal"}
+    assert datos["reposicion_semanal"] == 250.0
+
+
+def test_construir_json_egresos_los_gastos_no_llevan_concepto(tmp_path):
+    ruta = tmp_path / "tabla.htm"
+    ruta.write_text(_tabla_egresos_htm(_fila_egreso("01/07/2026 09:00", "COMPRA DE VERDURAS", "EDWIN", "30")), encoding="utf-8")
+    destino = tmp_path / "egresos.json"
+
+    conciliar.construir_json_egresos([ruta], 250.0, destino)
+
+    datos = json.loads(destino.read_text(encoding="utf-8"))
+    assert len(datos["gastos"]) == 1
+    assert "concepto" not in datos["gastos"][0]
+
+
+# -----------------------------------------------------------------------------
 # CSV derivado (filtrar_y_escribir_csv)
 # -----------------------------------------------------------------------------
 def _fila_contable(**overrides) -> dict[str, str]:
