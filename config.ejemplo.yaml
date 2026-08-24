@@ -120,6 +120,16 @@ conciliacion:
       # No es libre ni cosmético: el motor lo usa para decidir el local y el
       # encargado de la caja chica. Ver conciliacion/build_conciliacion.py.
       nombre_motor: LA CALETA CENTRO
+      # Empresas SIN cuenta bancaria propia cuyas compras paga ESTA empresa.
+      # Sus comprobantes entran al CSV de esta conciliación (si no, sus cargos
+      # quedan marcados SIN COMPROBANTE para siempre: el dinero salió de acá
+      # pero la factura está a nombre de la otra). Cada nombre debe existir en
+      # conciliacion.empresas Y no tener 'cuentas' propias — si tuviera, el
+      # mismo comprobante se contaría dos veces y conciliar.py aborta. Las
+      # filas heredadas se marcan en SERIE_NUMERO y OBSERVACIONES para que en
+      # el .xlsx se vea a nombre de quién está facturado cada comprobante.
+      # Borra la clave si todas las empresas tienen sus propias cuentas.
+      paga_comprobantes_de: [LA CALETA INSUMOS]
       # Reposición semanal de la caja chica desde el banco. El reporte de
       # egresos del sistema de ventas (--egresos de conciliar.py) se cuadra
       # contra estas salidas. Borra la sección si el negocio no maneja caja
@@ -148,6 +158,11 @@ conciliacion:
           numero: "9012"
           moneda: PEN
           principal: true
+    # Empresa SIN cuentas propias, nombrada arriba en paga_comprobantes_de.
+    # Va aquí, sin 'cuentas', para que conciliar.py pueda validarla; si se
+    # intenta conciliar sola, aborta indicando por cuál empresa hacerlo.
+    - nombre_corto: LA CALETA INSUMOS
+      nombre_motor: LA CALETA INSUMOS
 
 # =============================================================================
 # Correo (Gmail) — SOLO LECTURA
