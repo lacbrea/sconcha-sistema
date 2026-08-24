@@ -60,6 +60,7 @@ Uso multi-cuenta (v3.1, varios EECC de la misma empresa en un solo Excel):
 """
 import openpyxl, json, re, datetime, sys, os, csv, argparse
 from itertools import combinations
+from math import comb
 from collections import Counter
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -651,14 +652,50 @@ def match_individual(monto, fecha_cargo, prov_hint, require_name):
     return best
 
 
+# Tope de la busqueda por combinaciones en match_lote(): el tamaño de la
+# COMBINACION (k), no el del grupo (n). Version vieja (hasta 2026-08-23)
+# descartaba el lote ENTERO si el proveedor tenia mas de 6 comprobantes
+# candidatos en la ventana ("para no explotar combinatoria") - caso real
+# jul-2026, EL TEMPLO: LLONTOP con 7 facturas nunca cruzo un cargo de S/975
+# cuyo subconjunto exacto (375+225+225+150) si existia, porque n=7 > 6 hacia
+# saltar toda la busqueda de combinaciones, no solo las mas caras.
+#
+# C(n, k) para k FIJO crece polinomialmente en n (grado k), no exponencialmente
+# como C(n, n/2) - por eso lo correcto es topar k, dejando que n crezca.
+# MAX_LOTE_K = 5 reproduce el tope EFECTIVO que ya tenia el codigo viejo (con
+# n<=6, el maximo r que se llegaba a probar era range(2, n) = hasta n-1 = 5),
+# asi que no se afloja la tolerancia ya validada contra datos reales
+# (MOGOFRAN, LLONTOP jun-2026): simplemente se deja de exigir que TODO el
+# grupo quepa en <=6 para probar esos mismos tamaños de combinacion.
+#
+# MAX_LOTE_COMBOS_POR_K = 20_000: techo de combinaciones evaluadas por
+# (grupo, k). Si C(n, k) > 20_000 para un k dado, ese k se salta para ese
+# grupo (un k mayor, que crece mas rapido todavia, tambien se saltaria - por
+# eso no hace falta un techo aparte para k+1). Peor caso por grupo: los 4
+# valores de k (2..5) tope en 20_000 cada uno = 80_000 combinaciones
+# evaluadas, cada una con a lo sumo 5 sumas -> ~400_000 operaciones
+# aritmeticas, una fraccion de segundo en Python. Con n=50 candidatos del
+# mismo proveedor en la ventana (mas que cualquier caso real visto: el jul-2026
+# de LLONTOP fue n=7), C(50,2)=1,225 y C(50,3)=19,600 SI se evaluan (bajo el
+# techo); C(50,4)=230,300 y C(50,5)=2,118,760 se saltan - se siguen probando
+# pares y tercias en vez de abandonar el lote entero como hacia el codigo
+# viejo con cualquier n>6.
+MAX_LOTE_K = 5
+MAX_LOTE_COMBOS_POR_K = 20_000
+
+
 def match_lote(monto, fecha_cargo, prov_hint, require_name):
     """Cruce por lote de pago semanal: mismo proveedor + misma FECHA_PAGO, suma de 2+
     comprobantes cuya diferencia con el monto del cargo esta dentro de +/- S/0.10
     (TOL_LOTE, redondeado a 2 decimales - los lotes acumulan redondeos de varios
-    comprobantes). Prueba primero el grupo completo y luego combinaciones (grupos
-    pequeños, hasta 6 comprobantes por proveedor/fecha, para no explotar
-    combinatoria); de todos los grupos/combos candidatos dentro de tolerancia,
-    gana el de MENOR diferencia (un lote exacto siempre le gana a uno aproximado).
+    comprobantes). Prueba primero el grupo completo y luego combinaciones de
+    tamaño 2..MAX_LOTE_K (ver comentario arriba de la funcion - el tope es del
+    tamaño de la combinacion, no de cuantos comprobantes tiene el grupo); de
+    todos los grupos/combos candidatos dentro de tolerancia, gana el de MENOR
+    diferencia (un lote exacto siempre le gana a uno aproximado, aunque el
+    aproximado se haya evaluado antes - ver
+    test_match_lote_exacto_le_gana_a_aproximado_aunque_se_evalue_despues en
+    tests/test_build_conciliacion.py).
 
     Fallback sin FECHA_PAGO: si el comprobante no trae FECHA_PAGO (CSV incompleto),
     se agrupa por proveedor + emision <= fecha del cargo, hasta 15 dias antes (un
@@ -667,7 +704,17 @@ def match_lote(monto, fecha_cargo, prov_hint, require_name):
     Desambiguacion de fecha exacta: si un grupo (por FECHA_PAGO real) no es de la
     fecha del cargo actual y existe otro cargo del mismo monto exactamente en esa
     fecha (ver CARGO_KEYS), el grupo no se le ofrece a este cargo - se reserva
-    para el cargo de fecha exacta."""
+    para el cargo de fecha exacta.
+
+    Determinismo: 'groups' es un dict armado iterando la lista 'comprobantes'
+    en su orden original (no un set), y dentro de cada grupo 'items' conserva
+    ese mismo orden - itertools.combinations() sobre una lista con orden fijo
+    enumera siempre en el mismo orden. Si dos combos DISTINTOS empatan en la
+    MISMA diferencia minima (posible con montos repetidos, ej. varias facturas
+    de S/225), gana el primero encontrado en ese orden fijo (total del grupo
+    primero, luego k=2,3,4,5 en el orden de combinations()) - no se resuelve
+    por 'menos comprobantes' ni ningun otro criterio nuevo, es el mismo
+    comportamiento de siempre ante empates, ahora documentado explicitamente."""
     if fecha_cargo is None:
         return None
     groups = {}
@@ -709,11 +756,12 @@ def match_lote(monto, fecha_cargo, prov_hint, require_name):
         total_all = round(sum(i['_TOTAL'] for i in items), 2)
         cand.append((round(abs(total_all - monto), 2), items))
         n = len(items)
-        if n <= 6:
-            for r in range(2, n):
-                for combo in combinations(items, r):
-                    d = round(abs(round(sum(i['_TOTAL'] for i in combo), 2) - monto), 2)
-                    cand.append((d, list(combo)))
+        for r in range(2, min(n, MAX_LOTE_K + 1)):
+            if comb(n, r) > MAX_LOTE_COMBOS_POR_K:
+                continue  # este k se saltea para este grupo (ver comentario arriba)
+            for combo in combinations(items, r):
+                d = round(abs(round(sum(i['_TOTAL'] for i in combo), 2) - monto), 2)
+                cand.append((d, list(combo)))
         for d, grp in cand:
             if d > TOL_LOTE:
                 continue

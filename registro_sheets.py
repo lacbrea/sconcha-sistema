@@ -76,6 +76,44 @@ NOMBRE_HOJA_RESPALDOS_CAJA = "RESPALDOS_CAJA"
 REGISTRADO_POR = "skill-comprobantes"
 
 
+def _parsear_total(total: Any) -> float:
+    """Convierte TOTAL (numero, o texto en formato es-PE o en-US) a float.
+
+    Defensa en profundidad ademas del fix en claves_existentes() (leer con
+    UNFORMATTED_VALUE): esta funcion tambien la usa el camino de --dry-run
+    (_claves_desde_csv, sobre salida/contable.csv, escrito por esta misma
+    clase con punto decimal), y en el futuro podria llegarle un TOTAL como
+    texto desde otro lado. El bug original era asumir que la coma SIEMPRE es
+    separador de miles (';replace(",", "")'): sobre '8,4' (coma decimal,
+    formato es-PE) eso da float('84') = 84.0 en vez de 8.4, e infla la clave
+    x10. Regla:
+      - coma Y punto presentes: el que aparece mas a la derecha es el
+        decimal ('1.507,16' es-PE -> 1507.16; '1,507.16' en-US -> 1507.16).
+      - solo coma, con <=2 digitos despues de la ULTIMA coma y una sola
+        coma: coma decimal real ('8,4' -> 8.4; '118,00' -> 118.0).
+      - solo coma en cualquier otro caso (3+ digitos despues, o varias
+        comas): separador de miles, se descarta como antes ('1,507' -> 1507.0).
+      - sin coma: se interpreta tal cual (soporta el punto decimal que usa
+        el CSV de dry_run, ej. '118.0').
+    Lanza ValueError/TypeError si total no es numerico (fila vacia/cabecera/
+    basura); _clave() lo captura."""
+    texto = str(total).strip()
+    tiene_coma = "," in texto
+    tiene_punto = "." in texto
+    if tiene_coma and tiene_punto:
+        if texto.rfind(",") > texto.rfind("."):
+            texto = texto.replace(".", "").replace(",", ".")  # es-PE: 1.507,16
+        else:
+            texto = texto.replace(",", "")  # en-US: 1,507.16
+    elif tiene_coma:
+        parte_decimal = texto.split(",")[-1]
+        if texto.count(",") == 1 and len(parte_decimal) <= 2:
+            texto = texto.replace(",", ".")  # coma decimal: 8,4 / 118,00
+        else:
+            texto = texto.replace(",", "")  # separador de miles: 1,507
+    return float(texto)
+
+
 def _clave(ruc: Any, serie_numero: Any, total: Any) -> str | None:
     """'RUC|SERIE_NUMERO|TOTAL con 2 decimales', mismo formato que
     ComprobanteExtraido.clave() (esquema.py): ruc y serie en mayusculas y sin
@@ -88,7 +126,7 @@ def _clave(ruc: Any, serie_numero: Any, total: Any) -> str | None:
     if not ruc_s or not serie_s:
         return None
     try:
-        total_f = float(str(total).replace(",", "").strip())
+        total_f = _parsear_total(total)
     except (TypeError, ValueError):
         return None
     return f"{ruc_s}|{serie_s}|{total_f:.2f}"
@@ -190,10 +228,26 @@ class Registro:
             return self._claves_desde_csv(self._csv_contable)
 
         servicio = self._obtener_servicio()
+        # valueRenderOption="UNFORMATTED_VALUE": sin esto, el default
+        # (FORMATTED_VALUE) devuelve TOTAL formateado al idioma del Sheet
+        # (es-PE), y un importe como 8.4 vuelve como la cadena '8,4' con COMA
+        # decimal. _clave() la lee con .replace(",", "") pensando que es
+        # separador de miles y la infla x10 (84.00 en vez de 8.40): la
+        # deteccion de duplicados deja de funcionar para cualquier importe
+        # con decimales. dateTimeRenderOption="FORMATTED_STRING" evita el
+        # efecto colateral de UNFORMATTED_VALUE sobre columnas de fecha (las
+        # devolveria como serial de Sheets). Ver el docstring de
+        # leer_filas_sheet_contable() en conciliar.py (linea ~390): mismo
+        # bug, misma combinacion, verificada contra el Sheet real.
         resp = (
             servicio.spreadsheets()
             .values()
-            .get(spreadsheetId=self.id_contable, range=self._rango_contable)
+            .get(
+                spreadsheetId=self.id_contable,
+                range=self._rango_contable,
+                valueRenderOption="UNFORMATTED_VALUE",
+                dateTimeRenderOption="FORMATTED_STRING",
+            )
             .execute()
         )
         return self._claves_desde_filas(resp.get("values", []))

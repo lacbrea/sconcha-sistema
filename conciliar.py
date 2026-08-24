@@ -78,6 +78,64 @@ def resolver_empresa(config: dict, nombre_corto: str) -> tuple[dict | None, str 
     )
 
 
+def validar_config_conciliacion(config: dict) -> str | None:
+    """Valida 'paga_comprobantes_de' en conciliacion.empresas ANTES de tocar
+    Drive/Sheets. Devuelve None si todo está bien, o un mensaje de error listo
+    para loguear (mismo patrón que resolver_empresa: quien llama solo loguea
+    y sale).
+
+    Caso real que motiva esto (jul-2026): ILLAWARA E.I.R.L. no tiene cuentas
+    bancarias propias — sus compras las paga EL TEMPLO desde las suyas — así
+    que EL TEMPLO declara 'paga_comprobantes_de: [ILLAWARA]' para que
+    filtrar_y_escribir_csv() incluya también los comprobantes facturados a
+    ILLAWARA en el CSV que arma para su propia conciliación. Dos formas en
+    que esa declaración puede quedar mal, ambas silenciosas si no se
+    validaran acá:
+
+    1. 'ILLAWARA' no existe en conciliacion.empresas (typo, o se borró la
+       entrada) — filtrar_y_escribir_csv() simplemente no encontraría filas
+       de más, sin ningún aviso de que la declaración es inválida.
+    2. La empresa referida SÍ tiene 'cuentas' propias — entonces sus
+       comprobantes entrarían DOS VECES: una vez en su propia conciliación
+       (si alguien corre --empresa ILLAWARA) y otra vez en la de quien
+       declaró paga_comprobantes_de. Ese doble conteo es el error que hay
+       que hacer imposible, no solo documentar."""
+    empresas = ((config.get("conciliacion") or {}).get("empresas")) or []
+    por_nombre = {e.get("nombre_corto"): e for e in empresas}
+    for empresa in empresas:
+        nombre = empresa.get("nombre_corto")
+        for destino in empresa.get("paga_comprobantes_de") or []:
+            objetivo = por_nombre.get(destino)
+            if objetivo is None:
+                disponibles = ", ".join(por_nombre.keys()) or "(ninguna configurada)"
+                return (
+                    f"conciliacion.empresas: '{nombre}' declara paga_comprobantes_de: [{destino}], pero "
+                    f"'{destino}' no está en conciliacion.empresas de config.yaml. "
+                    f"Empresas disponibles: {disponibles}."
+                )
+            if objetivo.get("cuentas"):
+                return (
+                    f"conciliacion.empresas: '{destino}' tiene 'cuentas' propias Y está en "
+                    f"paga_comprobantes_de de '{nombre}'. Sus comprobantes entrarían dos veces "
+                    f"(en la conciliación de '{destino}' y en la de '{nombre}'). Quítale 'cuentas' a "
+                    f"'{destino}' (si de verdad no tiene cuenta propia) o quita '{destino}' de "
+                    f"paga_comprobantes_de de '{nombre}'."
+                )
+    return None
+
+
+def quien_paga_comprobantes_de(config: dict, nombre_corto: str) -> str | None:
+    """Si 'nombre_corto' aparece en el paga_comprobantes_de de otra empresa,
+    devuelve el nombre_corto de esa empresa (para el mensaje de error cuando
+    alguien intenta conciliar directamente una empresa sin cuentas propias);
+    si no, None."""
+    empresas = ((config.get("conciliacion") or {}).get("empresas")) or []
+    for empresa in empresas:
+        if nombre_corto in (empresa.get("paga_comprobantes_de") or []):
+            return empresa.get("nombre_corto")
+    return None
+
+
 def resolver_ruc_empresa(config: dict, nombre_corto: str) -> str | None:
     """Busca el RUC de 'nombre_corto' en config['empresas'] (la lista de
     comprobantes: nombre_corto/razon_social/ruc), NO en
@@ -260,18 +318,64 @@ def descargar_constancias(
 #    "reposicion_semanal": float}
 # reposicion_semanal sale de config.yaml (conciliacion.empresas[].caja_chica),
 # nunca hardcodeada acá ni en el motor.
+#
+# CONCILIACION/<mes>/EGRESOS/ es UNA sola carpeta por mes, compartida por
+# todas las empresas del negocio (no hay una carpeta EGRESOS por empresa a
+# nivel Drive). Por eso el reporte se sube a una SUBCARPETA por empresa,
+# EGRESOS/<nombre_corto>/ — verificado con los reportes reales de julio
+# 2026: 'Egresos (18).xls' (local LINCE, 61 gastos, S/2,597.60) es de EL
+# TEMPLO, y 'Egresos (19).xls' (local MIRAFLORES, 171 gastos, S/5,114.22) es
+# de INSTITUCION. Si ambos se subieran sueltos a la misma carpeta EGRESOS/,
+# cada conciliación se llevaría TODO lo que encuentre ahí sin filtrar por
+# empresa, y la hoja CAJA CHICA de EL TEMPLO se tragaría los gastos de
+# INSTITUCION (y viceversa) sin ningún error visible. El nombre de la
+# subcarpeta usa nombre_corto TAL CUAL ("EL TEMPLO", con espacios), igual
+# que el resto de esta rama del árbol (el .xlsx de salida se llama
+# "CONCILIACION EL TEMPLO - JULIO 2026.xlsx") — no el "EL_TEMPLO" con guion
+# bajo que usa 01_PROCESADO, que es un árbol distinto que arma procesar.py.
 # -----------------------------------------------------------------------------
 EXTENSIONES_EGRESOS = (".xls", ".htm", ".html")
 
 
-def descargar_egresos(almacen: AlmacenDrive, carpeta_egresos_id: str, destino_dir: pathlib.Path) -> list[pathlib.Path]:
-    """Descarga todo lo que haya en CONCILIACION/<mes>/EGRESOS/ con una
-    extensión reconocible por egresos_caja.py (el reporte es un .xls que en
-    realidad es HTML, ver ese módulo). Si hay varios archivos (varios locales
-    de la misma empresa, ej. LINCE + otro local) se devuelven todos: el
-    llamador los parsea y concatena. Un archivo con extensión no reconocida
-    se ignora, pero SIEMPRE con una advertencia en el log (nunca en
-    silencio) — mismo criterio que descargar_eecc() con 'ignorados'.
+def advertir_egresos_sueltos(almacen: AlmacenDrive, carpeta_egresos_id: str) -> list[str]:
+    """Advierte (nunca en silencio) sobre archivos que queden directamente en
+    CONCILIACION/<mes>/EGRESOS/, fuera de cualquier subcarpeta de empresa:
+    layout viejo, de antes de que EGRESOS se separara por empresa (ver
+    comentario arriba de EXTENSIONES_EGRESOS). Un archivo suelto ahí no se
+    puede atribuir a ninguna empresa —es justo el problema que resolvió la
+    subcarpeta por empresa—, así que nunca se usa para conciliar. Mismo
+    criterio de "nunca en silencio" que descargar_eecc() con 'ignorados' y
+    descargar_egresos() con las extensiones no reconocidas.
+
+    almacen.listar() no es recursivo y excluye carpetas, así que esto lista
+    únicamente archivos sueltos en la raíz de EGRESOS/ — las subcarpetas de
+    empresa (y lo que haya dentro de ellas) no aparecen acá. Devuelve los
+    nombres advertidos.
+    """
+    sueltos = [archivo["name"] for archivo in almacen.listar(carpeta_egresos_id)]
+    for nombre in sueltos:
+        logger.warning(
+            "EGRESOS: archivo suelto en la raíz de EGRESOS/ (layout viejo, no se puede atribuir a "
+            "ninguna empresa), se ignora: %s. Muévelo a EGRESOS/<empresa>/ en Drive.", nombre,
+        )
+    return sueltos
+
+
+def descargar_egresos(
+    almacen: AlmacenDrive, carpeta_egresos_empresa_id: str, destino_dir: pathlib.Path
+) -> list[pathlib.Path]:
+    """Descarga todo lo que haya en CONCILIACION/<mes>/EGRESOS/<empresa>/ con
+    una extensión reconocible por egresos_caja.py (el reporte es un .xls que
+    en realidad es HTML, ver ese módulo). Si hay varios archivos (varios
+    locales de la misma empresa, ej. LINCE + otro local) se devuelven todos:
+    el llamador los parsea y concatena. Un archivo con extensión no
+    reconocida se ignora, pero SIEMPRE con una advertencia en el log (nunca
+    en silencio) — mismo criterio que descargar_eecc() con 'ignorados'.
+
+    carpeta_egresos_empresa_id es la SUBCARPETA de esta empresa dentro de
+    EGRESOS/, no la carpeta EGRESOS/ genérica (ver comentario arriba de
+    EXTENSIONES_EGRESOS sobre por qué). Los archivos sueltos directamente en
+    EGRESOS/ se advierten aparte, con advertir_egresos_sueltos().
 
     Nota: si alguien sube a Drive el .xls-frameset SIN su carpeta hermana
     '<nombre>_archivos/' (ver egresos_caja._resolver_tabla), el parseo falla
@@ -279,7 +383,7 @@ def descargar_egresos(almacen: AlmacenDrive, carpeta_egresos_id: str, destino_di
     esperada es subir el 'sheet001.htm' ya extraído, o el .xls completo con
     su carpeta hermana si Drive la preserva.
     """
-    archivos = almacen.listar(carpeta_egresos_id)
+    archivos = almacen.listar(carpeta_egresos_empresa_id)
     rutas: list[pathlib.Path] = []
     for archivo in archivos:
         nombre = archivo["name"]
@@ -432,18 +536,51 @@ def filtrar_y_escribir_csv(
     mes: str,
     destino_csv: pathlib.Path,
     margen_dias: int = MARGEN_DIAS_COMPROBANTES,
+    paga_comprobantes_de: list[str] | None = None,
 ) -> int:
-    """Filtra las filas de 'nombre_corto' cuya FECHA_EMISION o FECHA_PAGO cae
+    """Filtra las filas de 'nombre_corto' (y, si se pasa, de las empresas
+    listadas en 'paga_comprobantes_de' — ver conciliacion.empresas[].
+    paga_comprobantes_de en config.yaml) cuya FECHA_EMISION o FECHA_PAGO cae
     en 'mes' +/- margen_dias, y las escribe en destino_csv con las columnas
     que espera el motor (COLUMNAS_CONTABLE, importado de registro_sheets.py:
     es la fuente de verdad, no se duplica esa lista acá). Devuelve cuántas
     filas quedaron. La columna EMPRESA se reescribe con nombre_motor (ver
-    comentario arriba del filtro interno del motor)."""
+    comentario arriba del filtro interno del motor) para TODAS las filas
+    incluidas, también las que llegaron por paga_comprobantes_de: el motor
+    solo conoce una empresa por corrida (el argumento posicional 'empresa'),
+    así que un comprobante de ILLAWARA que entra a la conciliación de EL
+    TEMPLO tiene que aparecer con EMPRESA=nombre_motor de EL TEMPLO para que
+    el filtro EMP_KEY del motor no lo descarte.
+
+    Caso real jul-2026: ILLAWARA E.I.R.L. no tiene cuentas bancarias propias
+    — EL TEMPLO paga sus compras desde las suyas — así que 8 comprobantes
+    facturados a ILLAWARA (EMPRESA='ILLAWARA' en el Sheet contable) solo
+    cruzan contra los cargos del banco de EL TEMPLO si este filtro los deja
+    pasar.
+
+    Trazabilidad (para que un contador no lea en silencio una compra de
+    ILLAWARA como si fuera de EL TEMPLO): a las filas que entran por
+    paga_comprobantes_de se les antepone una marca a SERIE_NUMERO
+    ("F001-00102426" -> "F001-00102426 [FACT. A ILLAWARA]") y se les agrega
+    una nota a OBSERVACIONES. Las dos, no una sola, y a propósito:
+    build_conciliacion.py (el motor, que no se toca) NUNCA lee la columna
+    OBSERVACIONES del CSV — no aparece en ningún `row.get('OBSERVACIONES')`
+    del motor — así que una nota que viviera solo ahí jamás llegaría al
+    .xlsx (y el CSV en sí ni siquiera se sube a Drive: es un intermedio en
+    salida/, el contador nunca lo abre). SERIE_NUMERO en cambio SÍ la usa el
+    motor para armar la columna "N Comprobante" del cargo que cruza
+    (build_conciliacion.py, n_comprobante = m.get('SERIE_NUMERO', '')) sin
+    participar del cruce mismo (el match usa TOTAL/fechas/PROVEEDOR, nunca
+    SERIE_NUMERO) — es el único campo de la fila que sobrevive intacto hasta
+    el .xlsx y que un contador ve exactamente donde mira para confirmar un
+    cruce. OBSERVACIONES se deja también, igual de completa, para quien
+    audite el CSV intermedio o el Sheet contable de origen."""
     inicio, fin = _rango_mes_con_margen(mes, margen_dias)
+    empresas_incluidas = {nombre_corto, *(paga_comprobantes_de or [])}
 
     filtradas = []
     for fila in filas:
-        if (fila.get("EMPRESA") or "").strip() != nombre_corto:
+        if (fila.get("EMPRESA") or "").strip() not in empresas_incluidas:
             continue
         fecha_emision = _parsear_fecha_flex(fila.get("FECHA_EMISION"))
         fecha_pago = _parsear_fecha_flex(fila.get("FECHA_PAGO"))
@@ -460,8 +597,19 @@ def filtrar_y_escribir_csv(
         escritor.writeheader()
         for fila in filtradas:
             salida = {columna: fila.get(columna, "") for columna in COLUMNAS_CONTABLE}
+            empresa_original = (fila.get("EMPRESA") or "").strip()
             salida["EMPRESA"] = nombre_motor
             salida["ESTADO_PAGO"] = _estado_pago_para_el_motor(fila)
+            if empresa_original != nombre_corto:
+                marca = f"[FACT. A {empresa_original}]"
+                salida["SERIE_NUMERO"] = f"{salida.get('SERIE_NUMERO', '')} {marca}".strip()
+                nota = (
+                    f"Comprobante facturado a {empresa_original}, no a {nombre_corto}. Lo paga "
+                    f"{nombre_corto} desde su propia cuenta porque {empresa_original} no tiene "
+                    f"cuentas bancarias propias (ver paga_comprobantes_de en config.yaml)."
+                )
+                obs_previa = (salida.get("OBSERVACIONES") or "").strip()
+                salida["OBSERVACIONES"] = f"{obs_previa} | {nota}" if obs_previa else nota
             escritor.writerow(salida)
 
     return len(filtradas)
@@ -722,7 +870,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--egresos", default=None,
         help="Reporte de egresos de caja (.xls/.htm/.html) a mano; si se indica, manda sobre lo que haya en "
-             "Drive (CONCILIACION/<mes>/EGRESOS/). Útil cuando el reporte todavía no está en Drive.",
+             "Drive (CONCILIACION/<mes>/EGRESOS/<empresa>/). Útil cuando el reporte todavía no está en Drive.",
     )
     parser.add_argument("--verbose", action="store_true", help="Log detallado (DEBUG) también en consola.")
     args = parser.parse_args(argv)
@@ -736,9 +884,28 @@ def main(argv: list[str] | None = None) -> int:
 
     configurar_logging(pathlib.Path("salida"), args.verbose)
 
+    motivo_config = validar_config_conciliacion(config)
+    if motivo_config is not None:
+        logger.error(motivo_config)
+        return 1
+
     empresa_cfg, motivo = resolver_empresa(config, args.empresa)
     if empresa_cfg is None:
         logger.error(motivo)
+        return 1
+
+    if not empresa_cfg.get("cuentas"):
+        quien_paga = quien_paga_comprobantes_de(config, empresa_cfg["nombre_corto"])
+        detalle = (
+            f" Sus compras las paga '{quien_paga}' (ver conciliacion.empresas[].paga_comprobantes_de "
+            f"de '{quien_paga}' en config.yaml) — concilia con --empresa \"{quien_paga}\"."
+            if quien_paga
+            else " No tiene 'cuentas' en conciliacion.empresas de config.yaml."
+        )
+        logger.error(
+            "'%s' no tiene cuentas bancarias propias: no se puede conciliar directamente.%s",
+            empresa_cfg["nombre_corto"], detalle,
+        )
         return 1
 
     carpeta_conciliacion_id = ((config.get("conciliacion") or {}).get("carpeta") or "").strip()
@@ -759,7 +926,12 @@ def main(argv: list[str] | None = None) -> int:
     carpeta_mes_id = almacen.asegurar_carpeta(args.mes, carpeta_conciliacion_id)
     carpeta_eecc_id = almacen.asegurar_carpeta("EECC", carpeta_mes_id)
     carpeta_constancias_id = almacen.asegurar_carpeta("CONSTANCIAS", carpeta_mes_id)
+    # EGRESOS es una sola carpeta por mes compartida por todas las empresas;
+    # la subcarpeta por empresa es lo que evita que una conciliación se
+    # lleve el reporte de otra empresa (ver comentario arriba de
+    # EXTENSIONES_EGRESOS, sección "Egresos de caja").
     carpeta_egresos_id = almacen.asegurar_carpeta("EGRESOS", carpeta_mes_id)
+    carpeta_egresos_empresa_id = almacen.asegurar_carpeta(empresa_cfg["nombre_corto"], carpeta_egresos_id)
 
     # --- correo (opcional), ANTES de juntar archivos -------------------------
     # La garantía de --dry-run ("no llama al correo") es este 'and not
@@ -805,7 +977,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Egresos de caja (reporte del sistema de ventas) --------------------
     # --egresos (override manual) manda sobre lo que haya en Drive: es el
-    # caso de hoy, con el reporte todavía sin subir a CONCILIACION/EGRESOS/.
+    # caso de hoy, con el reporte todavía sin subir a CONCILIACION/EGRESOS/<empresa>/.
     # Sin override y sin nada en Drive, NO se pasa --egresos al motor: la
     # hoja CAJA CHICA sale con la regla vieja (fondo fijo), y se loguea para
     # que quede claro que no es un olvido.
@@ -815,7 +987,8 @@ def main(argv: list[str] | None = None) -> int:
         rutas_egresos = [pathlib.Path(args.egresos)]
         logger.info("--egresos (override manual): %s", rutas_egresos[0])
     else:
-        rutas_egresos = descargar_egresos(almacen, carpeta_egresos_id, trabajo_dir)
+        advertir_egresos_sueltos(almacen, carpeta_egresos_id)
+        rutas_egresos = descargar_egresos(almacen, carpeta_egresos_empresa_id, trabajo_dir)
     if rutas_egresos:
         reposicion_semanal = (empresa_cfg.get("caja_chica") or {}).get("reposicion_semanal")
         if reposicion_semanal is None:
@@ -853,7 +1026,8 @@ def main(argv: list[str] | None = None) -> int:
         filas = leer_filas_sheet_contable(servicio_sheets, id_contable, rango)
         ruta_csv = trabajo_dir / "comprobantes.csv"
         n_comprobantes = filtrar_y_escribir_csv(
-            filas, empresa_cfg["nombre_corto"], empresa_cfg["nombre_motor"], args.mes, ruta_csv
+            filas, empresa_cfg["nombre_corto"], empresa_cfg["nombre_motor"], args.mes, ruta_csv,
+            paga_comprobantes_de=empresa_cfg.get("paga_comprobantes_de"),
         )
         logger.info("CSV de comprobantes derivado del Sheet contable: %d fila(s) -> %s", n_comprobantes, ruta_csv)
 

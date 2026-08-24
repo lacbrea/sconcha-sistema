@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import pathlib
 import sys
 import types
@@ -328,6 +329,106 @@ def test_construir_argumentos_motor_usa_nombre_motor_no_nombre_corto():
 
 
 # -----------------------------------------------------------------------------
+# Egresos de caja: descarga por empresa (descargar_egresos, advertir_egresos_sueltos)
+#
+# CONCILIACION/<mes>/EGRESOS/ es una sola carpeta por mes compartida por
+# todas las empresas; conciliar.py ahora crea (idempotente, con
+# asegurar_carpeta) una subcarpeta EGRESOS/<nombre_corto>/ por empresa, para
+# que descargar_egresos() nunca se lleve el reporte de otra empresa. Caso
+# real que motivó el cambio (verificado con julio 2026): 'Egresos (18).xls'
+# (local LINCE, 61 gastos, S/2,597.60) es de EL TEMPLO, y
+# 'Egresos (19).xls' (local MIRAFLORES, 171 gastos, S/5,114.22) es de
+# INSTITUCION — con una sola carpeta EGRESOS/ compartida, cada conciliación
+# se hubiera tragado los gastos de la otra empresa en su hoja CAJA CHICA.
+# -----------------------------------------------------------------------------
+def test_descargar_egresos_de_la_subcarpeta_de_empresa_trae_solo_los_de_esa_empresa(tmp_path):
+    almacen = FakeAlmacen()
+    carpeta_egresos_id = almacen.agregar_carpeta("EGRESOS")
+    carpeta_el_templo_id = almacen.asegurar_carpeta("EL TEMPLO", carpeta_egresos_id)
+    almacen.agregar_archivo(carpeta_el_templo_id, "Egresos (18).xls", b"reporte LINCE / EL TEMPLO")
+
+    rutas = conciliar.descargar_egresos(almacen, carpeta_el_templo_id, tmp_path)
+
+    assert len(rutas) == 1
+    assert rutas[0] == tmp_path / "Egresos (18).xls"
+    assert rutas[0].read_bytes() == b"reporte LINCE / EL TEMPLO"
+
+
+def test_advertir_egresos_sueltos_ignora_y_advierte_archivo_en_la_raiz(tmp_path, caplog):
+    """Un archivo directamente en EGRESOS/ (layout viejo, sin subcarpeta de
+    empresa) no se puede atribuir a ninguna empresa: se ignora, pero SIEMPRE
+    con una advertencia clara en el log, nunca en silencio."""
+    almacen = FakeAlmacen()
+    carpeta_egresos_id = almacen.agregar_carpeta("EGRESOS")
+    almacen.agregar_archivo(carpeta_egresos_id, "Egresos (20).xls", b"suelto, layout viejo")
+
+    with caplog.at_level(logging.WARNING, logger="procesar.conciliar"):
+        sueltos = conciliar.advertir_egresos_sueltos(almacen, carpeta_egresos_id)
+
+    assert sueltos == ["Egresos (20).xls"]
+    mensajes = [r.message for r in caplog.records]
+    assert any("Egresos (20).xls" in m and "suelto" in m for m in mensajes)
+    # nunca se descarga: advertir_egresos_sueltos() solo lista y advierte
+    assert not (tmp_path / "Egresos (20).xls").exists()
+
+
+def test_advertir_egresos_sueltos_no_ve_lo_que_hay_dentro_de_subcarpetas_de_empresa():
+    """Un archivo que sí está dentro de EGRESOS/<empresa>/ no debe generar la
+    advertencia de 'archivo suelto': almacen.listar() no es recursivo y
+    excluye carpetas, así que la subcarpeta de empresa ni su contenido
+    aparecen al listar la carpeta EGRESOS/ raíz."""
+    almacen = FakeAlmacen()
+    carpeta_egresos_id = almacen.agregar_carpeta("EGRESOS")
+    carpeta_el_templo_id = almacen.asegurar_carpeta("EL TEMPLO", carpeta_egresos_id)
+    almacen.agregar_archivo(carpeta_el_templo_id, "Egresos (18).xls")
+
+    sueltos = conciliar.advertir_egresos_sueltos(almacen, carpeta_egresos_id)
+
+    assert sueltos == []
+
+
+def test_descargar_egresos_dos_empresas_cada_una_recibe_solo_lo_propio(tmp_path):
+    """Dos empresas, cada una con su propio reporte en su subcarpeta: cada
+    llamada a descargar_egresos() con la subcarpeta correspondiente trae
+    solo el archivo de esa empresa, nunca el de la otra."""
+    almacen = FakeAlmacen()
+    carpeta_egresos_id = almacen.agregar_carpeta("EGRESOS")
+    carpeta_el_templo_id = almacen.asegurar_carpeta("EL TEMPLO", carpeta_egresos_id)
+    carpeta_institucion_id = almacen.asegurar_carpeta("INSTITUCION", carpeta_egresos_id)
+    almacen.agregar_archivo(carpeta_el_templo_id, "Egresos (18).xls", b"LINCE / EL TEMPLO")
+    almacen.agregar_archivo(carpeta_institucion_id, "Egresos (19).xls", b"MIRAFLORES / INSTITUCION")
+
+    destino_el_templo = tmp_path / "EL TEMPLO"
+    destino_institucion = tmp_path / "INSTITUCION"
+    rutas_el_templo = conciliar.descargar_egresos(almacen, carpeta_el_templo_id, destino_el_templo)
+    rutas_institucion = conciliar.descargar_egresos(almacen, carpeta_institucion_id, destino_institucion)
+
+    assert [r.name for r in rutas_el_templo] == ["Egresos (18).xls"]
+    assert rutas_el_templo[0].read_bytes() == b"LINCE / EL TEMPLO"
+    assert [r.name for r in rutas_institucion] == ["Egresos (19).xls"]
+    assert rutas_institucion[0].read_bytes() == b"MIRAFLORES / INSTITUCION"
+
+
+def test_descargar_egresos_extension_no_reconocida_dentro_de_la_subcarpeta_se_ignora_con_advertencia(
+    tmp_path, caplog
+):
+    """Mismo comportamiento de siempre para extensión no reconocida, ahora
+    dentro de la subcarpeta de empresa en vez de EGRESOS/ directo."""
+    almacen = FakeAlmacen()
+    carpeta_egresos_id = almacen.agregar_carpeta("EGRESOS")
+    carpeta_el_templo_id = almacen.asegurar_carpeta("EL TEMPLO", carpeta_egresos_id)
+    almacen.agregar_archivo(carpeta_el_templo_id, "notas.txt", b"no es un reporte de egresos")
+
+    with caplog.at_level(logging.WARNING, logger="procesar.conciliar"):
+        rutas = conciliar.descargar_egresos(almacen, carpeta_el_templo_id, tmp_path)
+
+    assert rutas == []
+    mensajes = [r.message for r in caplog.records]
+    assert any("notas.txt" in m and "extensión no reconocida" in m for m in mensajes)
+    assert not (tmp_path / "notas.txt").exists()
+
+
+# -----------------------------------------------------------------------------
 # Egresos de caja: JSON intermedio (construir_json_egresos)
 # -----------------------------------------------------------------------------
 def _tabla_egresos_htm(*filas) -> str:
@@ -459,6 +560,156 @@ def test_filtrar_y_escribir_csv_descarta_fila_sin_fecha_valida_en_ninguna_column
     n = conciliar.filtrar_y_escribir_csv([fila_sin_fecha], "EL TEMPLO", "EL TEMPLO", "2026-06", destino)
 
     assert n == 0
+
+
+# -----------------------------------------------------------------------------
+# paga_comprobantes_de: ILLAWARA no tiene cuentas bancarias propias, sus
+# compras las paga EL TEMPLO (ver config.yaml y el docstring de
+# filtrar_y_escribir_csv/validar_config_conciliacion en conciliar.py).
+# -----------------------------------------------------------------------------
+def test_filtrar_y_escribir_csv_incluye_filas_de_paga_comprobantes_de_con_empresa_reescrita(tmp_path):
+    fila_propia = _fila_contable(EMPRESA="EL TEMPLO", FECHA_EMISION="10/07/2026")
+    fila_illawara = _fila_contable(EMPRESA="ILLAWARA", FECHA_EMISION="12/07/2026")
+    fila_otra_empresa_no_declarada = _fila_contable(EMPRESA="INSTITUCION", FECHA_EMISION="12/07/2026")
+    destino = tmp_path / "comprobantes.csv"
+
+    n = conciliar.filtrar_y_escribir_csv(
+        [fila_propia, fila_illawara, fila_otra_empresa_no_declarada],
+        "EL TEMPLO", "EL TEMPLO", "2026-07", destino,
+        paga_comprobantes_de=["ILLAWARA"],
+    )
+
+    assert n == 2  # la propia + la de ILLAWARA; INSTITUCION (no declarada) queda afuera
+    with destino.open("r", encoding="utf-8-sig", newline="") as f:
+        filas = list(csv.DictReader(f))
+    # Las DOS filas incluidas quedan con EMPRESA=nombre_motor (nunca 'ILLAWARA'
+    # ni 'EL TEMPLO' a secas): el filtro EMP_KEY del motor descartaría en
+    # silencio cualquier valor que no contenga su EMP_KEY (ver comentario
+    # arriba de filtrar_y_escribir_csv en conciliar.py).
+    assert {f["EMPRESA"] for f in filas} == {"EL TEMPLO"}
+
+
+def test_filtrar_y_escribir_csv_marca_trazabilidad_en_serie_numero_y_observaciones(tmp_path):
+    fila_illawara = _fila_contable(
+        EMPRESA="ILLAWARA", FECHA_EMISION="12/07/2026", SERIE_NUMERO="F001-00102426",
+    )
+    destino = tmp_path / "comprobantes.csv"
+
+    conciliar.filtrar_y_escribir_csv(
+        [fila_illawara], "EL TEMPLO", "EL TEMPLO", "2026-07", destino, paga_comprobantes_de=["ILLAWARA"],
+    )
+
+    with destino.open("r", encoding="utf-8-sig", newline="") as f:
+        fila = next(csv.DictReader(f))
+    # SERIE_NUMERO: el motor SÍ la lee (n_comprobante) y es lo único que un
+    # contador ve intacto hasta el .xlsx, así que la marca vive ahí también,
+    # no solo en OBSERVACIONES (que el motor nunca lee).
+    assert fila["SERIE_NUMERO"] == "F001-00102426 [FACT. A ILLAWARA]"
+    assert "ILLAWARA" in fila["OBSERVACIONES"]
+    assert "EL TEMPLO" in fila["OBSERVACIONES"]
+
+
+def test_filtrar_y_escribir_csv_no_pisa_observaciones_existentes(tmp_path):
+    fila_illawara = _fila_contable(
+        EMPRESA="ILLAWARA", FECHA_EMISION="12/07/2026", OBSERVACIONES="Nota original del contador",
+    )
+    destino = tmp_path / "comprobantes.csv"
+
+    conciliar.filtrar_y_escribir_csv(
+        [fila_illawara], "EL TEMPLO", "EL TEMPLO", "2026-07", destino, paga_comprobantes_de=["ILLAWARA"],
+    )
+
+    with destino.open("r", encoding="utf-8-sig", newline="") as f:
+        fila = next(csv.DictReader(f))
+    assert "Nota original del contador" in fila["OBSERVACIONES"]  # no se pisa
+    assert "ILLAWARA" in fila["OBSERVACIONES"]  # se concatena la nota de trazabilidad
+
+
+def test_filtrar_y_escribir_csv_fila_propia_no_lleva_marca_de_trazabilidad(tmp_path):
+    """Las filas que YA son de nombre_corto (no llegaron por
+    paga_comprobantes_de) no deben llevar la marca [FACT. A ...] ni tocar
+    OBSERVACIONES: la marca es solo para distinguir un comprobante ajeno."""
+    fila_propia = _fila_contable(
+        EMPRESA="EL TEMPLO", FECHA_EMISION="12/07/2026", SERIE_NUMERO="F001-00099999",
+    )
+    destino = tmp_path / "comprobantes.csv"
+
+    conciliar.filtrar_y_escribir_csv(
+        [fila_propia], "EL TEMPLO", "EL TEMPLO", "2026-07", destino, paga_comprobantes_de=["ILLAWARA"],
+    )
+
+    with destino.open("r", encoding="utf-8-sig", newline="") as f:
+        fila = next(csv.DictReader(f))
+    assert fila["SERIE_NUMERO"] == "F001-00099999"
+    assert fila["OBSERVACIONES"] == ""
+
+
+def test_filtrar_y_escribir_csv_sin_paga_comprobantes_de_no_hay_regresion(tmp_path):
+    """Sin pasar paga_comprobantes_de (el caso de INSTITUCION, que no declara
+    ninguna), el comportamiento es exactamente el de antes: solo pasa la
+    propia empresa, sin marca de trazabilidad."""
+    fila_propia = _fila_contable(EMPRESA="EL TEMPLO", FECHA_EMISION="10/07/2026", SERIE_NUMERO="F001-1")
+    fila_illawara = _fila_contable(EMPRESA="ILLAWARA", FECHA_EMISION="12/07/2026")
+    destino = tmp_path / "comprobantes.csv"
+
+    n = conciliar.filtrar_y_escribir_csv([fila_propia, fila_illawara], "EL TEMPLO", "EL TEMPLO", "2026-07", destino)
+
+    assert n == 1
+    with destino.open("r", encoding="utf-8-sig", newline="") as f:
+        fila = next(csv.DictReader(f))
+    assert fila["EMPRESA"] == "EL TEMPLO"
+    assert fila["SERIE_NUMERO"] == "F001-1"  # sin marca
+    assert fila["OBSERVACIONES"] == ""
+
+
+def test_filtrar_y_escribir_csv_caso_real_julio_2026_illawara_entra_al_csv_de_el_templo(tmp_path):
+    """Caso real verificado jul-2026 (ver config.yaml, comentario junto a
+    paga_comprobantes_de): 8 comprobantes facturados a ILLAWARA E.I.R.L.
+    (CLIENTE_RUC=20614321734), proveedores ULTRAFRIO/APUDEX/PROGRAS, total
+    S/7,024.01, que el banco de EL TEMPLO sí pagó."""
+    # Montos individuales de cada comprobante: no vienen dados (el dato
+    # confirmado es el total, S/7,024.01, y el reparto 3/3/2 por proveedor,
+    # ver el mensaje de tarea); se fabrican acá solo para que el fixture
+    # sume ese total exacto, no se presentan como el desglose real.
+    montos_ultrafrio = ["900.00", "850.00", "750.00"]  # suma 2500.00
+    montos_apudex = ["500.00", "512.00", "500.00"]  # suma 1512.00
+    montos_progras = ["1506.00", "1506.01"]  # suma 3012.01
+    filas_illawara = [
+        _fila_contable(
+            EMPRESA="ILLAWARA", FECHA_EMISION="05/07/2026", CLIENTE_RUC="20614321734",
+            PROVEEDOR="ULTRAFRIO S.A.C.", TOTAL=monto, SERIE_NUMERO=f"F001-{i}",
+        )
+        for i, monto in enumerate(montos_ultrafrio, start=1)
+    ] + [
+        _fila_contable(
+            EMPRESA="ILLAWARA", FECHA_EMISION="10/07/2026", CLIENTE_RUC="20614321734",
+            PROVEEDOR="APUDEX S.A.C.", TOTAL=monto, SERIE_NUMERO=f"F002-{i}",
+        )
+        for i, monto in enumerate(montos_apudex, start=1)
+    ] + [
+        _fila_contable(
+            EMPRESA="ILLAWARA", FECHA_EMISION="15/07/2026", CLIENTE_RUC="20614321734",
+            PROVEEDOR="PROGRAS S.A.C.", TOTAL=monto, SERIE_NUMERO=f"F003-{i}",
+        )
+        for i, monto in enumerate(montos_progras, start=1)
+    ]
+    assert len(filas_illawara) == 8
+    total = sum(float(f["TOTAL"]) for f in filas_illawara)
+    assert round(total, 2) == 7024.01
+
+    destino = tmp_path / "comprobantes.csv"
+    n = conciliar.filtrar_y_escribir_csv(
+        filas_illawara, "EL TEMPLO", "EL TEMPLO", "2026-07", destino, paga_comprobantes_de=["ILLAWARA"],
+    )
+
+    assert n == 8
+    with destino.open("r", encoding="utf-8-sig", newline="") as f:
+        filas = list(csv.DictReader(f))
+    assert len(filas) == 8
+    assert all(f["EMPRESA"] == "EL TEMPLO" for f in filas)  # nombre_motor, nunca 'ILLAWARA'
+    assert all("[FACT. A ILLAWARA]" in f["SERIE_NUMERO"] for f in filas)
+    assert all("ILLAWARA" in f["OBSERVACIONES"] for f in filas)
+    assert round(sum(float(f["TOTAL"]) for f in filas), 2) == 7024.01
 
 
 # -----------------------------------------------------------------------------
@@ -629,6 +880,82 @@ def test_resolver_empresa_no_encontrada_devuelve_motivo_con_disponibles():
     assert empresa is None
     assert "NO EXISTE" in motivo
     assert "EL TEMPLO" in motivo
+
+
+# -----------------------------------------------------------------------------
+# validar_config_conciliacion / quien_paga_comprobantes_de: guardas de
+# paga_comprobantes_de (ver docstrings en conciliar.py y el caso real de
+# ILLAWARA en config.yaml).
+# -----------------------------------------------------------------------------
+def _config_conciliacion_con_illawara(illawara_tiene_cuentas: bool = False) -> dict:
+    return {
+        "conciliacion": {
+            "empresas": [
+                {
+                    "nombre_corto": "EL TEMPLO", "nombre_motor": "EL TEMPLO",
+                    "paga_comprobantes_de": ["ILLAWARA"],
+                    "cuentas": [{"banco": "interbank", "numero": "4134", "moneda": "PEN", "principal": True}],
+                },
+                {
+                    "nombre_corto": "ILLAWARA", "nombre_motor": "ILLAWARA",
+                    "cuentas": [{"banco": "interbank", "numero": "9999", "moneda": "PEN", "principal": True}]
+                    if illawara_tiene_cuentas else [],
+                },
+            ]
+        }
+    }
+
+
+def test_validar_config_conciliacion_ok_sin_paga_comprobantes_de():
+    config = {"conciliacion": {"empresas": [{"nombre_corto": "EL TEMPLO", "nombre_motor": "EL TEMPLO", "cuentas": []}]}}
+
+    assert conciliar.validar_config_conciliacion(config) is None
+
+
+def test_validar_config_conciliacion_ok_cuando_empresa_referida_no_tiene_cuentas():
+    config = _config_conciliacion_con_illawara(illawara_tiene_cuentas=False)
+
+    assert conciliar.validar_config_conciliacion(config) is None
+
+
+def test_validar_config_conciliacion_falla_si_empresa_referida_no_existe():
+    config = {
+        "conciliacion": {
+            "empresas": [
+                {"nombre_corto": "EL TEMPLO", "nombre_motor": "EL TEMPLO", "paga_comprobantes_de": ["ILLAWARA"], "cuentas": []},
+            ]
+        }
+    }
+
+    motivo = conciliar.validar_config_conciliacion(config)
+
+    assert motivo is not None
+    assert "ILLAWARA" in motivo
+    assert "EL TEMPLO" in motivo
+
+
+def test_validar_config_conciliacion_falla_si_empresa_referida_tiene_cuentas_propias():
+    """Doble conteo: si ILLAWARA tuviera 'cuentas' propias, sus comprobantes
+    entrarían dos veces (en su propia conciliación y en la de EL TEMPLO)."""
+    config = _config_conciliacion_con_illawara(illawara_tiene_cuentas=True)
+
+    motivo = conciliar.validar_config_conciliacion(config)
+
+    assert motivo is not None
+    assert "ILLAWARA" in motivo
+    assert "dos veces" in motivo
+
+
+def test_quien_paga_comprobantes_de_encuentra_la_empresa_que_declara():
+    config = _config_conciliacion_con_illawara()
+
+    assert conciliar.quien_paga_comprobantes_de(config, "ILLAWARA") == "EL TEMPLO"
+
+
+def test_quien_paga_comprobantes_de_ninguna_declara_devuelve_none():
+    config = {"conciliacion": {"empresas": [{"nombre_corto": "EL TEMPLO", "nombre_motor": "EL TEMPLO", "cuentas": []}]}}
+
+    assert conciliar.quien_paga_comprobantes_de(config, "EL TEMPLO") is None
 
 
 def test_leer_filas_sheet_contable_arma_dicts_desde_la_cabecera():
@@ -986,3 +1313,91 @@ def test_main_cero_eecc_devuelve_1_y_no_corre_el_motor(tmp_path, monkeypatch):
 
     assert codigo == 1
     assert llamadas_motor == []  # nunca se corrió el motor
+
+
+# -----------------------------------------------------------------------------
+# main(): paga_comprobantes_de de punta a punta (ILLAWARA sin cuentas
+# propias, EL TEMPLO paga sus comprobantes).
+# -----------------------------------------------------------------------------
+def _config_con_illawara(illawara_tiene_cuentas: bool = False) -> dict:
+    """_config_base() + ILLAWARA, con EL TEMPLO declarando
+    paga_comprobantes_de: [ILLAWARA] (mismo shape que config.yaml real)."""
+    config = _config_base()
+    config["empresas"].append(
+        {"nombre_corto": "ILLAWARA", "razon_social": "ILLAWARA E.I.R.L.", "ruc": "20614321734", "locales": []}
+    )
+    config["conciliacion"]["empresas"][0]["paga_comprobantes_de"] = ["ILLAWARA"]
+    config["conciliacion"]["empresas"].append(
+        {
+            "nombre_corto": "ILLAWARA", "nombre_motor": "ILLAWARA",
+            "cuentas": [{"banco": "interbank", "numero": "9999", "moneda": "PEN", "principal": True}]
+            if illawara_tiene_cuentas else [],
+        }
+    )
+    return config
+
+
+def test_main_bloquea_conciliar_directamente_una_empresa_sin_cuentas_propias(tmp_path, monkeypatch):
+    """Intentar --empresa ILLAWARA (sin cuentas propias) no debe llegar a
+    tocar Drive: main() corta antes, con un mensaje que dice quién sí la
+    concilia (EL TEMPLO, vía paga_comprobantes_de)."""
+    monkeypatch.chdir(tmp_path)
+    config = _config_con_illawara()
+    ruta_config = _escribir_config(tmp_path, config)
+    almacen = FakeAlmacen()
+    llamadas_motor = _montar_dobles_de_google(monkeypatch, almacen)
+
+    codigo = conciliar.main(["--empresa", "ILLAWARA", "--mes", "2026-07", "--config", str(ruta_config)])
+
+    assert codigo == 1
+    assert llamadas_motor == []
+    assert almacen.subidas == []
+    log = (tmp_path / "salida" / "conciliar.log").read_text(encoding="utf-8")
+    assert "ILLAWARA" in log
+    assert "EL TEMPLO" in log  # el mensaje dice quién sí la concilia
+
+
+def test_main_falla_si_paga_comprobantes_de_referencia_empresa_con_cuentas_propias(tmp_path, monkeypatch):
+    """validar_config_conciliacion() corta ANTES de tocar Drive/Sheets si la
+    config tiene el error de doble conteo (empresa referida con cuentas
+    propias)."""
+    monkeypatch.chdir(tmp_path)
+    config = _config_con_illawara(illawara_tiene_cuentas=True)
+    ruta_config = _escribir_config(tmp_path, config)
+    almacen = FakeAlmacen()
+    llamadas_motor = _montar_dobles_de_google(monkeypatch, almacen)
+
+    codigo = conciliar.main(["--empresa", "EL TEMPLO", "--mes", "2026-07", "--config", str(ruta_config)])
+
+    assert codigo == 1
+    assert llamadas_motor == []
+    assert almacen.subidas == []
+    log = (tmp_path / "salida" / "conciliar.log").read_text(encoding="utf-8")
+    assert "dos veces" in log
+
+
+def test_main_el_templo_concilia_incluyendo_comprobantes_de_illawara(tmp_path, monkeypatch):
+    """De punta a punta: --empresa EL TEMPLO deriva el CSV incluyendo también
+    las filas de ILLAWARA (vía paga_comprobantes_de), con EMPRESA reescrita
+    a nombre_motor de EL TEMPLO."""
+    monkeypatch.chdir(tmp_path)
+    config = _config_con_illawara()
+    ruta_config = _escribir_config(tmp_path, config)
+    almacen, *_ = _almacen_con_un_eecc(mes="2026-07")
+    _montar_dobles_de_google(monkeypatch, almacen)
+    fila_el_templo = ["10/07/2026", "EL TEMPLO"] + [""] * (len(COLUMNAS_CONTABLE) - 2)
+    fila_illawara = ["12/07/2026", "ILLAWARA"] + [""] * (len(COLUMNAS_CONTABLE) - 2)
+    servicio_sheets = FakeServicioSheets([COLUMNAS_CONTABLE, fila_el_templo, fila_illawara])
+    monkeypatch.setattr(auth_google, "servicio_sheets", lambda: servicio_sheets)
+
+    codigo = conciliar.main(
+        ["--empresa", "EL TEMPLO", "--mes", "2026-07", "--config", str(ruta_config), "--sin-heredar"]
+    )
+
+    assert codigo == 0
+    ruta_csv = tmp_path / "salida" / "conciliacion" / "EL TEMPLO" / "2026-07" / "comprobantes.csv"
+    with ruta_csv.open("r", encoding="utf-8-sig", newline="") as f:
+        filas = list(csv.DictReader(f))
+    assert len(filas) == 2
+    assert all(f["EMPRESA"] == "EL TEMPLO" for f in filas)  # nombre_motor, ninguna quedó como 'ILLAWARA'
+    assert any("[FACT. A ILLAWARA]" in f["SERIE_NUMERO"] for f in filas)

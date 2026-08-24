@@ -117,7 +117,10 @@ C:\Python312\python.exe -m pip install -r requirements.txt
      - `carpeta`: déjalo vacío (`""`); lo llena el Paso 5.
      - `empresas`: una entrada por cada empresa (de las de arriba) que
        tenga cuentas bancarias propias — una razón social que solo
-       factura, sin cuenta propia, se omite (no se concilia).
+       factura, sin cuenta propia, se omite (no se concilia), salvo que
+       otra empresa del negocio pague sus compras desde la suya (ver
+       `paga_comprobantes_de` más abajo, y el caso real de ILLAWARA en
+       `SKILL.md`, sección "Conciliación bancaria").
        - `nombre_corto`: debe coincidir exactamente con el `nombre_corto`
          de la lista de `empresas` de arriba.
        - `nombre_motor`: el string EXACTO que recibe el motor vendorizado
@@ -140,10 +143,13 @@ C:\Python312\python.exe -m pip install -r requirements.txt
            Se cruza contra el "Reporte de Egresos" que el sistema de
            ventas del negocio exporta por local — súbelo (el `.xls`/
            `.htm`, con su carpeta hermana `_archivos` si aplica) a
-           `CONCILIACION/AAAA-MM/EGRESOS/` en Drive, o pásalo a mano con
-           `conciliar.py --egresos <ruta>`. Sin este reporte, `conciliar.py`
-           sigue con la regla vieja (fondo fijo de S/500) sin que haga
-           falta tocar nada más.
+           `CONCILIACION/AAAA-MM/EGRESOS/<nombre_corto>/` en Drive (la
+           subcarpeta de ESTA empresa, con el `nombre_corto` tal cual; ver
+           "Reporte de egresos de caja y caja chica" en SKILL.md sobre por
+           qué es por empresa y no una sola carpeta compartida), o pásalo a
+           mano con `conciliar.py --egresos <ruta>`. Sin este reporte,
+           `conciliar.py` sigue con la regla vieja (fondo fijo de S/500)
+           sin que haga falta tocar nada más.
        - `cuentas`: una entrada por cada cuenta bancaria de esta empresa,
          con `banco` y `moneda` (informativos) y:
          - `numero`: los ÚLTIMOS DÍGITOS con los que el banco nombra el
@@ -154,6 +160,20 @@ C:\Python312\python.exe -m pip install -r requirements.txt
          - `principal: true`: marca la cuenta que va como argumento
            posicional del motor; las demás entran con `--eecc`
            (repetible). Solo una cuenta por empresa puede ser `principal`.
+       - `paga_comprobantes_de` (opcional): lista de `nombre_corto` de
+         OTRAS empresas de este negocio que **no tienen cuentas bancarias
+         propias** (razón social que solo factura, cuyas compras las paga
+         esta empresa desde su propia cuenta). Caso real: ILLAWARA E.I.R.L.
+         no tiene cuenta bancaria — EL TEMPLO paga sus compras desde la
+         suya — así que la entrada de EL TEMPLO trae
+         `paga_comprobantes_de: [ILLAWARA]`, e ILLAWARA aparece en
+         `conciliacion.empresas` SIN `cuentas` (así se documenta que no se
+         concilia por sí sola). Cada nombre listado debe existir en
+         `conciliacion.empresas` y no tener `cuentas` propias — si no,
+         `conciliar.py` no arranca (evita el doble conteo: una vez en la
+         conciliación de la empresa referida, otra vez en la de quien
+         declara `paga_comprobantes_de`). Ver "Conciliación bancaria" en
+         `SKILL.md` para el detalle completo del caso ILLAWARA.
    - `correo` (opcional, solo si `conciliacion` aplica): déjalo tal como
      viene en `config.ejemplo.yaml` (`habilitado: false`) hasta tener a la
      vista un correo real de cada tipo con el cual confirmar las consultas

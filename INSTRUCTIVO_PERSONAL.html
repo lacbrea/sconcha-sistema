@@ -1,0 +1,197 @@
+<title>Comprobantes a Drive</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&display=swap">
+
+<style>
+:root{
+  --ground:#FBFCFA;
+  --surface:#EFF3F0;
+  --ink:#14201C;
+  --muted:#5C6B65;
+  --rule:#D3DBD6;
+  --accent:#0E7C5A;
+  --accent-soft:#E2F0E9;
+  --alert:#A8431E;
+  --alert-soft:#F7E9E2;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#101512;
+    --surface:#1B221E;
+    --ink:#E9EEEA;
+    --muted:#9AAAA2;
+    --rule:#2C3630;
+    --accent:#48C795;
+    --accent-soft:#163027;
+    --alert:#E8845C;
+    --alert-soft:#2A1B15;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#101512;
+  --surface:#1B221E;
+  --ink:#E9EEEA;
+  --muted:#9AAAA2;
+  --rule:#2C3630;
+  --accent:#48C795;
+  --accent-soft:#163027;
+  --alert:#E8845C;
+  --alert-soft:#2A1B15;
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0;
+  background:var(--ground);
+  color:var(--ink);
+  font-family:"Source Sans 3",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+  font-size:1.0625rem;
+  line-height:1.55;
+  -webkit-text-size-adjust:100%;
+}
+.wrap{max-width:34rem;margin:0 auto;padding:2.25rem 1.25rem 4rem;display:flex;flex-direction:column;gap:2.5rem}
+
+.eyebrow{
+  font-family:"Barlow Condensed",Impact,sans-serif;
+  font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+  font-size:.9rem;color:var(--accent);margin:0;
+}
+h1{
+  font-family:"Barlow Condensed",Impact,sans-serif;
+  font-weight:700;font-size:clamp(2.4rem,10vw,3.25rem);line-height:.98;
+  margin:.35rem 0 0;text-wrap:balance;letter-spacing:-.01em;
+}
+.lede{margin:.9rem 0 0;color:var(--muted);font-size:1.0625rem}
+
+h2{
+  font-family:"Barlow Condensed",Impact,sans-serif;
+  font-weight:700;font-size:1.6rem;line-height:1.1;
+  margin:0 0 .9rem;text-transform:uppercase;letter-spacing:.02em;
+}
+section{display:flex;flex-direction:column}
+
+ol.pasos{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:.85rem;counter-reset:paso}
+ol.pasos li{
+  counter-increment:paso;
+  display:grid;grid-template-columns:1.9rem 1fr;gap:.85rem;align-items:baseline;
+}
+ol.pasos li::before{
+  content:counter(paso);
+  font-family:"Barlow Condensed",Impact,sans-serif;font-weight:700;font-size:1.5rem;
+  color:var(--accent);line-height:1;font-variant-numeric:tabular-nums;
+}
+kbd{
+  font-family:inherit;font-weight:700;background:var(--surface);
+  border:1px solid var(--rule);border-radius:.3rem;padding:.05em .4em;
+}
+
+dl.carpetas{margin:0;display:flex;flex-direction:column}
+dl.carpetas div{padding:1.1rem 0;border-top:1px solid var(--rule)}
+dl.carpetas div:last-child{border-bottom:1px solid var(--rule)}
+dt{
+  font-family:"Barlow Condensed",Impact,sans-serif;
+  font-weight:700;font-size:1.45rem;line-height:1;letter-spacing:.01em;
+  color:var(--accent);
+}
+dd{margin:.45rem 0 0}
+
+ul.reglas{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:1rem}
+ul.reglas li{padding-left:1.1rem;position:relative}
+ul.reglas li::before{
+  content:"";position:absolute;left:0;top:.62em;
+  width:.4rem;height:.4rem;background:var(--accent);border-radius:50%;
+}
+ul.reglas b{font-weight:700}
+
+.nota{
+  background:var(--surface);border-radius:.5rem;padding:1.1rem 1.15rem;
+  font-size:1rem;
+}
+.nota p{margin:0}
+.nota p + p{margin-top:.6rem}
+
+.alerta{
+  border-left:4px solid var(--alert);background:var(--alert-soft);
+  padding:1.1rem 1.15rem;border-radius:0 .5rem .5rem 0;
+}
+.alerta h2{color:var(--alert);margin-bottom:.5rem}
+.alerta p{margin:0}
+
+.cierre{color:var(--muted);font-size:.95rem;border-top:1px solid var(--rule);padding-top:1.25rem;margin:0}
+strong{font-weight:700}
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">S'Concha · Lince y Miraflores</p>
+    <h1>Comprobantes<br>a Drive</h1>
+    <p class="lede">Desde ahora las facturas y boletas van a <strong>Google Drive</strong>. No a OneDrive, no al WhatsApp de nadie. Lo que subes acá entra solo a la contabilidad: no hay que pasarlo a ningún cuaderno.</p>
+  </header>
+
+  <section>
+    <h2>Cómo subir</h2>
+    <ol class="pasos">
+      <li>Abre la app <strong>Google Drive</strong> con la cuenta del negocio.</li>
+      <li>Entra a <kbd>SCONCHA</kbd> y luego a <kbd>00_BUZON</kbd>.</li>
+      <li>Entra a la carpeta que corresponda, de las cuatro de abajo.</li>
+      <li>Toca <kbd>+</kbd>, luego <kbd>Subir</kbd>, y toma la foto o elige el archivo.</li>
+    </ol>
+    <div class="nota" style="margin-top:1.25rem">
+      <p>Desde la computadora es lo mismo en <strong>drive.google.com</strong>: arrastras el archivo a la carpeta.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Las cuatro carpetas</h2>
+    <dl class="carpetas">
+      <div>
+        <dt>FACTURAS</dt>
+        <dd>La factura o boleta del proveedor. La del gas, la de Tai Loy, la de Hortifrut. Si el proveedor manda un archivo XML por correo, ese también va acá.</dd>
+      </div>
+      <div>
+        <dt>NOTAS_DE_VENTA</dt>
+        <dd>Las boletas del día de caja chica: la compra en el mercado, los taxis. Es el respaldo de lo que ya anotaste en el reporte de egresos.</dd>
+      </div>
+      <div>
+        <dt>LIQUIDACIONES</dt>
+        <dd>Las liquidaciones de compra: cuando le compras a alguien que <strong>no tiene RUC</strong> y no te puede dar factura.</dd>
+      </div>
+      <div>
+        <dt>OTROS</dt>
+        <dd>Recibos de servicios: luz, agua, teléfono, internet.</dd>
+      </div>
+    </dl>
+    <div class="nota" style="margin-top:1.25rem">
+      <p>Si de verdad no sabes cuál es, ponlo en <strong>OTROS</strong> y avisa. Es mejor que se quede sin subir.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Cinco reglas y ya</h2>
+    <ul class="reglas">
+      <li><b>Un archivo por comprobante.</b> Si son tres facturas, son tres fotos.</li>
+      <li><b>Que se lea el número y el total.</b> Foto derecha, con luz, el papel completo dentro del cuadro. Si salió movida, tómala de nuevo: si no se lee, alguien la tiene que ir a buscar en físico.</li>
+      <li><b>Súbelo el mismo día.</b> Juntar la semana es como se pierden.</li>
+      <li><b>No lo subas dos veces.</b> Si ya está, déjalo.</li>
+      <li><b>No cambies el nombre del archivo</b> ni muevas nada de las otras carpetas. Esas las maneja el sistema solo.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Qué pasa después</h2>
+    <div class="nota">
+      <p>El archivo desaparece de <kbd>00_BUZON</kbd> en cuanto el sistema lo lee: se va solo a <kbd>01_PROCESADO</kbd>, ordenado por mes.</p>
+      <p><strong>Que se vacíe la carpeta es la señal de que salió bien.</strong> Si un comprobante no se pudo leer, va a <kbd>02_REVISAR</kbd> y te avisamos.</p>
+    </div>
+  </section>
+
+  <section class="alerta">
+    <h2>Lo que ya no se usa</h2>
+    <p>La carpeta de <strong>OneDrive</strong> donde dejabas las fotos <strong>ya no se revisa</strong>. Lo que se deje ahí no entra a la contabilidad.</p>
+  </section>
+
+  <p class="cierre">¿Dudas con un comprobante raro? Pregunta antes de subirlo mal.</p>
+
+</div>

@@ -204,8 +204,9 @@ C:\Python312\python.exe conciliar.py --empresa "EL TEMPLO" --mes 2026-07 --egres
 - `--mes`: formato `AAAA-MM`.
 - `--egresos <ruta>`: reporte de egresos de caja (.xls/.htm/.html) a mano;
   si se indica, manda sobre lo que haya en Drive
-  (`CONCILIACION/<mes>/EGRESOS/`). Útil cuando el reporte todavía no está
-  subido a Drive (ver "Reporte de egresos de caja y caja chica" más abajo).
+  (`CONCILIACION/<mes>/EGRESOS/<empresa>/`). Útil cuando el reporte todavía
+  no está subido a Drive (ver "Reporte de egresos de caja y caja chica" más
+  abajo).
 - `--dry-run`: genera el `.xlsx` localmente para revisarlo, pero no sube
   nada a Drive **ni consulta el correo**, aunque `correo.habilitado` esté
   en `true`.
@@ -224,17 +225,33 @@ comprobantes, el `.xlsx` antes de subirlo) quedan en
 ### Carpetas de Drive
 
 ```
-<RAIZ>/CONCILIACION/AAAA-MM/EECC/         estados de cuenta del banco (uno por cuenta configurada)
-<RAIZ>/CONCILIACION/AAAA-MM/CONSTANCIAS/  cons_<numero_cuenta>.json con las constancias de transferencia
-<RAIZ>/CONCILIACION/AAAA-MM/EGRESOS/      reporte(s) de egresos de caja del sistema de ventas (ver "Reporte de egresos de caja y caja chica" más abajo)
-<RAIZ>/CONCILIACION/AAAA-MM/              el .xlsx de salida: "CONCILIACION <nombre_corto> - <MES> <AÑO>.xlsx"
+<RAIZ>/CONCILIACION/AAAA-MM/EECC/                    estados de cuenta del banco (uno por cuenta configurada)
+<RAIZ>/CONCILIACION/AAAA-MM/CONSTANCIAS/             cons_<numero_cuenta>.json con las constancias de transferencia
+<RAIZ>/CONCILIACION/AAAA-MM/EGRESOS/<nombre_corto>/  reporte(s) de egresos de caja del sistema de ventas, POR EMPRESA (ver "Reporte de egresos de caja y caja chica" más abajo)
+<RAIZ>/CONCILIACION/AAAA-MM/                         el .xlsx de salida: "CONCILIACION <nombre_corto> - <MES> <AÑO>.xlsx"
 ```
 
 `init_negocio.py` crea la carpeta `CONCILIACION` (y guarda su id en
 `conciliacion.carpeta`) solo si `config.yaml` trae la sección
 `conciliacion` — es opcional a propósito (ver ONBOARDING.md, paso 3). Las
-subcarpetas `AAAA-MM`, `EECC`, `CONSTANCIAS` y `EGRESOS` las crea
-`conciliar.py` mismo, por API, la primera vez que corre para ese mes.
+subcarpetas `AAAA-MM`, `EECC`, `CONSTANCIAS` y `EGRESOS` (y, dentro de
+`EGRESOS`, la subcarpeta `<nombre_corto>` de cada empresa) las crea
+`conciliar.py` mismo, por API, la primera vez que corre para ese mes/empresa.
+
+`EGRESOS` es una única carpeta por mes, compartida por TODAS las empresas
+del negocio (no hay una carpeta `CONCILIACION` separada por empresa). Por
+eso el reporte va en una subcarpeta por empresa, `EGRESOS/<nombre_corto>/`
+—con el `nombre_corto` tal cual aparece en `conciliacion.empresas[]`, con
+espacios ("EL TEMPLO"), igual que el resto de esta rama del árbol; no el
+`EL_TEMPLO` con guion bajo que usa `01_PROCESADO`, que es un árbol
+distinto que arma `procesar.py`—, nunca sueltos directamente en
+`EGRESOS/`. La razón no es estética: `descargar_egresos()` se lleva TODO
+lo que encuentre en la carpeta que se le pase, sin filtrar por empresa. Un
+archivo suelto en `EGRESOS/` (fuera de cualquier subcarpeta) no se puede
+atribuir a ninguna empresa, así que `conciliar.py` lo ignora siempre —con
+una advertencia en el log, nunca en silencio— y hay que moverlo a mano a
+la subcarpeta que corresponda. Ver la entrada correspondiente en "Trampas
+conocidas" para el caso real que motivó este diseño.
 
 `conciliar.py` decide qué EECC (o constancia) pertenece a qué cuenta por
 el campo `numero` de `config.yaml` — los últimos dígitos con los que el
@@ -245,6 +262,65 @@ ignora, siempre con una advertencia en el log (nunca en silencio). La
 cuenta marcada `principal: true` va como argumento posicional del motor;
 las demás entran con `--eecc` (repetible) — solo una cuenta por empresa
 puede ser `principal`.
+
+### Empresas sin cuenta bancaria propia (`paga_comprobantes_de`)
+
+Caso de negocio real (verificado jul-2026): una razón social del negocio
+**factura pero no tiene cuenta bancaria propia** — sus compras las paga
+otra empresa del mismo negocio, desde la cuenta de ESA otra empresa.
+ILLAWARA E.I.R.L. es ese caso: 8 comprobantes por S/7,024.01
+(`CLIENTE_RUC=20614321734` en el Sheet contable, proveedores ULTRAFRIO,
+APUDEX y PROGRAS) que EL TEMPLO pagó desde su propio banco. Sin este
+mecanismo, esos 8 comprobantes quedan invisibles para cualquier
+conciliación: no tienen cuenta propia contra la cual cruzar, y si el CSV
+de EL TEMPLO no los incluye, los 9 cargos correspondientes del banco de EL
+TEMPLO (S/7,824 en total) salen marcados SIN COMPROBANTE aunque el gasto
+sí esté registrado en el Sheet contable.
+
+La solución vive enteramente del lado del CSV que `conciliar.py` arma
+para el motor — **el motor vendorizado no se toca**, sigue conociendo solo
+una empresa por corrida:
+
+- La empresa que **paga** declara `paga_comprobantes_de: [<nombre_corto de
+  la que factura sin cuenta>]` en su entrada de `conciliacion.empresas`
+  (ver `config.yaml`, entrada de EL TEMPLO, y "Paso 3" de `ONBOARDING.md`).
+- La empresa que **factura sin cuenta** aparece en `conciliacion.empresas`
+  SIN la clave `cuentas` (así queda registrada, pero no conciliable por sí
+  sola).
+- `validar_config_conciliacion()` (en `conciliar.py`, corre al inicio de
+  `main()`, antes de tocar Drive/Sheets) hace imposibles las dos formas en
+  que esta declaración podría quedar mal en silencio: que el nombre
+  referido no exista en `conciliacion.empresas` (typo), o que SÍ tenga
+  `cuentas` propias (lo que duplicaría sus comprobantes: una vez en su
+  propia conciliación, otra vez en la de quien la paga).
+- Intentar conciliar directamente la empresa sin cuenta
+  (`--empresa ILLAWARA`) no llega a tocar Drive: `main()` corta antes con
+  un mensaje que dice quién sí la concilia (`--empresa "EL TEMPLO"`).
+- `filtrar_y_escribir_csv()` incluye en el CSV, además de las filas propias,
+  las filas cuya columna `EMPRESA` sea una de las listadas en
+  `paga_comprobantes_de`. **Todas** esas filas —propias y ajenas— salen con
+  `EMPRESA` reescrita al `nombre_motor` de quien concilia (nunca al
+  `nombre_corto` de la empresa que facturó): el motor filtra internamente
+  con `EMP_KEY not in norm(row['EMPRESA'])` (`build_conciliacion.py:90` y
+  `:454`), así que una fila que saliera con `"ILLAWARA"` se descartaría en
+  silencio.
+- **Trazabilidad**: para que un contador no lea en silencio una compra de
+  ILLAWARA como si fuera de EL TEMPLO, cada fila que entra por
+  `paga_comprobantes_de` lleva la marca en DOS lugares, a propósito:
+  - `SERIE_NUMERO` se antepone con `[FACT. A ILLAWARA]` (ej.
+    `"F001-00102426 [FACT. A ILLAWARA]"`). Es el único campo de la fila
+    que el motor sí usa y que sobrevive intacto hasta el `.xlsx`
+    (`n_comprobante = m.get('SERIE_NUMERO', '')`, sin participar del cruce
+    mismo, que usa TOTAL/fecha/PROVEEDOR) — es donde un contador mira para
+    confirmar un cruce.
+  - `OBSERVACIONES` recibe una nota completa explicando el porqué,
+    **concatenada** a cualquier nota que ya trajera la fila (nunca la
+    pisa). El motor nunca lee esta columna del CSV, así que no sustituye a
+    la marca de `SERIE_NUMERO` — es un respaldo para quien audite el CSV
+    intermedio o el Sheet contable de origen.
+- Sin `paga_comprobantes_de` (el caso de INSTITUCION, o de cualquier
+  negocio de un solo RUC), el comportamiento es exactamente el de antes:
+  cero cambios.
 
 ### Reporte de egresos de caja y caja chica
 
@@ -275,7 +351,7 @@ formato (también en "Trampas conocidas").
 `config.yaml`, nunca hardcodeada en el motor), en vez del fondo fijo de
 S/500 por local que regía hasta jun-2026 (`FONDO_CAJA_CHICA` en
 `build_conciliacion.py`). Sin `--egresos` —ni override manual ni nada en
-`CONCILIACION/<mes>/EGRESOS/` de Drive—, `conciliar.py` no pasa el flag y
+`CONCILIACION/<mes>/EGRESOS/<empresa>/` de Drive—, `conciliar.py` no pasa el flag y
 el motor mantiene el comportamiento viejo (fondo fijo + boletas rendidas
 del CSV de comprobantes) sin cambios.
 
@@ -488,3 +564,20 @@ final del propio estado de cuenta — y el mismo conteo de conciliación:
   normalizar. Ahora una fecha no reconocida devuelve `(None, None)` y la
   fila va a `filas_ignoradas` en vez de escribirse: mismo criterio de
   "nunca fallar en silencio" que ya usa el resto del sistema.
+- **`EGRESOS/` es una sola carpeta por mes, compartida por todas las
+  empresas — por eso el reporte va en una subcarpeta por empresa, nunca
+  suelto.** `descargar_egresos()` se lleva TODO lo que encuentre en la
+  carpeta que se le pase, sin filtrar por empresa (a diferencia de
+  `descargar_eecc()`, que sí filtra por el `numero` de cuenta). Verificado
+  con los reportes reales de julio 2026: `Egresos (18).xls` (local LINCE,
+  61 gastos, S/2,597.60) es de EL TEMPLO, y `Egresos (19).xls` (local
+  MIRAFLORES, 171 gastos, S/5,114.22) es de INSTITUCION. Si ambos se
+  hubieran subido sueltos a la misma carpeta `EGRESOS/`, la conciliación de
+  EL TEMPLO se habría tragado los 171 gastos de MIRAFLORES en su hoja CAJA
+  CHICA, y la de INSTITUCION los de LINCE — sin ningún error visible, con
+  el mismo riesgo silencioso del `EMP_KEY` de arriba pero del lado de
+  Drive en vez del CSV. Por eso `conciliar.py` crea (idempotente, con
+  `asegurar_carpeta`) `EGRESOS/<nombre_corto>/` y descarga solo de ahí; un
+  archivo que quede suelto directamente en `EGRESOS/` (layout viejo, de
+  antes de este cambio) se ignora siempre con una advertencia en el log
+  (`advertir_egresos_sueltos()`), nunca en silencio.

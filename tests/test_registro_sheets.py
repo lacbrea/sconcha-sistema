@@ -86,8 +86,21 @@ class _FakeValues:
     def __init__(self, store: dict[str, list[list]]):
         self._store = store
         self._pendiente = None
+        # Registro de cada llamada a get(), con sus kwargs de renderizado
+        # tal cual los recibio: permite a un test verificar que
+        # claves_existentes() pide UNFORMATTED_VALUE (ver
+        # test_claves_existentes_via_servicio_fake_pide_unformatted_value).
+        self.llamadas_get: list[dict] = []
 
-    def get(self, spreadsheetId, range):  # noqa: A002 - firma igual a la API real
+    def get(self, spreadsheetId, range, valueRenderOption=None, dateTimeRenderOption=None):  # noqa: A002, N803 - firma igual a la API real
+        self.llamadas_get.append(
+            {
+                "spreadsheetId": spreadsheetId,
+                "range": range,
+                "valueRenderOption": valueRenderOption,
+                "dateTimeRenderOption": dateTimeRenderOption,
+            }
+        )
         self._pendiente = ("get", _clave_store(spreadsheetId, range))
         return self
 
@@ -129,6 +142,9 @@ class FakeServicioSheets:
     def __init__(self):
         self.store: dict[str, list[list]] = {}
         self._values = _FakeValues(self.store)
+        # Alias publico para que los tests inspeccionen las llamadas a
+        # get() sin tocar el atributo "privado" _values.
+        self.llamadas_get = self._values.llamadas_get
         self.hojas: dict[str, set[str]] = {}
         self._pendiente_meta = None
 
@@ -257,6 +273,62 @@ def test_columna_link_drive_no_link_comprobante():
 
 
 # ---------------------------------------------------------------------------
+# Bug real: TOTAL con coma decimal (Sheet en espanol). Verificado 2026-08-23
+# contra el Sheet real (1HBrk8CDMLNCbzahWjG-HSvY4q13OnP0QZWUClbEtIxo, 'Hoja
+# 1'): FORMATTED_VALUE devuelve TOTAL '8,4' (coma decimal); el _clave()
+# original hacia `.replace(",", "")` pensando que la coma siempre es
+# separador de miles, y sobre '8,4' eso da float('84') = 84.0 en vez de 8.4.
+# La deteccion de duplicados fallaba en silencio para cualquier importe con
+# decimales (fila real duplicada: TAI LOY, F581-0280271, TOTAL 8.4).
+# ---------------------------------------------------------------------------
+def test_clave_coma_decimal_no_se_infla_x10():
+    """El caso exacto del bug: '8,4' debe dar 8.40, no 84.00."""
+    assert registro_sheets._clave("20100049181", "F581-0280271", "8,4") == "20100049181|F581-0280271|8.40"
+
+
+def test_clave_coma_decimal_con_dos_cifras_no_se_infla_x100():
+    assert registro_sheets._clave("123", "S1", "118,00") == "123|S1|118.00"
+
+
+def test_clave_separador_de_miles_formato_es_pe_no_se_rompe():
+    """Punto de miles + coma decimal ('1.507,16', formato es-PE): sigue
+    dando el monto correcto, no una fila basura ni un monto inflado."""
+    assert registro_sheets._clave("123", "S1", "1.507,16") == "123|S1|1507.16"
+
+
+def test_clave_separador_de_miles_formato_en_us_no_se_rompe():
+    """Coma de miles + punto decimal ('1,507.16', formato en-US): tambien
+    debe seguir funcionando (por si algun dato llega en ese formato)."""
+    assert registro_sheets._clave("123", "S1", "1,507.16") == "123|S1|1507.16"
+
+
+def test_clave_solo_coma_de_miles_sin_decimales_no_se_rompe():
+    """Una sola coma pero con 3+ cifras despues ('1,507'): sigue siendo
+    separador de miles, como en el comportamiento original."""
+    assert registro_sheets._clave("123", "S1", "1,507") == "123|S1|1507.00"
+
+
+def test_clave_monto_redondo_sigue_funcionando():
+    """Caso que 'funcionaba de casualidad' segun el reporte: un monto sin
+    decimales no cambia de comportamiento."""
+    assert registro_sheets._clave("123", "S1", "545") == "123|S1|545.00"
+
+
+def test_clave_total_como_numero_nativo_float():
+    """UNFORMATTED_VALUE devuelve TOTAL como numero de Python (float), no
+    como texto: _clave() debe seguir funcionando igual."""
+    assert registro_sheets._clave("123", "S1", 8.4) == "123|S1|8.40"
+
+
+def test_clave_total_csv_dry_run_con_punto_decimal_no_se_rompe():
+    """El camino de --dry-run lee salida/contable.csv, escrito por esta
+    misma clase con punto decimal (str() de Python, nunca coma): confirma
+    que la nueva logica de _clave() no reinterpreta ese punto como
+    separador de miles."""
+    assert registro_sheets._clave("123", "S1", "1507.16") == "123|S1|1507.16"
+
+
+# ---------------------------------------------------------------------------
 # dry_run: CSV
 # ---------------------------------------------------------------------------
 def test_dry_run_escribe_csvs_contable_y_detalle(tmp_path):
@@ -379,6 +451,71 @@ def test_claves_existentes_via_servicio_fake(tmp_path):
     registro.escribir(_comprobante_con_items(), empresa="SCONCHA", local="MIRAFLORES", link_drive="", archivo="a.pdf")
 
     assert registro.claves_existentes() == {"20123456789|F001-1234|118.00"}
+
+
+def test_claves_existentes_pide_unformatted_value(tmp_path):
+    """claves_existentes() debe leer el sheet contable con
+    valueRenderOption='UNFORMATTED_VALUE' y dateTimeRenderOption=
+    'FORMATTED_STRING' -misma combinacion que leer_filas_sheet_contable() en
+    conciliar.py-, no con el default (FORMATTED_VALUE), que devuelve TOTAL
+    formateado al idioma del Sheet (coma decimal) y rompe la deteccion de
+    duplicados."""
+    fake = FakeServicioSheets()
+    config = {
+        "dry_run": False,
+        "catalogo_csv": str(_catalogo_csv_minimo(tmp_path)),
+        "sheets": {"contable": "SHEET_CONTABLE", "detalle": "SHEET_DETALLE"},
+    }
+    registro = Registro(config, servicio=fake)
+
+    registro.claves_existentes()
+
+    llamadas = [l for l in fake.llamadas_get if l["spreadsheetId"] == "SHEET_CONTABLE"]
+    assert llamadas, "claves_existentes() no llamo a values().get() sobre el sheet contable"
+    assert llamadas[-1]["valueRenderOption"] == "UNFORMATTED_VALUE"
+    assert llamadas[-1]["dateTimeRenderOption"] == "FORMATTED_STRING"
+
+
+def test_claves_existentes_detecta_duplicado_con_total_formateado_coma_decimal(tmp_path):
+    """Reproduce de punta a punta el bug real (TAI LOY, F581-0280271, TOTAL
+    8.4 duplicado en el Sheet real, verificado 2026-08-23): si en el sheet
+    contable TOTAL viene como '8,4' (coma decimal, tal como lo devolveria
+    FORMATTED_VALUE en un Sheet en espanol), claves_existentes() debe seguir
+    calculando la clave correcta (...|8.40, no ...|84.00) y un comprobante
+    nuevo con el mismo RUC/SERIE/TOTAL debe detectarse como ya registrado
+    -exactamente el chequeo que hace procesar.py antes de volver a
+    registrarlo."""
+    fake = FakeServicioSheets()
+    fila = ["" for _ in COLUMNAS_CONTABLE]
+    fila[COLUMNAS_CONTABLE.index("RUC")] = "20100049181"
+    fila[COLUMNAS_CONTABLE.index("SERIE_NUMERO")] = "F581-0280271"
+    fila[COLUMNAS_CONTABLE.index("TOTAL")] = "8,4"
+    fake.store["SHEET_CONTABLE"] = [COLUMNAS_CONTABLE, fila]
+
+    config = {
+        "dry_run": False,
+        "catalogo_csv": str(_catalogo_csv_minimo(tmp_path)),
+        "sheets": {"contable": "SHEET_CONTABLE", "detalle": "SHEET_DETALLE"},
+    }
+    registro = Registro(config, servicio=fake)
+
+    claves = registro.claves_existentes()
+
+    assert claves == {"20100049181|F581-0280271|8.40"}
+
+    nuevo = ComprobanteExtraido(
+        origen="pdf",
+        confianza=0.9,
+        proveedor_ruc="20100049181",
+        proveedor_razon_social="TAI LOY",
+        tipo_documento="FACTURA",
+        serie_numero="F581-0280271",
+        fecha_emision="2026-07-05",
+        condicion="contado",
+        total=8.4,
+        items=[],
+    )
+    assert nuevo.clave() in claves  # se detecta como duplicado: no se vuelve a registrar
 
 
 # ---------------------------------------------------------------------------
