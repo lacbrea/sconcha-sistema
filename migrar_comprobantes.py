@@ -90,6 +90,13 @@ EMPRESA_DESTINO = "EL_TEMPLO"
 PREFIJOS_IGNORADOS = ("~$", ".")
 NOMBRES_IGNORADOS = {"desktop.ini", "thumbs.db"}
 
+# Extensiones que procesar.py sabe leer. Solo aplica al modo --a-buzon: un
+# archivo que el pipeline no puede procesar termina en 02_REVISAR con un
+# motivo, asi que se filtra ANTES de subirlo en vez de ensuciar la carpeta de
+# revision. El modo archivo NO filtra por extension: ahi el objetivo es
+# preservar el archivo historico completo, sea lo que sea.
+EXTENSIONES_BUZON = {".pdf", ".xml", ".jpg", ".jpeg", ".png", ".heic"}
+
 # -----------------------------------------------------------------------------
 # Mapa de meses: EXPLÍCITO, no por parseo. El origen mezcla nombre completo,
 # abreviatura ("OCT", "NOV", "DIC") y grafía peruana ("SETIEMBRE", no
@@ -260,7 +267,10 @@ def recorrer_arbol_plano(raiz: pathlib.Path) -> list[pathlib.Path]:
     cuyo nombre no es un mes válido (el caso real: "...\\2026\\JULIO\\
     FACTURAS", una carpeta hoja) no aborta nada. Aplica los mismos filtros
     de artefactos que recorrer_arbol_origen (PREFIJOS_IGNORADOS,
-    NOMBRES_IGNORADOS), para no subir desktop.ini ni similares al buzón.
+    NOMBRES_IGNORADOS), y ademas descarta las extensiones que procesar.py no
+    sabe leer (EXTENSIONES_BUZON): subir un .docx al buzon solo lograria que
+    termine en 02_REVISAR con un motivo. Lo descartado se registra en el log,
+    nunca en silencio.
     """
     if not raiz.exists():
         raise FileNotFoundError(f"No existe la carpeta de origen: {raiz}")
@@ -272,6 +282,11 @@ def recorrer_arbol_plano(raiz: pathlib.Path) -> list[pathlib.Path]:
         if ruta.name.lower() in NOMBRES_IGNORADOS:
             continue
         if ruta.name.startswith(PREFIJOS_IGNORADOS):
+            continue
+        if ruta.suffix.lower() not in EXTENSIONES_BUZON:
+            logger.warning(
+                "%s: extension no soportada por procesar.py, no se sube al buzon.", ruta.name
+            )
             continue
         archivos.append(ruta)
     return archivos

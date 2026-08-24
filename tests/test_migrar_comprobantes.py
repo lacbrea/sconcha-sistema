@@ -541,6 +541,42 @@ def test_recorrer_arbol_plano_encuentra_archivos_sin_interpretar_carpetas(tmp_pa
     assert nombres == {"f1.pdf", "f2.pdf", "f3.pdf"}
 
 
+def test_recorrer_arbol_plano_descarta_extensiones_que_procesar_no_lee(tmp_path):
+    """Un archivo que procesar.py no sabe leer no debe llegar al buzon: solo
+    lograria terminar en 02_REVISAR con un motivo. Se descarta antes de subir
+    y queda advertido en el log, nunca en silencio."""
+    raiz = tmp_path / "FACTURAS"
+    raiz.mkdir(parents=True)
+    for nombre in ("f1.pdf", "f2.XML", "foto.JPG", "boleta.heic"):
+        (raiz / nombre).write_bytes(b"ok")
+    for nombre in ("contrato.docx", "respaldo.zip", "notas.txt"):
+        (raiz / nombre).write_bytes(b"no")
+
+    # Handler propio y nivel restaurado a mano: este archivo silencia el logger
+    # del modulo en CRITICAL (ver arriba), asi que ni caplog ni un handler
+    # suelto verian nada. Se baja el nivel solo durante la llamada.
+    capturados: list[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            capturados.append(record.getMessage())
+
+    handler = _Handler(level=logging.WARNING)
+    nivel_previo = mc.logger.level
+    mc.logger.setLevel(logging.WARNING)
+    mc.logger.addHandler(handler)
+    try:
+        archivos = mc.recorrer_arbol_plano(raiz)
+    finally:
+        mc.logger.removeHandler(handler)
+        mc.logger.setLevel(nivel_previo)
+
+    assert {a.name for a in archivos} == {"f1.pdf", "f2.XML", "foto.JPG", "boleta.heic"}
+    advertidos = " ".join(capturados)
+    for descartado in ("contrato.docx", "respaldo.zip", "notas.txt"):
+        assert descartado in advertidos
+
+
 def test_recorrer_arbol_plano_aborta_si_no_existe_el_origen(tmp_path):
     import pytest
 
