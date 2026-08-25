@@ -51,6 +51,7 @@ td.papel { font-size: 9.6pt; }
 }
 tr.nada th, tr.nada td { background: #f0f0f0; }
 
+.nota-tabla { margin: -3mm 0 5mm; font-size: 9.2pt; }
 .callout {
   border: 3px solid #000; padding: 4mm 4.5mm; margin: 0 0 5mm;
   display: grid; grid-template-columns: 1fr; gap: 1.5mm;
@@ -95,19 +96,19 @@ strong { font-weight: 700; }
   <tbody>
     <tr>
       <th>Con efectivo de la caja chica</th>
-      <td class="ejemplos">Verduras de Caquetá, palta, pollo, el taxi de la compra, el queque de cumpleaños</td>
+      <td class="ejemplos">El taxi a Caquetá, la palta y el pollo del día, el tíner, el queque de cumpleaños</td>
       <td class="reporte"><span class="si">Sí</span><span class="detalle">Anota fecha, motivo, a quién se le dio y monto.</span></td>
       <td class="papel">La boleta va a <span class="carpeta">NOTAS_DE_VENTA</span></td>
     </tr>
     <tr>
-      <th>Por transferencia, y te dan factura</th>
+      <th>Por transferencia, <u>y te dan factura</u></th>
       <td class="ejemplos">Tai Loy, Hortifrut, Wilton's, Dolmer, Mogofran</td>
       <td class="reporte"><span class="no">No</span></td>
       <td class="papel">La factura va a <span class="carpeta">FACTURAS</span><span class="detalle">Si el proveedor manda un archivo XML por correo, ese también.</span></td>
     </tr>
     <tr>
-      <th>A alguien que no tiene RUC</th>
-      <td class="ejemplos">La compra de pescado</td>
+      <th>Por transferencia, <u>y NO te dan factura</u></th>
+      <td class="ejemplos"><strong>El pescado</strong> y <strong>las verduras de Caquetá</strong></td>
       <td class="reporte"><span class="no">No</span></td>
       <td class="papel">La liquidación de compra va a <span class="carpeta">LIQUIDACIONES</span></td>
     </tr>
@@ -125,10 +126,11 @@ strong { font-weight: 700; }
     </tr>
   </tbody>
 </table>
+<p class="nota-tabla">¿No sabes en cuál va? Ponlo en <span class="carpeta">OTROS</span> y avisa. Es mejor que quedarse sin subir.</p>
 
 <div class="callout">
-  <h2>La liquidación del pescado</h2>
-  <p>Es el papel que más falta hoy. <strong>Ya se emite</strong> — el problema es que nadie la sube. Si la tienes en la mano, va a <span class="carpeta">LIQUIDACIONES</span> el mismo día, igual que una factura.</p>
+  <h2>Lo que se paga sin factura</h2>
+  <p><strong>El pescado y las verduras de Caquetá se pagan por transferencia y no dan factura.</strong> Lo que corresponde es la <strong>liquidación de compra</strong>, y va a <span class="carpeta">LIQUIDACIONES</span> el mismo día. Son los papeles que más faltan hoy. <strong>Si te mandan sin nada, avisa a administración ese mismo día</strong> — no lo dejes pasar.</p>
 </div>
 
 <div class="reglas">
@@ -137,8 +139,8 @@ strong { font-weight: 700; }
     <p>El mismo día, uno por comprobante. Juntar la semana es como se pierden.</p>
   </div>
   <div class="regla">
-    <h3>Si no sabes cuál es</h3>
-    <p>Ponlo en <span class="carpeta">OTROS</span> y avisa. Es mejor que se quede sin subir.</p>
+    <h3>Si no te dan papel</h3>
+    <p>Avisa el mismo día. Un gasto sin comprobante no se puede sustentar después.</p>
   </div>
   <div class="regla">
     <h3>Que se lea el total</h3>
