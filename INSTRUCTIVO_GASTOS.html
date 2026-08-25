@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Donde se registra cada gasto</title>
+<style>
+@page { size: A4 portrait; margin: 12mm 12mm 10mm; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: "Segoe UI", Arial, Helvetica, sans-serif;
+  color: #000; background: #fff;
+  font-size: 10.4pt; line-height: 1.35;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+header { border-bottom: 3px solid #000; padding-bottom: 5mm; margin-bottom: 5mm; }
+.negocio {
+  font-size: 8.5pt; letter-spacing: .18em; text-transform: uppercase;
+  font-weight: 600; margin: 0 0 2mm;
+}
+h1 {
+  font-size: 25pt; line-height: 1.02; margin: 0; font-weight: 700;
+  letter-spacing: -.015em; text-transform: uppercase;
+}
+.bajada { margin: 3mm 0 0; font-size: 10.5pt; max-width: 155mm; }
+
+table { width: 100%; border-collapse: collapse; margin: 0 0 5mm; }
+caption {
+  caption-side: top; text-align: left; font-weight: 700; font-size: 9pt;
+  letter-spacing: .12em; text-transform: uppercase; padding-bottom: 2mm;
+}
+th, td { border: 1px solid #000; padding: 2.6mm 2.4mm; vertical-align: top; }
+thead th {
+  background: #000; color: #fff; font-size: 8.6pt; text-transform: uppercase;
+  letter-spacing: .06em; text-align: left;
+}
+tbody th {
+  text-align: left; font-size: 10.4pt; font-weight: 700; width: 40mm;
+  background: #f0f0f0;
+}
+td.ejemplos { font-size: 9.6pt; width: 52mm; }
+td.reporte { width: 34mm; font-size: 9.6pt; }
+td.papel { font-size: 9.6pt; }
+.si { display: block; font-weight: 700; text-transform: uppercase; }
+.no { display: block; font-weight: 700; text-transform: uppercase; color: #000; }
+.detalle { display: block; font-size: 8.6pt; margin-top: 1mm; }
+.carpeta {
+  font-weight: 700; font-family: Consolas, "Courier New", monospace;
+  font-size: 9.4pt; border: 1.5px solid #000; padding: .3mm 1.4mm;
+  white-space: nowrap;
+}
+tr.nada th, tr.nada td { background: #f0f0f0; }
+
+.callout {
+  border: 3px solid #000; padding: 4mm 4.5mm; margin: 0 0 5mm;
+  display: grid; grid-template-columns: 1fr; gap: 1.5mm;
+}
+.callout h2 {
+  margin: 0; font-size: 12.5pt; text-transform: uppercase; letter-spacing: .04em;
+}
+.callout p { margin: 0; font-size: 10pt; }
+
+.reglas { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4mm; }
+.regla { border-top: 2px solid #000; padding-top: 2.5mm; }
+.regla h3 {
+  margin: 0 0 1.2mm; font-size: 9pt; text-transform: uppercase;
+  letter-spacing: .08em;
+}
+.regla p { margin: 0; font-size: 9.4pt; }
+footer {
+  margin-top: 5mm; border-top: 1px solid #000; padding-top: 2.5mm;
+  font-size: 8.6pt;
+}
+strong { font-weight: 700; }
+</style>
+</head>
+<body>
+
+<header>
+  <p class="negocio">S'Concha &middot; Lince y Miraflores</p>
+  <h1>Dónde se registra<br>cada gasto</h1>
+  <p class="bajada">Un mismo gasto puede tener que anotarse en <strong>dos sitios</strong>: en el reporte de egresos del sistema, y en la carpeta de Drive donde va el papel. Lo que decide cuál es <strong>cómo se pagó</strong> y <strong>qué papel te dieron</strong>.</p>
+</header>
+
+<table>
+  <caption>Busca tu caso en la primera columna</caption>
+  <thead>
+    <tr>
+      <th>Cómo se pagó</th>
+      <th>Ejemplos</th>
+      <th>¿Va al reporte de egresos?</th>
+      <th>¿Dónde va el papel?</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>Con efectivo de la caja chica</th>
+      <td class="ejemplos">Verduras de Caquetá, palta, pollo, el taxi de la compra, el queque de cumpleaños</td>
+      <td class="reporte"><span class="si">Sí</span><span class="detalle">Anota fecha, motivo, a quién se le dio y monto.</span></td>
+      <td class="papel">La boleta va a <span class="carpeta">NOTAS_DE_VENTA</span></td>
+    </tr>
+    <tr>
+      <th>Por transferencia, y te dan factura</th>
+      <td class="ejemplos">Tai Loy, Hortifrut, Wilton's, Dolmer, Mogofran</td>
+      <td class="reporte"><span class="no">No</span></td>
+      <td class="papel">La factura va a <span class="carpeta">FACTURAS</span><span class="detalle">Si el proveedor manda un archivo XML por correo, ese también.</span></td>
+    </tr>
+    <tr>
+      <th>A alguien que no tiene RUC</th>
+      <td class="ejemplos">La compra de pescado</td>
+      <td class="reporte"><span class="no">No</span></td>
+      <td class="papel">La liquidación de compra va a <span class="carpeta">LIQUIDACIONES</span></td>
+    </tr>
+    <tr>
+      <th>Servicios del local</th>
+      <td class="ejemplos">Luz, agua, internet, teléfono</td>
+      <td class="reporte"><span class="no">No</span></td>
+      <td class="papel">El recibo va a <span class="carpeta">OTROS</span></td>
+    </tr>
+    <tr class="nada">
+      <th>Planilla, impuestos, propinas y préstamos</th>
+      <td class="ejemplos">Sueldos, SUNAT, EsSalud</td>
+      <td class="reporte"><span class="no">No</span></td>
+      <td class="papel">No va al buzón. Lo maneja administración: <strong>no subas nada</strong>.</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout">
+  <h2>La liquidación del pescado</h2>
+  <p>Es el papel que más falta hoy. <strong>Ya se emite</strong> — el problema es que nadie la sube. Si la tienes en la mano, va a <span class="carpeta">LIQUIDACIONES</span> el mismo día, igual que una factura.</p>
+</div>
+
+<div class="reglas">
+  <div class="regla">
+    <h3>Si hay papel, se sube</h3>
+    <p>El mismo día, uno por comprobante. Juntar la semana es como se pierden.</p>
+  </div>
+  <div class="regla">
+    <h3>Si no sabes cuál es</h3>
+    <p>Ponlo en <span class="carpeta">OTROS</span> y avisa. Es mejor que se quede sin subir.</p>
+  </div>
+  <div class="regla">
+    <h3>Que se lea el total</h3>
+    <p>Foto derecha, con luz, el papel completo. Si salió movida, tómala de nuevo.</p>
+  </div>
+</div>
+
+<footer>
+  La carpeta de <strong>OneDrive</strong> ya no se revisa: lo que se deje ahí no entra a la contabilidad.
+  &nbsp;&middot;&nbsp; ¿Dudas con un gasto raro? Pregunta antes de anotarlo mal.
+</footer>
+
+</body>
+</html>
