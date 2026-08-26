@@ -283,6 +283,55 @@ def test_resolver_ruc_empresa_busca_en_config_empresas_no_en_conciliacion_empres
     assert conciliar.resolver_ruc_empresa(config, "NO EXISTE") is None
 
 
+def test_resolver_carpeta_buzon_correo_empresa_presente_usa_su_carpeta_facturas():
+    """Con buzon_empresas configurado, la empresa presente devuelve el id de
+    su propia carpeta 'facturas', no la raiz del buzon."""
+    config = {
+        "drive": {
+            "carpetas": {
+                "buzon": "RAIZ_BUZON",
+                "buzon_empresas": {
+                    "EL TEMPLO": {"facturas": "FACTURAS_EL_TEMPLO", "otros": "OTROS_EL_TEMPLO"},
+                    "INSTITUCION": {"facturas": "FACTURAS_INSTITUCION"},
+                },
+            }
+        }
+    }
+    assert conciliar.resolver_carpeta_buzon_correo(config, "EL TEMPLO") == "FACTURAS_EL_TEMPLO"
+    assert conciliar.resolver_carpeta_buzon_correo(config, "INSTITUCION") == "FACTURAS_INSTITUCION"
+
+
+def test_resolver_carpeta_buzon_correo_empresa_ausente_cae_a_la_raiz(caplog):
+    """Si buzon_empresas existe pero no tiene entrada para la empresa pedida,
+    cae a la raiz del buzon y deja una advertencia (red de seguridad)."""
+    config = {
+        "drive": {
+            "carpetas": {
+                "buzon": "RAIZ_BUZON",
+                "buzon_empresas": {"EL TEMPLO": {"facturas": "FACTURAS_EL_TEMPLO"}},
+            }
+        }
+    }
+    with caplog.at_level(logging.WARNING):
+        assert conciliar.resolver_carpeta_buzon_correo(config, "ILLAWARA") == "RAIZ_BUZON"
+    assert "ILLAWARA" in caplog.text
+
+
+def test_resolver_carpeta_buzon_correo_sin_buzon_empresas_cae_a_la_raiz():
+    """Sin buzon_empresas configurado (negocio de una sola empresa que sigue
+    con buzon_tipos), cae a la raiz del buzon sin advertencia."""
+    config = {"drive": {"carpetas": {"buzon": "RAIZ_BUZON"}}}
+    assert conciliar.resolver_carpeta_buzon_correo(config, "EL TEMPLO") == "RAIZ_BUZON"
+
+
+def test_resolver_carpeta_buzon_correo_config_mutilado_no_lanza():
+    """Config vacio o con secciones faltantes (drive, carpetas) devuelve None
+    en vez de lanzar."""
+    assert conciliar.resolver_carpeta_buzon_correo({}, "EL TEMPLO") is None
+    assert conciliar.resolver_carpeta_buzon_correo({"drive": {}}, "EL TEMPLO") is None
+    assert conciliar.resolver_carpeta_buzon_correo({"drive": {"carpetas": {}}}, "EL TEMPLO") is None
+
+
 def test_construir_argumentos_motor_none_cuando_falta_principal_o_constancias():
     argumentos = conciliar.construir_argumentos_motor(
         eecc_principal=None,

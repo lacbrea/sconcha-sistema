@@ -153,6 +153,37 @@ def resolver_ruc_empresa(config: dict, nombre_corto: str) -> str | None:
     return None
 
 
+def resolver_carpeta_buzon_correo(config: dict, nombre_corto: str) -> str | None:
+    """Devuelve la carpeta de Drive donde correo_gmail debe dejar los
+    comprobantes de proveedores de 'nombre_corto' (destino BUZON de las
+    reglas de correo). El buzon 00_BUZON ya esta separado por empresa
+    (config['drive']['carpetas']['buzon_empresas'][nombre_corto]['facturas']);
+    las carpetas planas de la raiz se borraron, asi que un adjunto que caiga
+    ahi entra por el camino de compatibilidad TIPO_RAIZ_BUZON de procesar.py
+    (se procesa igual, pero con una advertencia por archivo y sin empresa de
+    carpeta). Orden de precedencia:
+      1. la carpeta 'facturas' de la empresa en buzon_empresas, si existe;
+      2. si no, la raiz de 00_BUZON (config['drive']['carpetas']['buzon']) —
+         el caso de un negocio de una sola empresa que sigue con
+         buzon_tipos, y tambien la red de seguridad si a una empresa le
+         falta su entrada. Tolera que falte 'drive', 'carpetas',
+         'buzon_empresas' o la propia empresa: nunca lanza, devuelve None si
+         no hay nada configurado."""
+    carpetas = (config.get("drive") or {}).get("carpetas") or {}
+    buzon_empresas = carpetas.get("buzon_empresas") or {}
+    entrada_empresa = buzon_empresas.get(nombre_corto) or {}
+    carpeta_facturas = entrada_empresa.get("facturas")
+    if carpeta_facturas:
+        return carpeta_facturas
+    if buzon_empresas:
+        logger.warning(
+            "No hay carpeta 'facturas' en buzon_empresas para '%s': el correo de "
+            "esta empresa ira a la raiz del buzon (00_BUZON).",
+            nombre_corto,
+        )
+    return carpetas.get("buzon")
+
+
 def directorio_trabajo(nombre_corto: str, mes: str) -> pathlib.Path:
     return pathlib.Path("salida") / "conciliacion" / nombre_corto / mes
 
@@ -942,10 +973,14 @@ def main(argv: list[str] | None = None) -> int:
         try:
             import correo_gmail
 
+            # BUZON apunta a la carpeta de facturas de la empresa que se esta
+            # conciliando: esa carpeta SOLO rellena, si el comprobante trae
+            # RUC de cliente gana el RUC (ver resolver_empresa_con_carpeta en
+            # procesar.py).
             carpetas_correo = {
                 "EECC": carpeta_eecc_id,
                 "CONSTANCIAS": carpeta_constancias_id,
-                "BUZON": (config.get("drive", {}).get("carpetas") or {}).get("buzon"),
+                "BUZON": resolver_carpeta_buzon_correo(config, empresa_cfg["nombre_corto"]),
             }
             resumen_correo = correo_gmail.descargar(
                 config, almacen, carpetas_correo, servicio=None, dry_run=args.dry_run
