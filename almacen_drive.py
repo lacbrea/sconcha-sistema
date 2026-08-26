@@ -184,13 +184,17 @@ class AlmacenDrive:
         return resultado.get("webViewLink", "")
 
     # -------------------------------------------------------------------
-    def asegurar_carpeta(self, nombre: str, padre_id: str | None = None) -> str:
+    def buscar_carpeta(self, nombre: str, padre_id: str | None = None) -> str | None:
         """Devuelve el id de la carpeta 'nombre' dentro de 'padre_id' (o de
-        'root' -> "Mi unidad" si padre_id es None), creándola si no existe.
+        'root' -> "Mi unidad" si padre_id es None), o None si no existe.
 
-        Idempotente: busca por nombre+padre antes de crear, así que correr
-        esto dos veces siempre devuelve el mismo id sin duplicar la
-        carpeta.
+        A diferencia de buscar_por_nombre() (que ignora carpetas a
+        propósito, porque existe para archivos), esta busca únicamente
+        carpetas y nunca crea nada: existe para quien necesita saber si una
+        carpeta ya está ahí sin arriesgarse a crearla de paso, como la
+        detección de carpetas planas huérfanas en 00_BUZON (ver
+        procesar.py -> construir_planes_enrutados), que antes de esto no
+        tenía forma de mirar sin también crear.
         """
         padre_efectivo = padre_id or "root"
         query = (
@@ -199,8 +203,21 @@ class AlmacenDrive:
         )
         resp = self._servicio.files().list(q=query, fields="files(id, name)", pageSize=5).execute()
         encontrados = resp.get("files", [])
-        if encontrados:
-            return encontrados[0]["id"]
+        return encontrados[0]["id"] if encontrados else None
+
+    # -------------------------------------------------------------------
+    def asegurar_carpeta(self, nombre: str, padre_id: str | None = None) -> str:
+        """Devuelve el id de la carpeta 'nombre' dentro de 'padre_id' (o de
+        'root' -> "Mi unidad" si padre_id es None), creándola si no existe.
+
+        Idempotente: busca por nombre+padre antes de crear (con
+        buscar_carpeta), así que correr esto dos veces siempre devuelve el
+        mismo id sin duplicar la carpeta.
+        """
+        padre_efectivo = padre_id or "root"
+        encontrada = self.buscar_carpeta(nombre, padre_efectivo)
+        if encontrada is not None:
+            return encontrada
 
         metadata = {"name": nombre, "mimeType": MIME_CARPETA, "parents": [padre_efectivo]}
         resultado = self._servicio.files().create(body=metadata, fields="id").execute()

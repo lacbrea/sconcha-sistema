@@ -11,7 +11,11 @@ Hace tres cosas, en orden, y es seguro correrlo varias veces (idempotente):
    carpeta CONCILIACION y guarda su id en conciliacion.carpeta. Si config.yaml
    trae drive.carpetas.buzon_tipos (opcional), crea además dentro de 00_BUZON
    las subcarpetas FACTURAS, NOTAS_DE_VENTA, LIQUIDACIONES y OTROS, y guarda
-   sus ids ahí mismo.
+   sus ids ahí mismo. Si en cambio trae drive.carpetas.buzon_empresas
+   (opcional, para negocios de varias empresas), crea dentro de 00_BUZON una
+   carpeta por empresa (mismo nombre que usa 01_PROCESADO) y dentro de cada
+   una las cuatro subcarpetas por tipo. 'buzon_tipos' y 'buzon_empresas' son
+   alternativas -no pueden convivir en el mismo config.yaml-.
 2. Crea los dos Google Sheets del negocio ("contable" y "detalle") con sus
    cabeceras, usando la cuenta de Google autenticada por auth_google.py. Si
    config.yaml ya trae un ID de Sheet configurado, verifica que siga siendo
@@ -77,6 +81,24 @@ BUZON_TIPOS = {
     "otros": "OTROS",
 }
 
+
+def _nombre_carpeta_empresa(nombre_corto: str) -> str:
+    """Nombre de carpeta de Drive para una empresa (ej. 'EL TEMPLO' ->
+    'EL_TEMPLO'), usado bajo drive.carpetas.buzon_empresas.
+
+    Duplicado deliberado, no importado, de procesar.nombre_empresa_carpeta()
+    (misma línea exacta: nombre_corto.strip().replace(' ', '_')). Es el mismo
+    criterio que arma la carpeta de una empresa en 01_PROCESADO, y las dos
+    convenciones tienen que coincidir siempre. No se importa desde
+    procesar.py porque procesar.py importa (a nivel de módulo)
+    extractores.modelo, que a su vez importa el SDK de anthropic: un import
+    pesado que --dry-run no necesita y que ya causó un problema en este repo
+    (ver el comentario sobre registro_sheets.py más abajo, mismo motivo por
+    el que se evitó ahí). Si nombre_empresa_carpeta() cambia en procesar.py,
+    replicar el cambio aquí.
+    """
+    return nombre_corto.strip().replace(" ", "_")
+
 # -----------------------------------------------------------------------------
 # Cabeceras de los dos Sheets del negocio. Fila 1 de cada spreadsheet.
 #
@@ -111,13 +133,66 @@ def cargar_config(ruta_config: pathlib.Path) -> dict:
         return yaml.safe_load(f)
 
 
+def _validar_buzon_empresas(config: dict) -> dict | None:
+    """Valida drive.carpetas.buzon_tipos vs. drive.carpetas.buzon_empresas y
+    devuelve el dict de buzon_empresas tal como está en config.yaml (o None
+    si la sección no existe).
+
+    Las dos secciones son formas alternativas de organizar 00_BUZON:
+    'buzon_tipos' (plano, una carpeta por tipo de documento) para un
+    negocio de una sola empresa, y 'buzon_empresas' (anidado, una carpeta
+    por empresa y dentro cuatro por tipo) para un negocio con varias
+    empresas. Que convivan las dos en el mismo config.yaml es un error de
+    configuración -no una preferencia que el sistema deba adivinar-, así
+    que aborta en vez de elegir una en silencio (mismo criterio que ya usa
+    este módulo en preparar_sheet(): un estado ambiguo se informa y se
+    corrige a mano, nunca se resuelve solo).
+
+    Cada nombre de empresa que aparezca en buzon_empresas tiene que existir
+    en config['empresas'][].nombre_corto: es el mismo campo que usa
+    resolver_empresa() en procesar.py y el que arma la carpeta en
+    01_PROCESADO, así que un nombre que no está ahí no tiene comprobantes
+    que vayan a caer en esa carpeta -casi siempre un typo- y aborta con
+    el mismo criterio que resolver_local() usa para local_por_defecto.
+    """
+    carpetas_cfg = ((config.get("drive") or {}).get("carpetas") or {})
+    buzon_tipos_cfg = carpetas_cfg.get("buzon_tipos")
+    buzon_empresas_cfg = carpetas_cfg.get("buzon_empresas")
+
+    if buzon_tipos_cfg and buzon_empresas_cfg:
+        sys.exit(
+            "config.yaml trae 'drive.carpetas.buzon_tipos' y 'drive.carpetas.buzon_empresas' "
+            "a la vez: son dos formas alternativas de organizar 00_BUZON y no pueden convivir. "
+            "Usa 'buzon_tipos' si el negocio factura bajo una sola empresa, o 'buzon_empresas' "
+            "si factura bajo varias (ver config.ejemplo.yaml para el detalle de cuándo usar cada "
+            "una). Borra del config.yaml la sección que no corresponda."
+        )
+
+    if not buzon_empresas_cfg:
+        return None
+
+    nombres_validos = {str(e.get("nombre_corto") or "") for e in (config.get("empresas") or [])}
+    for nombre_empresa in buzon_empresas_cfg:
+        if nombre_empresa not in nombres_validos:
+            sys.exit(
+                f"'{nombre_empresa}' en drive.carpetas.buzon_empresas no está en config['empresas'] "
+                f"(nombre_corto); revisa el nombre (debe coincidir exacto) o agrega la empresa a "
+                f"la lista de config.yaml."
+            )
+
+    return buzon_empresas_cfg
+
+
 def preparar_carpetas(config: dict, almacen: "AlmacenDrive | None", dry_run: bool) -> dict[str, str]:
     """Asegura (crea si hace falta) la carpeta raíz del negocio en "Mi
     unidad" y las 3 subcarpetas de trabajo, todo por API de Drive.
 
     Devuelve {"raiz": id, "buzon": id, "procesado": id, "revisar": id} en
-    modo real; {} en --dry-run (no hay nada que devolver: no se llama a la
-    API, así que no hay ids que informar, solo la intención).
+    modo real (más "conciliacion", "buzon_tipos" o "buzon_empresas" si esas
+    secciones opcionales están en config.yaml -mutuamente excluyentes entre
+    sí, ver _validar_buzon_empresas()-); {} en --dry-run (no hay nada que
+    devolver: no se llama a la API, así que no hay ids que informar, solo la
+    intención).
 
     Nota: a diferencia de la versión anterior (basada en pathlib), esta
     función no distingue en el mensaje impreso entre "creada" y "ya
@@ -129,7 +204,9 @@ def preparar_carpetas(config: dict, almacen: "AlmacenDrive | None", dry_run: boo
     """
     raiz_nombre = config["drive"]["raiz_nombre"]
     con_conciliacion = bool(config.get("conciliacion"))
+    buzon_empresas_cfg = _validar_buzon_empresas(config)
     con_buzon_tipos = bool(((config.get("drive") or {}).get("carpetas") or {}).get("buzon_tipos"))
+    con_buzon_empresas = bool(buzon_empresas_cfg)
 
     print(f"\n== Carpetas en Drive (raíz: '{raiz_nombre}') ==")
     if dry_run:
@@ -144,6 +221,18 @@ def preparar_carpetas(config: dict, almacen: "AlmacenDrive | None", dry_run: boo
         if con_buzon_tipos:
             for nombre in BUZON_TIPOS.values():
                 print(f"[DRY-RUN] se aseguraría (creándola si no existe): {raiz_nombre}/{NOMBRE_BUZON}/{nombre}")
+        elif con_buzon_empresas:
+            for nombre_corto in buzon_empresas_cfg:
+                nombre_carpeta_empresa = _nombre_carpeta_empresa(nombre_corto)
+                print(
+                    f"[DRY-RUN] se aseguraría (creándola si no existe): "
+                    f"{raiz_nombre}/{NOMBRE_BUZON}/{nombre_carpeta_empresa}"
+                )
+                for nombre_tipo in BUZON_TIPOS.values():
+                    print(
+                        f"[DRY-RUN] se aseguraría (creándola si no existe): "
+                        f"{raiz_nombre}/{NOMBRE_BUZON}/{nombre_carpeta_empresa}/{nombre_tipo}"
+                    )
         else:
             print(
                 "[DRY-RUN] config.yaml no trae 'drive.carpetas.buzon_tipos': no se crearían las "
@@ -174,6 +263,19 @@ def preparar_carpetas(config: dict, almacen: "AlmacenDrive | None", dry_run: boo
             print(f"    {NOMBRE_BUZON}/{nombre} ({id_tipo})")
             ids_buzon_tipos[clave] = id_tipo
         ids["buzon_tipos"] = ids_buzon_tipos
+    elif con_buzon_empresas:
+        ids_buzon_empresas: dict[str, dict[str, str]] = {}
+        for nombre_corto in buzon_empresas_cfg:
+            nombre_carpeta_empresa = _nombre_carpeta_empresa(nombre_corto)
+            id_empresa = almacen.asegurar_carpeta(nombre_carpeta_empresa, id_buzon)
+            print(f"    {NOMBRE_BUZON}/{nombre_carpeta_empresa} ({id_empresa})")
+            ids_tipos: dict[str, str] = {}
+            for clave, nombre_tipo in BUZON_TIPOS.items():
+                id_tipo = almacen.asegurar_carpeta(nombre_tipo, id_empresa)
+                print(f"      {NOMBRE_BUZON}/{nombre_carpeta_empresa}/{nombre_tipo} ({id_tipo})")
+                ids_tipos[clave] = id_tipo
+            ids_buzon_empresas[nombre_corto] = ids_tipos
+        ids["buzon_empresas"] = ids_buzon_empresas
 
     return ids
 
@@ -358,6 +460,95 @@ def _actualizar_buzon_tipos_en_config(ruta_config: pathlib.Path, ids_buzon_tipos
     ruta_config.write_text(texto, encoding="utf-8")
 
 
+def _bloque_de(texto: str, ancla: str) -> tuple[int, int] | None:
+    """Encuentra el bloque de líneas que cuelga de 'ancla:' (todas las
+    líneas siguientes con MÁS indentación que 'ancla:', hasta la primera
+    línea no vacía que vuelva a esa indentación o a una menor, o hasta el
+    final del texto). Devuelve (inicio, fin) como offsets de 'texto', o
+    None si 'ancla:' no aparece. Acepta comillas opcionales alrededor del
+    nombre del ancla, porque una clave con espacios (un nombre de empresa,
+    ej. 'EL TEMPLO') puede o no venir entrecomillada en YAML.
+
+    Extraído de _reemplazar_clave_anidada() para reusarlo en
+    _reemplazar_clave_en_subbloque(), que necesita anidar dos niveles
+    (buzon_empresas -> nombre de empresa -> tipo de documento) en vez de
+    uno. _reemplazar_clave_anidada() se deja tal cual (no se migra a este
+    helper) para no arriesgar una regresión en un mecanismo que ya está
+    probado y en uso.
+    """
+    patron_ancla = re.compile(rf'(?m)^(\s*)"?{re.escape(ancla)}"?:\s*(?:#.*)?$')
+    m_ancla = patron_ancla.search(texto)
+    if not m_ancla:
+        return None
+    indent_ancla = len(m_ancla.group(1))
+    inicio_bloque = m_ancla.end()
+    patron_fin = re.compile(rf'(?m)^(?!\s*$)(\s{{0,{indent_ancla}}})\S')
+    m_fin = patron_fin.search(texto, inicio_bloque)
+    fin_bloque = m_fin.start() if m_fin else len(texto)
+    return inicio_bloque, fin_bloque
+
+
+def _reemplazar_clave_en_subbloque(texto: str, ancla1: str, ancla2: str, clave: str, valor: str) -> str:
+    """Como _reemplazar_clave_anidada, pero para una clave que cuelga de un
+    bloque anidado dos niveles: ancla1: -> ancla2: -> clave:.
+
+    Existe para drive.carpetas.buzon_empresas: 'facturas', 'notas_venta',
+    'liquidaciones' y 'otros' son las mismas claves genéricas que ya
+    motivaron _reemplazar_clave_anidada, pero ahí aparecen UNA VEZ por
+    empresa (una vez bajo 'EL TEMPLO', otra bajo 'INSTITUCION', ...).
+    Acotar solo al bloque de 'buzon_empresas:' no alcanza: el reemplazo de
+    'facturas' para EL TEMPLO pisaría el de la primera empresa que
+    aparezca en el archivo. Acotar también al bloque de la empresa en
+    cuestión (ancla2) elimina esa ambigüedad.
+    """
+    bloque1 = _bloque_de(texto, ancla1)
+    if bloque1 is None:
+        logger.warning(
+            "No se encontró la clave '%s:' en config.yaml; no se actualiza '%s' dentro de ella.", ancla1, clave
+        )
+        return texto
+    inicio1, fin1 = bloque1
+    sub_texto = texto[inicio1:fin1]
+
+    bloque2 = _bloque_de(sub_texto, ancla2)
+    if bloque2 is None:
+        logger.warning(
+            "No se encontró la clave '%s:' dentro del bloque '%s:' en config.yaml; no se actualiza '%s'.",
+            ancla2, ancla1, clave,
+        )
+        return texto
+    inicio2, fin2 = bloque2
+
+    sub_bloque = sub_texto[inicio2:fin2]
+    patron_clave = re.compile(rf'(?m)^(\s*{re.escape(clave)}:\s*)(".*?"|\S*)(\s*(?:#.*)?)$')
+    if not patron_clave.search(sub_bloque):
+        logger.warning(
+            "No se encontró la clave '%s:' dentro del bloque '%s:'/'%s:' en config.yaml; no se actualiza.",
+            clave, ancla1, ancla2,
+        )
+        return texto
+
+    sub_bloque_nuevo = patron_clave.sub(lambda m: f'{m.group(1)}"{valor}"{m.group(3)}', sub_bloque, count=1)
+    sub_texto_nuevo = sub_texto[:inicio2] + sub_bloque_nuevo + sub_texto[fin2:]
+    return texto[:inicio1] + sub_texto_nuevo + texto[fin1:]
+
+
+def _actualizar_buzon_empresas_en_config(
+    ruta_config: pathlib.Path, ids_buzon_empresas: dict[str, dict[str, str]]
+) -> None:
+    """Reescribe las claves de drive.carpetas.buzon_empresas en config.yaml
+    (una empresa -> cuatro tipos), preservando el resto del archivo. Usa
+    _reemplazar_clave_en_subbloque (no _reemplazar_clave_anidada) por la
+    razón descrita en su docstring: las claves de tipo se repiten una vez
+    por empresa.
+    """
+    texto = ruta_config.read_text(encoding="utf-8")
+    for nombre_corto, ids_tipos in ids_buzon_empresas.items():
+        for clave, valor in ids_tipos.items():
+            texto = _reemplazar_clave_en_subbloque(texto, "buzon_empresas", nombre_corto, clave, valor)
+    ruta_config.write_text(texto, encoding="utf-8")
+
+
 def _actualizar_carpeta_conciliacion_en_config(ruta_config: pathlib.Path, id_carpeta: str) -> None:
     """Reescribe la línea 'carpeta:' de la sección conciliacion en config.yaml.
 
@@ -442,6 +633,19 @@ def main(argv: list[str] | None = None) -> int:
     ):
         _actualizar_buzon_tipos_en_config(ruta_config, ids_buzon_tipos)
         print(f"config.yaml actualizado con los IDs de las subcarpetas de {NOMBRE_BUZON} por tipo ({ruta_config}).")
+        hubo_cambios = True
+
+    ids_buzon_empresas = ids_carpetas.get("buzon_empresas") or {}
+    buzon_empresas_cfg_actual = (carpetas_cfg_actual.get("buzon_empresas") or {})
+    if ids_buzon_empresas and any(
+        ids_tipos.get(clave) != ((buzon_empresas_cfg_actual.get(nombre_corto) or {}).get(clave) or "")
+        for nombre_corto, ids_tipos in ids_buzon_empresas.items()
+        for clave in BUZON_TIPOS
+    ):
+        _actualizar_buzon_empresas_en_config(ruta_config, ids_buzon_empresas)
+        print(
+            f"config.yaml actualizado con los IDs de las subcarpetas de {NOMBRE_BUZON} por empresa ({ruta_config})."
+        )
         hubo_cambios = True
 
     if id_contable != id_contable_actual or id_detalle != id_detalle_actual:

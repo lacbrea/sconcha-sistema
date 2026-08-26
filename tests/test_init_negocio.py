@@ -101,11 +101,16 @@ class FakeServicioSheets:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _config_minima(negocio: str = "LA CALETA", con_buzon_tipos: bool = False) -> dict:
+def _config_minima(
+    negocio: str = "LA CALETA",
+    con_buzon_tipos: bool = False,
+    con_buzon_empresas: bool = False,
+    nombres_empresas: list[str] | None = None,
+) -> dict:
     carpetas = {"raiz": "", "buzon": "", "procesado": "", "revisar": ""}
     if con_buzon_tipos:
         carpetas["buzon_tipos"] = {"facturas": "", "notas_venta": "", "liquidaciones": "", "otros": ""}
-    return {
+    config = {
         "negocio": negocio,
         "cuenta_google": "administracion.lacaleta@gmail.com",
         "drive": {
@@ -114,6 +119,15 @@ def _config_minima(negocio: str = "LA CALETA", con_buzon_tipos: bool = False) ->
         },
         "sheets": {"contable": "", "detalle": ""},
     }
+    if con_buzon_empresas:
+        nombres = nombres_empresas if nombres_empresas is not None else ["EL TEMPLO", "INSTITUCION"]
+        carpetas["buzon_empresas"] = {
+            nombre: {"facturas": "", "notas_venta": "", "liquidaciones": "", "otros": ""} for nombre in nombres
+        }
+        # RUC ficticio, distinto por empresa: solo hace falta que exista y
+        # sea único, resolver_empresa()/nombre_corto no lo validan aquí.
+        config["empresas"] = [{"nombre_corto": nombre, "ruc": str(10000000000 + i)} for i, nombre in enumerate(nombres)]
+    return config
 
 
 def _escribir_config_yaml(ruta: pathlib.Path, config: dict) -> None:
@@ -632,6 +646,187 @@ def test_dry_run_buzon_tipos_no_llama_api_ni_escribe_config(tmp_path, capsys):
     salida = capsys.readouterr().out
     for nombre in init_negocio.BUZON_TIPOS.values():
         assert nombre in salida
+
+
+# ---------------------------------------------------------------------------
+# _nombre_carpeta_empresa(): mismo criterio que
+# procesar.nombre_empresa_carpeta() (duplicado deliberado, ver docstring en
+# init_negocio.py) — un nombre con espacio sale con guion bajo.
+# ---------------------------------------------------------------------------
+def test_nombre_carpeta_empresa_reemplaza_espacios_por_guion_bajo():
+    assert init_negocio._nombre_carpeta_empresa("EL TEMPLO") == "EL_TEMPLO"
+    assert init_negocio._nombre_carpeta_empresa("INSTITUCION") == "INSTITUCION"
+
+
+# ---------------------------------------------------------------------------
+# Subcarpetas de 00_BUZON por empresa (drive.carpetas.buzon_empresas):
+# alternativa anidada a buzon_tipos para negocios con varias empresas. Las
+# dos secciones son mutuamente excluyentes; ver _validar_buzon_empresas().
+# ---------------------------------------------------------------------------
+def test_preparar_carpetas_crea_buzon_empresas_si_la_seccion_existe():
+    config = _config_minima(con_buzon_empresas=True, nombres_empresas=["EL TEMPLO", "INSTITUCION"])
+    almacen = _FakeAlmacenCarpetas()
+
+    ids = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+
+    assert set(ids) == {"raiz", "buzon", "procesado", "revisar", "buzon_empresas"}
+    assert set(ids["buzon_empresas"]) == {"EL TEMPLO", "INSTITUCION"}
+    for nombre_corto in ("EL TEMPLO", "INSTITUCION"):
+        assert set(ids["buzon_empresas"][nombre_corto]) == {"facturas", "notas_venta", "liquidaciones", "otros"}
+        assert all(ids["buzon_empresas"][nombre_corto].values())  # ningún id vacío
+
+    # Las carpetas de empresa cuelgan de 00_BUZON (id_buzon), no de la raíz,
+    # y usan el nombre de carpeta (guion bajo), no el nombre_corto tal cual.
+    assert ("EL_TEMPLO", ids["buzon"]) in almacen.llamadas
+    assert ("INSTITUCION", ids["buzon"]) in almacen.llamadas
+    id_el_templo = ids["buzon_empresas"]["EL TEMPLO"]["facturas"]
+    # Y las 4 subcarpetas de tipo cuelgan de la carpeta de la empresa, no de
+    # 00_BUZON directamente ni de la de la otra empresa.
+    id_carpeta_el_templo = [
+        nid for (nombre, padre), nid in almacen._existentes.items() if nombre == "EL_TEMPLO"
+    ][0]
+    assert (init_negocio.BUZON_TIPOS["facturas"], id_carpeta_el_templo) in almacen.llamadas
+
+
+def test_preparar_carpetas_no_crea_nada_sin_buzon_tipos_ni_buzon_empresas():
+    config = _config_minima()
+    assert "buzon_tipos" not in config["drive"]["carpetas"]
+    assert "buzon_empresas" not in config["drive"]["carpetas"]
+    almacen = _FakeAlmacenCarpetas()
+
+    ids = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+
+    assert set(ids) == {"raiz", "buzon", "procesado", "revisar"}
+    nombres_creados = {nombre for nombre, _ in almacen.llamadas}
+    assert not nombres_creados & set(init_negocio.BUZON_TIPOS.values())
+    assert "EL_TEMPLO" not in nombres_creados
+
+
+def test_preparar_carpetas_buzon_empresas_es_idempotente():
+    config = _config_minima(con_buzon_empresas=True, nombres_empresas=["EL TEMPLO", "INSTITUCION", "ILLAWARA"])
+    almacen = _FakeAlmacenCarpetas()
+
+    ids_1 = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+    llamadas_1 = len(almacen.llamadas)
+    assert llamadas_1 == 4 + 3 * (1 + 4)  # raiz+buzon+procesado+revisar + 3 empresas * (carpeta + 4 tipos)
+
+    ids_2 = init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+    assert ids_2 == ids_1
+    assert len(almacen.llamadas) == llamadas_1  # no crece: nada se duplica
+
+
+def test_preparar_carpetas_aborta_si_hay_buzon_tipos_y_buzon_empresas_a_la_vez():
+    config = _config_minima(con_buzon_tipos=True, con_buzon_empresas=True, nombres_empresas=["EL TEMPLO"])
+    almacen = _FakeAlmacenCarpetas()
+
+    with pytest.raises(SystemExit) as excinfo:
+        init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+    assert "buzon_tipos" in str(excinfo.value)
+    assert "buzon_empresas" in str(excinfo.value)
+
+
+def test_preparar_carpetas_aborta_si_buzon_empresas_nombra_empresa_no_configurada():
+    config = _config_minima(con_buzon_empresas=True, nombres_empresas=["EL TEMPLO"])
+    # Nombra una empresa que NO está en config["empresas"].
+    config["drive"]["carpetas"]["buzon_empresas"]["NO_EXISTE"] = {
+        "facturas": "", "notas_venta": "", "liquidaciones": "", "otros": "",
+    }
+    almacen = _FakeAlmacenCarpetas()
+
+    with pytest.raises(SystemExit) as excinfo:
+        init_negocio.preparar_carpetas(config, almacen, dry_run=False)
+    assert "NO_EXISTE" in str(excinfo.value)
+
+
+def test_preparar_carpetas_dry_run_informa_arbol_completo_de_buzon_empresas(capsys):
+    config = _config_minima(con_buzon_empresas=True, nombres_empresas=["EL TEMPLO", "INSTITUCION", "ILLAWARA"])
+
+    resultado = init_negocio.preparar_carpetas(config, None, dry_run=True)
+
+    assert resultado == {}
+    salida = capsys.readouterr().out
+    # Las 12 rutas completas (3 empresas x 4 tipos) aparecen en la salida.
+    for nombre_corto in ("EL TEMPLO", "INSTITUCION", "ILLAWARA"):
+        nombre_carpeta = init_negocio._nombre_carpeta_empresa(nombre_corto)
+        assert f"00_BUZON/{nombre_carpeta}" in salida
+        for nombre_tipo in init_negocio.BUZON_TIPOS.values():
+            assert f"00_BUZON/{nombre_carpeta}/{nombre_tipo}" in salida
+
+
+def test_dry_run_no_crea_buzon_empresas_ni_llama_api(tmp_path, capsys):
+    config = _config_minima(con_buzon_empresas=True, nombres_empresas=["EL TEMPLO", "INSTITUCION"])
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+    texto_original = ruta_config.read_text(encoding="utf-8")
+
+    codigo = init_negocio.main(["--config", str(ruta_config), "--dry-run"])
+
+    assert codigo == 0
+    assert ruta_config.read_text(encoding="utf-8") == texto_original
+    salida = capsys.readouterr().out
+    assert "EL_TEMPLO" in salida
+    assert "INSTITUCION" in salida
+
+
+def test_main_crea_buzon_empresas_y_escribe_sus_ids_en_el_sitio_correcto(tmp_path, monkeypatch):
+    config = _config_minima(con_buzon_empresas=True, nombres_empresas=["EL TEMPLO", "INSTITUCION"])
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+
+    servicio = FakeServicioSheets()
+    almacen_falso = _FakeAlmacenCarpetas()
+    _parchar_auth_google(monkeypatch, servicio, almacen_falso)
+
+    codigo = init_negocio.main(["--config", str(ruta_config)])
+
+    assert codigo == 0
+    assert len(almacen_falso.llamadas) == 4 + 2 * (1 + 4)  # raiz+buzon+procesado+revisar + 2*(carpeta+4 tipos)
+
+    config_final = yaml.safe_load(ruta_config.read_text(encoding="utf-8"))
+    ids_finales = config_final["drive"]["carpetas"]["buzon_empresas"]
+    assert set(ids_finales) == {"EL TEMPLO", "INSTITUCION"}
+    for nombre_corto in ("EL TEMPLO", "INSTITUCION"):
+        assert all(ids_finales[nombre_corto].values())
+    # Los ids de una empresa no se mezclaron con los de la otra.
+    assert len({tuple(sorted(v.values())) for v in ids_finales.values()}) == 2
+
+    # Segunda corrida: idempotente, no reescribe el config ni duplica carpetas.
+    texto_tras_primera = ruta_config.read_text(encoding="utf-8")
+    codigo_2 = init_negocio.main(["--config", str(ruta_config)])
+    assert codigo_2 == 0
+    assert ruta_config.read_text(encoding="utf-8") == texto_tras_primera
+    assert len(almacen_falso.llamadas) == 4 + 2 * (1 + 4)
+
+
+def test_main_aborta_si_buzon_empresas_nombra_empresa_no_configurada(tmp_path, monkeypatch):
+    config = _config_minima(con_buzon_empresas=True, nombres_empresas=["EL TEMPLO"])
+    config["drive"]["carpetas"]["buzon_empresas"]["NO_EXISTE"] = {
+        "facturas": "", "notas_venta": "", "liquidaciones": "", "otros": "",
+    }
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+
+    servicio = FakeServicioSheets()
+    almacen_falso = _FakeAlmacenCarpetas()
+    _parchar_auth_google(monkeypatch, servicio, almacen_falso)
+
+    with pytest.raises(SystemExit):
+        init_negocio.main(["--config", str(ruta_config)])
+    assert not almacen_falso.llamadas  # aborta antes de crear ninguna carpeta
+
+
+def test_main_aborta_si_hay_buzon_tipos_y_buzon_empresas_a_la_vez(tmp_path, monkeypatch):
+    config = _config_minima(con_buzon_tipos=True, con_buzon_empresas=True, nombres_empresas=["EL TEMPLO"])
+    ruta_config = tmp_path / "config.yaml"
+    _escribir_config_yaml(ruta_config, config)
+
+    servicio = FakeServicioSheets()
+    almacen_falso = _FakeAlmacenCarpetas()
+    _parchar_auth_google(monkeypatch, servicio, almacen_falso)
+
+    with pytest.raises(SystemExit):
+        init_negocio.main(["--config", str(ruta_config)])
+    assert not almacen_falso.llamadas
 
 
 # ---------------------------------------------------------------------------

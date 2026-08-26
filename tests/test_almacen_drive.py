@@ -189,6 +189,37 @@ def test_listar_carpeta_vacia():
 
 
 # -----------------------------------------------------------------------------
+# buscar_carpeta()
+# -----------------------------------------------------------------------------
+def test_buscar_carpeta_devuelve_id_si_existe():
+    servicio = FakeServicioDrive()
+    carpeta_id = servicio.agregar("FACTURAS", parents=["buzon-id"], mimeType=MIME_CARPETA)
+    almacen = AlmacenDrive(servicio)
+
+    assert almacen.buscar_carpeta("FACTURAS", "buzon-id") == carpeta_id
+
+
+def test_buscar_carpeta_devuelve_none_si_no_existe_y_no_crea_nada():
+    servicio = FakeServicioDrive()
+    almacen = AlmacenDrive(servicio)
+    cantidad_antes = len(servicio._archivos)
+
+    resultado = almacen.buscar_carpeta("FACTURAS", "buzon-id")
+
+    assert resultado is None
+    assert len(servicio._archivos) == cantidad_antes  # no creó nada al buscar
+
+
+def test_buscar_carpeta_distingue_por_padre():
+    servicio = FakeServicioDrive()
+    id_a = servicio.agregar("2026-07", parents=["empresa-a"], mimeType=MIME_CARPETA)
+    almacen = AlmacenDrive(servicio)
+
+    assert almacen.buscar_carpeta("2026-07", "empresa-a") == id_a
+    assert almacen.buscar_carpeta("2026-07", "empresa-b") is None
+
+
+# -----------------------------------------------------------------------------
 # asegurar_carpeta()
 # -----------------------------------------------------------------------------
 def test_asegurar_carpeta_es_idempotente():

@@ -104,6 +104,21 @@ TIPO_ESPERADO_POR_CLAVE_BUZON = {
 # archivo se entere de que debería haberlo puesto en una subcarpeta.
 TIPO_RAIZ_BUZON = "_raiz"
 
+# Nombre real (en Drive) de cada subcarpeta plana de 00_BUZON, igual al
+# BUZON_TIPOS de init_negocio.py (duplicado deliberado: procesar.py no
+# importa init_negocio.py, ver el comentario equivalente en
+# _nombre_carpeta_empresa de ese archivo). Se usa SOLO cuando el negocio
+# migró a 'buzon_empresas': ahí esas 4 carpetas planas quedan huérfanas
+# (ya no están en config.yaml) pero pueden seguir existiendo en Drive con
+# archivos dentro si alguien las usa por costumbre; hay que detectarlas por
+# nombre para no ignorarlos en silencio (ver construir_planes_enrutados).
+NOMBRE_CARPETA_POR_CLAVE_BUZON = {
+    "facturas": "FACTURAS",
+    "notas_venta": "NOTAS_DE_VENTA",
+    "liquidaciones": "LIQUIDACIONES",
+    "otros": "OTROS",
+}
+
 # Patrón de fecha al inicio del nombre de un respaldo de caja chica
 # (NOTAS_DE_VENTA), ej. "01.07 BOLETAS.pdf" -> día 01, mes 07.
 _PATRON_FECHA_NOMBRE_NOTA_VENTA = re.compile(r"^(\d{2})\.(\d{2})")
@@ -207,50 +222,130 @@ def resolver_buzon_tipos_ids(carpetas_cfg: dict) -> dict[str, str]:
     return {clave: (buzon_tipos_cfg.get(clave) or "").strip() for clave in CLAVES_BUZON_TIPOS}
 
 
+def resolver_buzon_empresas_ids(carpetas_cfg: dict) -> dict[str, dict[str, str]]:
+    """Ids de Drive de las subcarpetas de 00_BUZON por empresa y por tipo, a
+    partir de config['drive']['carpetas'] (carpetas_cfg['buzon_empresas']:
+    nombre_corto -> {tipo: id}). Devuelve {} si la sección no existe.
+
+    Igual que resolver_buzon_tipos_ids(), cada sub-dict siempre trae las 4
+    claves de CLAVES_BUZON_TIPOS (con "" para la que falte), así quien llama
+    no tiene que volver a defender contra una clave ausente."""
+    buzon_empresas_cfg = carpetas_cfg.get("buzon_empresas") or {}
+    resultado: dict[str, dict[str, str]] = {}
+    for nombre_empresa, tipos_cfg in buzon_empresas_cfg.items():
+        tipos_cfg = tipos_cfg or {}
+        resultado[nombre_empresa] = {clave: (tipos_cfg.get(clave) or "").strip() for clave in CLAVES_BUZON_TIPOS}
+    return resultado
+
+
+def _planes_por_carpeta(archivos: list[ArchivoDrive], clave: str) -> list[tuple[ArchivoDrive, list[ArchivoDrive]]]:
+    """'notas_venta' NO pasa por construir_planes(): el agrupado XML+respaldo
+    no aplica a un respaldo de caja chica (nunca hay XML de por medio), así
+    que cada archivo de esa subcarpeta se procesa suelto, sin respaldos."""
+    if clave == "notas_venta":
+        return [(archivo, []) for archivo in archivos]
+    return construir_planes(archivos)
+
+
 def construir_planes_enrutados(
     almacen: AlmacenDrive,
     carpeta_buzon_id: str,
     buzon_tipos_ids: dict[str, str],
-) -> list[tuple[ArchivoDrive, list[ArchivoDrive], str | None]]:
-    """Arma la lista de (principal, respaldos, tipo) a procesar en la
-    corrida, enrutando por subcarpeta de 00_BUZON cuando el negocio migró a
-    buzon_tipos (ver config.yaml -> drive.carpetas.buzon_tipos).
+    buzon_empresas_ids: dict[str, dict[str, str]] | None = None,
+) -> list[tuple[ArchivoDrive, list[ArchivoDrive], str | None, str | None]]:
+    """Arma la lista de (principal, respaldos, tipo, empresa_carpeta) a
+    procesar en la corrida, enrutando por subcarpeta de 00_BUZON cuando el
+    negocio migró a buzon_tipos o a buzon_empresas (ver config.yaml ->
+    drive.carpetas). Las dos secciones son mutuamente excluyentes
+    (init_negocio.py ya lo garantiza); si por algún motivo config.yaml trae
+    las dos, gana buzon_empresas.
 
-    'tipo' es la clave de buzon_tipos que corresponde al archivo
-    ('facturas'|'notas_venta'|'liquidaciones'|'otros'), TIPO_RAIZ_BUZON si el
-    archivo estaba suelto en la raíz de 00_BUZON (compatibilidad durante la
-    transición: se procesa como factura, con advertencia — ver
-    procesar_uno), o None si el negocio no tiene ningún id de buzon_tipos
-    configurado (comportamiento histórico intacto: solo se lista la raíz,
-    sin agrupar por subcarpeta y sin la advertencia de raíz, porque un
-    negocio que no migró no tiene por qué verla en cada corrida).
+    'tipo' es la clave de buzon_tipos/buzon_empresas que corresponde al
+    archivo ('facturas'|'notas_venta'|'liquidaciones'|'otros'),
+    TIPO_RAIZ_BUZON si el archivo estaba suelto en la raíz de 00_BUZON
+    (compatibilidad durante la transición: se procesa como factura, con
+    advertencia — ver procesar_uno), o None si el negocio no tiene ningún id
+    de buzon_tipos ni de buzon_empresas configurado (comportamiento
+    histórico intacto: solo se lista la raíz, sin agrupar por subcarpeta y
+    sin la advertencia de raíz, porque un negocio que no migró no tiene por
+    qué verla en cada corrida).
 
-    'notas_venta' NO pasa por construir_planes(): el agrupado XML+respaldo
-    no aplica a un respaldo de caja chica (nunca hay XML de por medio), así
-    que cada archivo de esa subcarpeta se procesa suelto, sin respaldos.
+    'empresa_carpeta' es el nombre_corto de la empresa dueña de la
+    subcarpeta de origen (solo con buzon_empresas configurado; None en
+    cualquier otro caso, incluida la raíz y las carpetas huérfanas). Quien
+    procesa el archivo lo usa como pista de a qué empresa asignarlo cuando
+    el propio documento no lo dice (ver resolver_empresa_con_carpeta y
+    resolver_empresa_local_nota_venta) — el RUC del comprobante, cuando está
+    disponible, tiene siempre la última palabra.
+
+    La detección de carpetas planas huérfanas (ver más abajo) usa
+    almacen.buscar_carpeta, que solo busca y nunca crea, así que corre
+    siempre — incluida una corrida --dry-run, que así avisa del problema
+    sin escribir nada en Drive. Antes de que existiera buscar_carpeta esto
+    dependía de asegurar_carpeta (encuentra-o-crea), que en un negocio sin
+    esas carpetas planas las creaba vacías en cada corrida; --dry-run se
+    saltaba la detección entera para no arriesgar esa escritura. Ya no hace
+    falta ese atajo.
     """
+    if buzon_empresas_ids and any(any(ids_tipos.values()) for ids_tipos in buzon_empresas_ids.values()):
+        resultado: list[tuple[ArchivoDrive, list[ArchivoDrive], str | None, str | None]] = []
+
+        for nombre_empresa, ids_tipos in buzon_empresas_ids.items():
+            for clave in CLAVES_BUZON_TIPOS:
+                carpeta_id = ids_tipos.get(clave)
+                if not carpeta_id:
+                    continue
+                archivos = listar_buzon(almacen, carpeta_id)
+                for principal, respaldos in _planes_por_carpeta(archivos, clave):
+                    resultado.append((principal, respaldos, clave, nombre_empresa))
+
+        # Carpetas planas huérfanas: si el negocio venía de 'buzon_tipos' y
+        # migró a 'buzon_empresas', las 4 subcarpetas viejas (hijas directas
+        # de 00_BUZON) pueden seguir existiendo en Drive con archivos
+        # dentro, aunque ya no estén en config.yaml. Se procesan igual (por
+        # RUC nada más, sin empresa de carpeta) y se advierte, nunca se
+        # ignoran en silencio.
+        for clave, nombre_carpeta in NOMBRE_CARPETA_POR_CLAVE_BUZON.items():
+            carpeta_id = almacen.buscar_carpeta(nombre_carpeta, carpeta_buzon_id)
+            if carpeta_id is None:
+                continue  # nunca existió o ya se retiró: nada que advertir ni procesar
+            archivos = listar_buzon(almacen, carpeta_id)
+            if archivos:
+                logger.warning(
+                    "%d archivo(s) en la carpeta huérfana '00_BUZON/%s': config.yaml usa "
+                    "'buzon_empresas', esa carpeta plana ya no está asociada a ninguna empresa. "
+                    "Se procesan solo por RUC; muévelos a la carpeta de su empresa.",
+                    len(archivos),
+                    nombre_carpeta,
+                )
+            for principal, respaldos in _planes_por_carpeta(archivos, clave):
+                resultado.append((principal, respaldos, clave, None))
+
+        # Archivos sueltos en la raíz del buzón: compatibilidad durante la
+        # transición (ver TIPO_RAIZ_BUZON).
+        for principal, respaldos in construir_planes(listar_buzon(almacen, carpeta_buzon_id)):
+            resultado.append((principal, respaldos, TIPO_RAIZ_BUZON, None))
+
+        return resultado
+
     if not any(buzon_tipos_ids.values()):
         planes = construir_planes(listar_buzon(almacen, carpeta_buzon_id))
-        return [(principal, respaldos, None) for principal, respaldos in planes]
+        return [(principal, respaldos, None, None) for principal, respaldos in planes]
 
-    resultado: list[tuple[ArchivoDrive, list[ArchivoDrive], str | None]] = []
+    resultado = []
 
     for clave in CLAVES_BUZON_TIPOS:
         carpeta_id = buzon_tipos_ids.get(clave)
         if not carpeta_id:
             continue
         archivos = listar_buzon(almacen, carpeta_id)
-        if clave == "notas_venta":
-            for archivo in archivos:
-                resultado.append((archivo, [], clave))
-        else:
-            for principal, respaldos in construir_planes(archivos):
-                resultado.append((principal, respaldos, clave))
+        for principal, respaldos in _planes_por_carpeta(archivos, clave):
+            resultado.append((principal, respaldos, clave, None))
 
     # Archivos sueltos en la raíz del buzón: compatibilidad durante la
     # transición (ver TIPO_RAIZ_BUZON).
     for principal, respaldos in construir_planes(listar_buzon(almacen, carpeta_buzon_id)):
-        resultado.append((principal, respaldos, TIPO_RAIZ_BUZON))
+        resultado.append((principal, respaldos, TIPO_RAIZ_BUZON, None))
 
     return resultado
 
@@ -436,6 +531,56 @@ def resolver_empresa(config: dict, comp: "ComprobanteExtraido") -> tuple[dict | 
     )
 
 
+def _buscar_empresa_por_nombre_corto(config: dict, nombre_corto: str) -> dict | None:
+    for empresa_cfg in config.get("empresas", []):
+        if str(empresa_cfg.get("nombre_corto") or "").strip() == nombre_corto:
+            return empresa_cfg
+    return None
+
+
+def resolver_empresa_con_carpeta(
+    config: dict, comp: "ComprobanteExtraido", empresa_carpeta: str | None
+) -> tuple[dict | None, str | None]:
+    """Igual que resolver_empresa(), pero teniendo en cuenta además la
+    empresa que indica la subcarpeta de origen (empresa_carpeta, solo con
+    drive.carpetas.buzon_empresas configurado — ver
+    construir_planes_enrutados; None en cualquier otro caso).
+
+    Precedencia (decisión del dueño, no negociable): GANA EL RUC DEL PAPEL.
+    La carpeta solo rellena cuando el documento no puede decirlo:
+      - Si el comprobante trae RUC de cliente y calza con una empresa: esa
+        empresa, aunque la carpeta diga otra. Si la carpeta decía otra
+        empresa, se advierte en el log con los dos valores — nunca en
+        silencio: es justo el caso que alguien va a querer auditar (ej.
+        ULTRAFRIO/APUDEX: facturadas a ILLAWARA pero subidas por el
+        personal de EL TEMPLO).
+      - Si no trae RUC, o el RUC no calza con ninguna empresa, y la carpeta
+        sí dice una: se usa la de la carpeta.
+      - Si no hay ni RUC ni carpeta: comportamiento de siempre (a
+        02_REVISAR con el motivo de resolver_empresa).
+    """
+    empresa_cfg, motivo = resolver_empresa(config, comp)
+
+    if empresa_cfg is not None:
+        nombre_por_ruc = str(empresa_cfg.get("nombre_corto") or "")
+        if empresa_carpeta and empresa_carpeta != nombre_por_ruc:
+            logger.warning(
+                "%s: el RUC de cliente asigna la empresa '%s', pero el archivo estaba en la "
+                "carpeta de '%s'; gana el RUC del comprobante (revisar quién lo subió).",
+                getattr(comp, "serie_numero", None) or "(sin serie)",
+                nombre_por_ruc,
+                empresa_carpeta,
+            )
+        return empresa_cfg, None
+
+    if empresa_carpeta:
+        empresa_de_carpeta = _buscar_empresa_por_nombre_corto(config, empresa_carpeta)
+        if empresa_de_carpeta is not None:
+            return empresa_de_carpeta, None
+
+    return None, motivo
+
+
 def resolver_local(empresa_cfg: dict) -> tuple[str | None, str | None]:
     """Decide el local de un comprobante ya asignado a una empresa.
 
@@ -473,17 +618,43 @@ def resolver_local(empresa_cfg: dict) -> tuple[str | None, str | None]:
     )
 
 
-def resolver_empresa_local_nota_venta(config: dict) -> tuple[str, str, str | None]:
+def resolver_empresa_local_nota_venta(
+    config: dict, empresa_carpeta: str | None = None
+) -> tuple[str, str, str | None]:
     """Devuelve (empresa, local, advertencia) para un respaldo de caja chica
     (NOTAS_DE_VENTA). A diferencia de un comprobante normal, este archivo
     NUNCA dice a qué empresa pertenece (no se lee con el modelo, ver
-    procesar_nota_venta): si el negocio tiene una sola empresa configurada,
-    se asigna esa, sin ambigüedad. Si tiene varias -como SCONCHA hoy, con EL
+    procesar_nota_venta).
+
+    Con drive.carpetas.buzon_empresas configurado, la subcarpeta de origen
+    SÍ dice a qué empresa pertenece el respaldo (empresa_carpeta, ver
+    construir_planes_enrutados): en ese caso se usa esa empresa directo, con
+    su local_por_defecto, igual que el resto del sistema — sin la
+    ambigüedad de antes.
+
+    Sin buzon_empresas (empresa_carpeta vacío/None, comportamiento histórico
+    intacto): si el negocio tiene una sola empresa configurada, se asigna
+    esa, sin ambigüedad. Si tiene varias -como SCONCHA con buzon_tipos, EL
     TEMPLO/INSTITUCION/ILLAWARA- NO se adivina cuál: asignar la empresa
     equivocada a un respaldo de caja chica sería inventar un dato financiero.
     En ese caso se devuelve empresa y local vacíos junto con una advertencia
     para el log; el dueño corrige EMPRESA (y LOCAL) a mano en RESPALDOS_CAJA.
     """
+    if empresa_carpeta:
+        empresa_cfg = _buscar_empresa_por_nombre_corto(config, empresa_carpeta)
+        if empresa_cfg is not None:
+            nombre_corto = str(empresa_cfg.get("nombre_corto") or "")
+            local, motivo_local = resolver_local(empresa_cfg)
+            if local is None:
+                return nombre_corto, "", motivo_local
+            return nombre_corto, local, None
+        # No debería pasar: la carpeta se nombró con un nombre_corto real de
+        # config['empresas'] (init_negocio.py lo valida al crearla).
+        return "", "", (
+            f"la carpeta de origen indica la empresa '{empresa_carpeta}', que no está en "
+            f"config['empresas']; corregir config.yaml"
+        )
+
     empresas = config.get("empresas") or []
     if len(empresas) != 1:
         return "", "", (
@@ -573,12 +744,16 @@ def procesar_uno(
     carpeta_revisar_id: str,
     dry_run: bool,
     tipo: str | None = None,
+    empresa_carpeta: str | None = None,
 ) -> ResultadoArchivo:
-    """'tipo' es la clave de buzon_tipos de la que salió el archivo
-    ('facturas'|'notas_venta'|'liquidaciones'|'otros'), TIPO_RAIZ_BUZON si
-    vino suelto de la raíz del buzón durante la transición, o None si el
-    negocio no tiene buzon_tipos configurado (comportamiento histórico,
-    equivalente a 'facturas' pero sin la advertencia de raíz). Ver
+    """'tipo' es la clave de buzon_tipos/buzon_empresas de la que salió el
+    archivo ('facturas'|'notas_venta'|'liquidaciones'|'otros'),
+    TIPO_RAIZ_BUZON si vino suelto de la raíz del buzón durante la
+    transición, o None si el negocio no tiene ni buzon_tipos ni
+    buzon_empresas configurado (comportamiento histórico, equivalente a
+    'facturas' pero sin la advertencia de raíz). 'empresa_carpeta' es el
+    nombre_corto de la empresa dueña de la subcarpeta de origen (solo con
+    buzon_empresas; None en cualquier otro caso). Ver
     construir_planes_enrutados().
     """
     nombre = principal.name
@@ -592,6 +767,7 @@ def procesar_uno(
             nombres_por_carpeta=nombres_por_carpeta,
             carpeta_procesado_id=carpeta_procesado_id,
             dry_run=dry_run,
+            empresa_carpeta=empresa_carpeta,
         )
 
     if tipo == TIPO_RAIZ_BUZON:
@@ -640,7 +816,7 @@ def procesar_uno(
             mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
             return ResultadoArchivo(nombre, "revisar", motivo, llamadas_modelo=llamadas_modelo)
 
-        empresa_cfg, motivo_empresa = resolver_empresa(config, comp)
+        empresa_cfg, motivo_empresa = resolver_empresa_con_carpeta(config, comp, empresa_carpeta)
         if empresa_cfg is None:
             mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, motivo_empresa, nombres_por_carpeta, dry_run)
             return ResultadoArchivo(nombre, "revisar", motivo_empresa, llamadas_modelo=llamadas_modelo)
@@ -731,6 +907,7 @@ def procesar_nota_venta(
     nombres_por_carpeta: dict[str, set[str]],
     carpeta_procesado_id: str,
     dry_run: bool,
+    empresa_carpeta: str | None = None,
 ) -> ResultadoArchivo:
     """Registra un respaldo de caja chica (subcarpeta NOTAS_DE_VENTA del
     buzón) SIN pasar por el modelo: costo S/0. El dato de fondo (montos,
@@ -739,10 +916,13 @@ def procesar_nota_venta(
     respaldo llegó, con qué fecha (si el nombre la trae) y a qué empresa/
     local se asignó, y se mueve a 01_PROCESADO con su nombre original (no
     hay RUC/serie con los que renombrar, a diferencia del pipeline normal).
+
+    'empresa_carpeta' (solo con buzon_empresas) resuelve la empresa sin
+    ambigüedad — ver resolver_empresa_local_nota_venta().
     """
     nombre = archivo.name
     fecha = extraer_fecha_nombre_archivo(nombre)
-    empresa, local, motivo_empresa = resolver_empresa_local_nota_venta(config)
+    empresa, local, motivo_empresa = resolver_empresa_local_nota_venta(config, empresa_carpeta)
     if motivo_empresa:
         logger.warning("%s: %s", nombre, motivo_empresa)
 
@@ -910,12 +1090,18 @@ def main(argv: list[str] | None = None) -> int:
         logger.warning("No se encontró '%s'; se seguirá sin emparejar ítems contra el catálogo.", ruta_catalogo)
 
     buzon_tipos_ids = resolver_buzon_tipos_ids(carpetas_cfg)
-    if any(buzon_tipos_ids.values()):
+    buzon_empresas_ids = resolver_buzon_empresas_ids(carpetas_cfg)
+    if any(any(ids_tipos.values()) for ids_tipos in buzon_empresas_ids.values()):
+        logger.info(
+            "Enrutando 00_BUZON por empresa y subcarpeta de tipo (buzon_empresas configurado): %s",
+            ", ".join(sorted(buzon_empresas_ids.keys())),
+        )
+    elif any(buzon_tipos_ids.values()):
         logger.info(
             "Enrutando 00_BUZON por subcarpeta de tipo (buzon_tipos configurado): %s",
             ", ".join(f"{clave}={id_}" for clave, id_ in buzon_tipos_ids.items() if id_),
         )
-    planes = construir_planes_enrutados(almacen, carpeta_buzon_id, buzon_tipos_ids)
+    planes = construir_planes_enrutados(almacen, carpeta_buzon_id, buzon_tipos_ids, buzon_empresas_ids)
 
     if args.solo:
         objetivo = args.solo.strip().lower()
@@ -934,7 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
     nombres_por_carpeta: dict[str, set[str]] = {}
     resultados: list[ResultadoArchivo] = []
 
-    for principal, respaldos, tipo in planes:
+    for principal, respaldos, tipo, empresa_carpeta in planes:
         try:
             resultado = procesar_uno(
                 principal,
@@ -949,6 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
                 carpeta_revisar_id=carpeta_revisar_id,
                 dry_run=args.dry_run,
                 tipo=tipo,
+                empresa_carpeta=empresa_carpeta,
             )
         except Exception as exc:
             # Red de seguridad final: un archivo que falla de cualquier forma

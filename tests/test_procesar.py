@@ -218,6 +218,7 @@ class AlmacenDriveFalso:
         self.textos_creados: list[tuple[str, str, str]] = []
         self.movimientos: list[tuple[str, str, str | None]] = []
         self.carpetas_aseguradas: list[tuple[str, str | None]] = []
+        self.carpetas_buscadas: list[tuple[str, str | None]] = []
 
     def _nuevo_id(self, prefijo: str) -> str:
         self._contador += 1
@@ -266,11 +267,18 @@ class AlmacenDriveFalso:
     def enlace(self, file_id: str) -> str:
         return f"https://drive.google.com/file/d/{file_id}/view"
 
-    def asegurar_carpeta(self, nombre: str, padre_id: str | None = None) -> str:
-        self.carpetas_aseguradas.append((nombre, padre_id))
+    def buscar_carpeta(self, nombre: str, padre_id: str | None = None) -> str | None:
+        self.carpetas_buscadas.append((nombre, padre_id))
         for cid, c in self.carpetas.items():
             if c["nombre"] == nombre and c["padre_id"] == padre_id:
                 return cid
+        return None
+
+    def asegurar_carpeta(self, nombre: str, padre_id: str | None = None) -> str:
+        self.carpetas_aseguradas.append((nombre, padre_id))
+        encontrada = self.buscar_carpeta(nombre, padre_id)
+        if encontrada is not None:
+            return encontrada
         return self.agregar_carpeta(nombre, padre_id)
 
 
@@ -328,6 +336,33 @@ def _entorno_con_buzon_tipos():
     }
     config["drive"]["carpetas"]["buzon_tipos"] = dict(ids_tipos)
     return config, almacen, carpeta_buzon_id, carpeta_procesado_id, carpeta_revisar_id, registro, catalogo_obj, ids_tipos
+
+
+def _entorno_con_buzon_empresas(nombres_empresas: list[str] | None = None):
+    """Igual que _entorno(), pero con 00_BUZON/<EMPRESA>/<TIPO> ya creadas y
+    cableadas en config['drive']['carpetas']['buzon_empresas'], como
+    quedaría un negocio de varias empresas después de correr init_negocio.py
+    con esa sección configurada. Devuelve además ids_por_empresa: dict
+    nombre_corto -> {tipo: id}."""
+    config, almacen, carpeta_buzon_id, carpeta_procesado_id, carpeta_revisar_id, registro, catalogo_obj = _entorno()
+    if nombres_empresas is None:
+        nombres_empresas = [e["nombre_corto"] for e in config["empresas"]]
+
+    ids_por_empresa: dict[str, dict[str, str]] = {}
+    buzon_empresas_cfg: dict[str, dict[str, str]] = {}
+    for nombre_empresa in nombres_empresas:
+        carpeta_empresa_id = almacen.agregar_carpeta(procesar.nombre_empresa_carpeta(nombre_empresa), carpeta_buzon_id)
+        ids_tipos = {
+            "facturas": almacen.agregar_carpeta("FACTURAS", carpeta_empresa_id),
+            "notas_venta": almacen.agregar_carpeta("NOTAS_DE_VENTA", carpeta_empresa_id),
+            "liquidaciones": almacen.agregar_carpeta("LIQUIDACIONES", carpeta_empresa_id),
+            "otros": almacen.agregar_carpeta("OTROS", carpeta_empresa_id),
+        }
+        ids_por_empresa[nombre_empresa] = ids_tipos
+        buzon_empresas_cfg[nombre_empresa] = dict(ids_tipos)
+
+    config["drive"]["carpetas"]["buzon_empresas"] = buzon_empresas_cfg
+    return config, almacen, carpeta_buzon_id, carpeta_procesado_id, carpeta_revisar_id, registro, catalogo_obj, ids_por_empresa
 
 
 def _crear_archivo_local(carpeta: pathlib.Path, nombre: str, contenido: bytes = b"contenido de prueba") -> pathlib.Path:
@@ -726,7 +761,8 @@ def test_construir_planes_enrutados_sin_buzon_tipos_usa_comportamiento_historico
     planes = procesar.construir_planes_enrutados(almacen, buzon_id, ids_vacios)
 
     assert {p[0].name for p in planes} == {"f.xml", "g.pdf"}
-    assert all(tipo is None for _, _, tipo in planes)
+    assert all(tipo is None for _, _, tipo, _ in planes)
+    assert all(empresa_carpeta is None for _, _, _, empresa_carpeta in planes)
 
 
 def test_construir_planes_enrutados_enruta_por_subcarpeta_y_raiz():
@@ -746,6 +782,9 @@ def test_construir_planes_enrutados_enruta_por_subcarpeta_y_raiz():
     assert por_nombre["compra.jpg"] == "liquidaciones"
     assert por_nombre["recibo.pdf"] == "otros"
     assert por_nombre["suelto.pdf"] == procesar.TIPO_RAIZ_BUZON
+    # buzon_tipos (sin buzon_empresas) nunca trae empresa_carpeta: eso es
+    # exclusivo de buzon_empresas.
+    assert all(empresa_carpeta is None for _, _, _, empresa_carpeta in planes)
 
 
 # -----------------------------------------------------------------------------
@@ -988,3 +1027,209 @@ def test_main_enruta_por_buzon_tipos_end_to_end(tmp_path, monkeypatch):
     assert registro.respaldos_caja[0]["archivo"] == "01.07 BOLETAS.pdf"
     # 2 comprobantes normales (factura + liquidación) escritos por Registro.escribir()
     assert len(registro.escritos) == 2
+
+
+# -----------------------------------------------------------------------------
+# resolver_buzon_empresas_ids
+# -----------------------------------------------------------------------------
+def test_resolver_buzon_empresas_ids_vacio_si_no_hay_seccion():
+    assert procesar.resolver_buzon_empresas_ids({}) == {}
+
+
+def test_resolver_buzon_empresas_ids_lee_por_empresa_y_tipo():
+    carpetas_cfg = {
+        "buzon_empresas": {
+            "EL TEMPLO": {"facturas": "f1", "notas_venta": "n1", "liquidaciones": "l1", "otros": "o1"},
+            "ILLAWARA": {"facturas": "f2"},  # las demás claves faltan a propósito
+        }
+    }
+    resultado = procesar.resolver_buzon_empresas_ids(carpetas_cfg)
+    assert resultado["EL TEMPLO"] == {"facturas": "f1", "notas_venta": "n1", "liquidaciones": "l1", "otros": "o1"}
+    assert resultado["ILLAWARA"] == {"facturas": "f2", "notas_venta": "", "liquidaciones": "", "otros": ""}
+
+
+# -----------------------------------------------------------------------------
+# construir_planes_enrutados con buzon_empresas: enruta por empresa Y tipo,
+# detecta carpetas planas huérfanas y sigue viendo la raíz (compatibilidad).
+# -----------------------------------------------------------------------------
+def test_construir_planes_enrutados_con_buzon_empresas():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO", "ILLAWARA"]
+    )
+    _crear_archivo(almacen, ids_por_empresa["EL TEMPLO"]["facturas"], "templo.xml")
+    _crear_archivo(almacen, ids_por_empresa["ILLAWARA"]["notas_venta"], "01.07 BOLETAS.pdf")
+    _crear_archivo(almacen, buzon_id, "suelto.pdf")  # raíz, compatibilidad
+
+    buzon_tipos_ids = procesar.resolver_buzon_tipos_ids(config["drive"]["carpetas"])
+    buzon_empresas_ids = procesar.resolver_buzon_empresas_ids(config["drive"]["carpetas"])
+    planes = procesar.construir_planes_enrutados(almacen, buzon_id, buzon_tipos_ids, buzon_empresas_ids)
+
+    por_nombre = {p[0].name: (p[2], p[3]) for p in planes}
+    assert por_nombre["templo.xml"] == ("facturas", "EL TEMPLO")
+    assert por_nombre["01.07 BOLETAS.pdf"] == ("notas_venta", "ILLAWARA")
+    assert por_nombre["suelto.pdf"] == (procesar.TIPO_RAIZ_BUZON, None)
+
+
+def test_construir_planes_enrutados_detecta_carpeta_plana_huerfana(caplog):
+    """Con buzon_empresas configurado, un archivo dejado en 00_BUZON/FACTURAS
+    (carpeta plana vieja, huérfana desde la migración) se procesa igual -
+    por RUC nada más, sin empresa de carpeta- y deja advertencia en el log."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    carpeta_huerfana_id = almacen.agregar_carpeta("FACTURAS", buzon_id)
+    _crear_archivo(almacen, carpeta_huerfana_id, "huerfano.xml")
+
+    buzon_tipos_ids = procesar.resolver_buzon_tipos_ids(config["drive"]["carpetas"])
+    buzon_empresas_ids = procesar.resolver_buzon_empresas_ids(config["drive"]["carpetas"])
+
+    with caplog.at_level(logging.WARNING, logger="procesar"):
+        planes = procesar.construir_planes_enrutados(almacen, buzon_id, buzon_tipos_ids, buzon_empresas_ids)
+
+    por_nombre = {p[0].name: (p[2], p[3]) for p in planes}
+    assert por_nombre["huerfano.xml"] == ("facturas", None)
+    assert any("huérfana" in r.getMessage() for r in caplog.records)
+
+
+def test_construir_planes_enrutados_sin_carpetas_planas_no_crea_ni_advierte(caplog):
+    """Negocio con buzon_empresas que nunca tuvo las 4 carpetas planas viejas
+    (FACTURAS/NOTAS_DE_VENTA/LIQUIDACIONES/OTROS): la detección busca cada
+    una con buscar_carpeta (encuentra, no crea), no las encuentra, y por lo
+    tanto no crea ninguna carpeta basura ni advierte nada. Esto reemplaza al
+    bug real: antes se usaba asegurar_carpeta (encuentra-o-crea) para esta
+    misma detección, así que cada corrida de un negocio así dejaba 4
+    carpetas vacías colgando en 00_BUZON."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    buzon_tipos_ids = procesar.resolver_buzon_tipos_ids(config["drive"]["carpetas"])
+    buzon_empresas_ids = procesar.resolver_buzon_empresas_ids(config["drive"]["carpetas"])
+    cantidad_carpetas_antes = len(almacen.carpetas)
+
+    with caplog.at_level(logging.WARNING, logger="procesar"):
+        procesar.construir_planes_enrutados(almacen, buzon_id, buzon_tipos_ids, buzon_empresas_ids)
+
+    assert almacen.carpetas_aseguradas == []  # nunca se llamó al encuentra-o-crea
+    assert len(almacen.carpetas) == cantidad_carpetas_antes  # ni una carpeta nueva
+    assert set(almacen.carpetas_buscadas) == {
+        ("FACTURAS", buzon_id), ("NOTAS_DE_VENTA", buzon_id), ("LIQUIDACIONES", buzon_id), ("OTROS", buzon_id),
+    }
+    assert caplog.records == []  # nada que advertir: las carpetas no existen
+
+
+# -----------------------------------------------------------------------------
+# Precedencia empresa: gana el RUC del papel; la carpeta solo rellena cuando
+# el documento no puede decirlo (decisión del dueño, ver
+# resolver_empresa_con_carpeta). Caso real: ULTRAFRIO/APUDEX facturadas a
+# ILLAWARA (RUC 20614321734) pero subidas por el personal de EL TEMPLO.
+# -----------------------------------------------------------------------------
+def test_ruc_gana_sobre_carpeta_y_advierte_con_los_dos_nombres(caplog):
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO", "ILLAWARA"]
+    )
+    comp = ComprobanteFalso(cliente_ruc="20614321734")  # RUC de ILLAWARA
+    _modulo_xml_ubl.extraer = lambda ruta: comp
+    archivo = _crear_archivo(almacen, ids_por_empresa["EL TEMPLO"]["facturas"], "ultrafrio.xml")
+
+    with caplog.at_level(logging.WARNING, logger="procesar"):
+        resultado = procesar.procesar_uno(
+            archivo, [], config=config, registro=registro, catalogo_obj=cat, almacen=almacen,
+            claves_procesadas_en_lote=set(), nombres_por_carpeta={}, carpeta_procesado_id=procesado_id,
+            carpeta_revisar_id=revisar_id, dry_run=False, tipo="facturas", empresa_carpeta="EL TEMPLO",
+        )
+
+    assert resultado.estado == "procesado"
+    assert registro.escritos[0]["empresa"] == "ILLAWARA"  # gana el RUC del papel
+    mensajes = [r.getMessage() for r in caplog.records]
+    assert any("ILLAWARA" in m and "EL TEMPLO" in m for m in mensajes)
+
+
+def test_sin_ruc_usa_la_empresa_de_la_carpeta():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO", "INSTITUCION"]
+    )
+    comp = ComprobanteFalso(cliente_ruc=None)  # el documento no dice nada
+    _modulo_xml_ubl.extraer = lambda ruta: comp
+    archivo = _crear_archivo(almacen, ids_por_empresa["INSTITUCION"]["facturas"], "sinruc.xml")
+
+    resultado = procesar.procesar_uno(
+        archivo, [], config=config, registro=registro, catalogo_obj=cat, almacen=almacen,
+        claves_procesadas_en_lote=set(), nombres_por_carpeta={}, carpeta_procesado_id=procesado_id,
+        carpeta_revisar_id=revisar_id, dry_run=False, tipo="facturas", empresa_carpeta="INSTITUCION",
+    )
+
+    assert resultado.estado == "procesado"
+    assert registro.escritos[0]["empresa"] == "INSTITUCION"
+    assert registro.escritos[0]["local"] == "MIRAFLORES"
+
+
+def test_nota_venta_en_carpeta_de_empresa_sale_con_empresa_y_local():
+    """Con buzon_empresas, el agujero de antes (EMPRESA/LOCAL vacíos con 3
+    empresas configuradas) queda cerrado: la carpeta resuelve la empresa."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO", "INSTITUCION", "ILLAWARA"]
+    )
+    archivo = _crear_archivo(almacen, ids_por_empresa["INSTITUCION"]["notas_venta"], "01.07 BOLETAS.pdf")
+
+    resultado = procesar.procesar_uno(
+        archivo, [], config=config, registro=registro, catalogo_obj=cat, almacen=almacen,
+        claves_procesadas_en_lote=set(), nombres_por_carpeta={}, carpeta_procesado_id=procesado_id,
+        carpeta_revisar_id=revisar_id, dry_run=False, tipo="notas_venta", empresa_carpeta="INSTITUCION",
+    )
+
+    assert resultado.estado == "procesado"
+    fila = registro.respaldos_caja[0]
+    assert fila["empresa"] == "INSTITUCION"
+    assert fila["local"] == "MIRAFLORES"
+
+
+def test_nota_venta_sin_buzon_empresas_sigue_vacia_sin_regresion():
+    """Con buzon_tipos (config viejo, varias empresas) la nota de venta
+    sigue saliendo vacía y con advertencia: sin regresión (empresa_carpeta
+    es siempre None ahí)."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_tipos = _entorno_con_buzon_tipos()
+    archivo = _crear_archivo(almacen, ids_tipos["notas_venta"], "01.07 BOLETAS.pdf")
+
+    resultado = _procesar_uno_con_tipo(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id, tipo="notas_venta")
+
+    assert resultado.estado == "procesado"
+    fila = registro.respaldos_caja[0]
+    assert fila["empresa"] == ""
+    assert fila["local"] == ""
+
+
+def test_archivo_en_carpeta_plana_huerfana_se_procesa_y_advierte(caplog):
+    """Un archivo en una carpeta plana huérfana (00_BUZON/OTROS, con
+    buzon_empresas configurado) se procesa igual -por RUC- y deja
+    advertencia en el log de que debe moverse a la carpeta de su empresa."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    carpeta_huerfana_id = almacen.agregar_carpeta("OTROS", buzon_id)
+    _crear_archivo(almacen, carpeta_huerfana_id, "recibo.pdf")
+
+    def falso_modelo(ruta, tipo, config=None, tipo_esperado=None):
+        return ComprobanteFalso()
+
+    _modulo_extractor_modelo.extraer = falso_modelo
+
+    buzon_tipos_ids = procesar.resolver_buzon_tipos_ids(config["drive"]["carpetas"])
+    buzon_empresas_ids = procesar.resolver_buzon_empresas_ids(config["drive"]["carpetas"])
+
+    with caplog.at_level(logging.WARNING, logger="procesar"):
+        planes = procesar.construir_planes_enrutados(almacen, buzon_id, buzon_tipos_ids, buzon_empresas_ids)
+
+    plan_huerfano = next(p for p in planes if p[0].name == "recibo.pdf")
+    principal, respaldos, tipo, empresa_carpeta = plan_huerfano
+    assert tipo == "otros"
+    assert empresa_carpeta is None
+
+    resultado = procesar.procesar_uno(
+        principal, respaldos, config=config, registro=registro, catalogo_obj=cat, almacen=almacen,
+        claves_procesadas_en_lote=set(), nombres_por_carpeta={}, carpeta_procesado_id=procesado_id,
+        carpeta_revisar_id=revisar_id, dry_run=False, tipo=tipo, empresa_carpeta=empresa_carpeta,
+    )
+
+    assert resultado.estado == "procesado"
+    assert registro.escritos[0]["empresa"] == "INSTITUCION"  # cliente_ruc por defecto del doble
+    assert any("huérfana" in r.getMessage() for r in caplog.records)

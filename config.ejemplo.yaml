@@ -38,9 +38,24 @@ drive:
     buzon: ""
     procesado: ""
     revisar: ""
-    # Subcarpetas de 00_BUZON, una por tipo de documento. La subcarpeta donde
-    # se deja el archivo le dice al sistema QUÉ es — dato que el documento no
-    # siempre trae:
+    # Subcarpetas de 00_BUZON. Hay DOS formas alternativas de organizarlas —
+    # NUNCA las dos a la vez: si config.yaml trae ambas secciones,
+    # init_negocio.py aborta con un mensaje claro en vez de elegir una en
+    # silencio. Cuál usar depende de cuántas empresas (RUCs distintos)
+    # facturan a este negocio — ver la lista 'empresas:' más abajo:
+    #
+    #   UNA sola empresa  -> usa 'buzon_tipos' (plano, la forma activa en
+    #                        este ejemplo). Separar además por empresa no
+    #                        aportaría nada -solo hay una- y complicaría el
+    #                        onboarding sin necesidad.
+    #   VARIAS empresas   -> usa 'buzon_empresas' (anidado, comentada más
+    #                        abajo). Sin ella, los comprobantes de todas las
+    #                        empresas caerían en las mismas 4 carpetas
+    #                        planas y habría que separarlos a mano por RUC
+    #                        antes de procesar.
+    #
+    # La subcarpeta donde se deja el archivo le dice al sistema QUÉ es — dato
+    # que el documento no siempre trae (aplica igual a las dos formas):
     #   facturas       comprobantes normales (foto, xml, pdf)
     #   notas_venta    respaldos de gastos de caja chica (foto, pdf, xls);
     #                  NO se leen con el modelo: el dato vive en el reporte de
@@ -48,12 +63,44 @@ drive:
     #   liquidaciones  compras de mercado/terminal sin comprobante formal
     #                  (pantallazos de WhatsApp, fotos, xls, pdf)
     #   otros          recibos de servicios, municipalidad, multiformato
-    # Los ids los rellena init_negocio.py. No los llenes a mano.
+    #
+    # ---- Forma 1: 'buzon_tipos' (negocio de una sola empresa) -----------
+    # Crea 00_BUZON/FACTURAS, 00_BUZON/NOTAS_DE_VENTA, etc. (plano). Los ids
+    # los rellena init_negocio.py. No los llenes a mano.
     buzon_tipos:
       facturas: ""
       notas_venta: ""
       liquidaciones: ""
       otros: ""
+    # ---- Forma 2: 'buzon_empresas' (negocio de varias empresas) ---------
+    # Crea 00_BUZON/<EMPRESA>/FACTURAS, 00_BUZON/<EMPRESA>/NOTAS_DE_VENTA,
+    # etc. (una carpeta por empresa, y dentro las 4 de siempre). Cada clave
+    # de primer nivel tiene que coincidir EXACTO con un 'nombre_corto' de la
+    # lista 'empresas:' de abajo — si nombra una empresa que no está ahí,
+    # init_negocio.py aborta. El nombre de la carpeta en Drive sale de
+    # nombre_corto reemplazando los espacios por guion bajo (ej.
+    # "LA CALETA CENTRO" -> "LA_CALETA_CENTRO"): el mismo criterio que usa
+    # 01_PROCESADO, para que sea el mismo árbol de comprobantes con una sola
+    # convención, no dos. Los ids los rellena init_negocio.py. No los llenes
+    # a mano. Para usar esta forma en un negocio de varias empresas: borra
+    # 'buzon_tipos' de arriba y descomenta este bloque (con una entrada por
+    # cada nombre_corto real del negocio, no necesariamente estas tres):
+    # buzon_empresas:
+    #   LA CALETA CENTRO:
+    #     facturas: ""
+    #     notas_venta: ""
+    #     liquidaciones: ""
+    #     otros: ""
+    #   LA CALETA NORTE:
+    #     facturas: ""
+    #     notas_venta: ""
+    #     liquidaciones: ""
+    #     otros: ""
+    #   LA CALETA INSUMOS:
+    #     facturas: ""
+    #     notas_venta: ""
+    #     liquidaciones: ""
+    #     otros: ""
 
 # Modelo de Claude usado por extractores/modelo.py para leer PDF e imágenes.
 # "esfuerzo" controla el nivel de esfuerzo de razonamiento (low/medium/high);
