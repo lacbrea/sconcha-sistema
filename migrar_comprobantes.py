@@ -70,16 +70,16 @@ logger = logging.getLogger("migrar_comprobantes")
 
 # -----------------------------------------------------------------------------
 # Configuración fija de esta migración (script de un solo uso, para UNA sola
-# empresa). No se lee de config.yaml a propósito: el alcance está cerrado
-# (solo EL TEMPLO tiene archivos; ver el encargo de este script) y así el
-# script no depende de que config.yaml no cambie mientras tanto.
+# empresa). RAIZ_ORIGEN_POR_DEFECTO no se lee de config.yaml a propósito: el
+# alcance está cerrado (solo EL TEMPLO tiene archivos; ver el encargo de este
+# script) y así el script no depende de que config.yaml no cambie mientras
+# tanto. El id de 01_PROCESADO ya no vive aqui como constante: se lee de
+# config.yaml -> drive.carpetas.procesado (ver cargar_config) para no publicar
+# un id real de Drive en un repositorio publico.
 # -----------------------------------------------------------------------------
 RAIZ_ORIGEN_POR_DEFECTO = pathlib.Path(
     r"C:\Users\luisa\OneDrive\SCONCHA\Sconcha 2\FACTURAS\EL TEMPLO"
 )
-
-# Id de Drive de 01_PROCESADO (= config.yaml -> drive.carpetas.procesado).
-CARPETA_PROCESADO_ID_POR_DEFECTO = "1lHxhikCbFFTl029vOIyk8r7W95yEbxZi"
 
 EMPRESA_DESTINO = "EL_TEMPLO"
 
@@ -450,14 +450,16 @@ def ejecutar_migracion(
 
 
 # -----------------------------------------------------------------------------
-# Modo --a-buzon: subida PLANA a 00_BUZON/<tipo>, sin árbol de meses. A
-# diferencia del resto del script (que no lee config.yaml a propósito, ver
-# el docstring del módulo), este modo SÍ lo lee: es la única forma de
-# resolver el id de la carpeta destino sin hardcodearlo.
+# Modo --a-buzon: subida PLANA a 00_BUZON/<tipo>, sin árbol de meses. Este
+# modo lee config.yaml para resolver drive.carpetas.buzon_tipos.<tipo>. El
+# modo archivo tambien lee config.yaml, pero solo para el id de
+# 01_PROCESADO por defecto (drive.carpetas.procesado) cuando no se pasa
+# --carpeta-procesado-id explicito.
 # -----------------------------------------------------------------------------
 def cargar_config(ruta_config: pathlib.Path) -> dict:
-    """Carga config.yaml. Solo la usa el modo --a-buzon (el modo archivo
-    sigue sin depender de config.yaml)."""
+    """Carga config.yaml. La usan tanto el modo --a-buzon (para
+    drive.carpetas.buzon_tipos) como el modo archivo (para el id por
+    defecto de drive.carpetas.procesado)."""
     if not ruta_config.exists():
         raise FileNotFoundError(
             f"No se encontró '{ruta_config}'. Pasa --config con la ruta correcta a config.yaml."
@@ -483,6 +485,23 @@ def resolver_carpeta_buzon(config: dict, tipo: str) -> str:
         raise ValueError(
             f"Tipo de buzon '{tipo}' no está en config.yaml -> drive.carpetas.buzon_tipos "
             f"(disponibles: {disponibles}). No se subió nada."
+        )
+    return carpeta_id
+
+
+def resolver_carpeta_procesado(config: dict) -> str:
+    """Devuelve el id de Drive de config.yaml -> drive.carpetas.procesado
+    (01_PROCESADO), usado como valor por defecto del modo archivo cuando no
+    se pasa --carpeta-procesado-id explicito.
+
+    Aborta (ValueError) si el id no esta en el config o viene vacio: mejor
+    frenar que subir la migracion a una carpeta equivocada.
+    """
+    carpeta_id = ((((config or {}).get("drive") or {}).get("carpetas") or {}).get("procesado") or "").strip()
+    if not carpeta_id:
+        raise ValueError(
+            "No hay id de Drive para 01_PROCESADO. Pasa --carpeta-procesado-id o configura "
+            "drive.carpetas.procesado en config.yaml."
         )
     return carpeta_id
 
@@ -605,8 +624,8 @@ def main(argv: list[str] | None = None) -> int:
         "--carpeta-procesado-id",
         default=None,
         help=(
-            f"Id de Drive de 01_PROCESADO (por defecto, {CARPETA_PROCESADO_ID_POR_DEFECTO!r}). "
-            "Incompatible con --a-buzon."
+            "Id de Drive de 01_PROCESADO. Si no se pasa, se lee de config.yaml -> "
+            "drive.carpetas.procesado. Incompatible con --a-buzon."
         ),
     )
     parser.add_argument(
@@ -636,7 +655,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config",
         default="config.yaml",
-        help="Ruta a config.yaml (solo la usa --a-buzon, para resolver drive.carpetas.buzon_tipos).",
+        help=(
+            "Ruta a config.yaml. La usa --a-buzon para resolver drive.carpetas.buzon_tipos, y "
+            "el modo archivo para el id por defecto de drive.carpetas.procesado (si no se pasa "
+            "--carpeta-procesado-id)."
+        ),
     )
     parser.add_argument(
         "--ejecutar",
@@ -693,7 +716,15 @@ def main(argv: list[str] | None = None) -> int:
         imprimir_resumen_buzon(resultado_buzon, args.a_buzon, dry_run=dry_run)
         return 0
 
-    carpeta_procesado_id = args.carpeta_procesado_id or CARPETA_PROCESADO_ID_POR_DEFECTO
+    if args.carpeta_procesado_id is not None:
+        carpeta_procesado_id = args.carpeta_procesado_id
+    else:
+        try:
+            config = cargar_config(pathlib.Path(args.config))
+            carpeta_procesado_id = resolver_carpeta_procesado(config)
+        except (FileNotFoundError, ValueError) as exc:
+            logger.error(str(exc))
+            return 1
 
     try:
         archivos = recorrer_arbol_origen(raiz)

@@ -6,7 +6,10 @@ credenciales.json
 token*.json
 
 # Configuración específica del negocio (contiene los IDs de los Sheets)
-config.yaml
+# config.yaml* y no config.yaml a secas: mismo criterio que token*.json arriba,
+# para que los respaldos y variantes (config.yaml.bak-..., config.yaml.old)
+# tampoco terminen en el repositorio.
+config.yaml*
 
 # Salidas de la corrida: log y cualquier archivo generado
 salida/

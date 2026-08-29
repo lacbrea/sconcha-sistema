@@ -274,8 +274,8 @@ def test_columna_link_drive_no_link_comprobante():
 
 # ---------------------------------------------------------------------------
 # Bug real: TOTAL con coma decimal (Sheet en espanol). Verificado 2026-08-23
-# contra el Sheet real (1HBrk8CDMLNCbzahWjG-HSvY4q13OnP0QZWUClbEtIxo, 'Hoja
-# 1'): FORMATTED_VALUE devuelve TOTAL '8,4' (coma decimal); el _clave()
+# contra el Sheet contable real ('Hoja 1'): FORMATTED_VALUE devuelve TOTAL
+# '8,4' (coma decimal); el _clave()
 # original hacia `.replace(",", "")` pensando que la coma siempre es
 # separador de miles, y sobre '8,4' eso da float('84') = 84.0 en vez de 8.4.
 # La deteccion de duplicados fallaba en silencio para cualquier importe con
