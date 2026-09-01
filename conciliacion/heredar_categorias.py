@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Herencia de Proveedor/Categoria/Tipo/Observacion desde una corrida anterior
+"""Herencia de Beneficiario/Categoria/Tipo/Observacion desde una corrida anterior
 (SCONCHA conciliacion v3.1) - modulo compartido, usado por build_conciliacion.py
 via la opcion `--heredar <xlsx_anterior>`.
+
+'Beneficiario' es el nombre de la columna del Excel desde el 2026-08-29 (antes
+'Proveedor'; ver el comentario de CARGOS_HEADERS en build_conciliacion.py). La
+llave interna sigue siendo 'proveedor' en el dict que devuelve build_map() (ver
+COL_PROVEEDOR mas abajo, que lee por indice de columna, no por texto del
+encabezado): renombrar esa llave es un cambio aparte, no hecho aqui.
 
 Caso de uso (ver SKILL.md "Heredar categorias de una corrida anterior"): hay que
 regenerar el Excel de un mes (ej. porque cambio el formato de EECC usado, o se
 perdieron las constancias/JSON de Gmail de esa corrida) pero SIN perder la
-depuracion manual de Proveedor/Categoria que el dueño ya hizo sobre el Excel
+depuracion manual de Beneficiario/Categoria que el dueño ya hizo sobre el Excel
 anterior de ese mismo mes/empresa (cargos que quedaban "PENDIENTE CONSTANCIA" o
 sin categoria y que el dueño corrigio a mano en el Excel).
 

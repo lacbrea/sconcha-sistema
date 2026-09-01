@@ -15,7 +15,7 @@ C:\Users\luisa\OneDrive\SCONCHA\AUTO\CONCILIACION\skill\scripts\
   acepta el motor (export Excel Interbank, PDF oficial Interbank, .xls-que-
   es-HTML de BBVA).
 - `heredar_categorias.py` — lee un `.xlsx` de una corrida anterior para que
-  el motor pueda heredar la depuración manual de Proveedor/Categoría
+  el motor pueda heredar la depuración manual de Beneficiario/Categoría
   (opción `--heredar` del motor).
 - `notificar_pendientes.py` — CLI aparte que envía por webhook el
   `pendientes.json` que el motor puede generar con `--pendientes`. No lo

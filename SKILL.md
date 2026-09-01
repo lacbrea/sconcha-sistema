@@ -211,7 +211,7 @@ C:\Python312\python.exe conciliar.py --empresa "EL TEMPLO" --mes 2026-07 --egres
   nada a Drive **ni consulta el correo**, aunque `correo.habilitado` esté
   en `true`.
 - `--sin-heredar`: no intenta heredar del `.xlsx` del mes anterior de la
-  misma empresa la depuración manual de Proveedor/Categoría (por defecto
+  misma empresa la depuración manual de Beneficiario/Categoría (por defecto
   sí lo intenta; si no encuentra nada, sigue sin heredar y lo anota en el
   log — no es error).
 - `--comprobantes <ruta.csv>`: usa ese CSV en vez de derivarlo del Sheet

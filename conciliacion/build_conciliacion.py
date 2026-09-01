@@ -85,7 +85,7 @@ ap.add_argument('--banco', default=None, choices=[None, 'interbank', 'bbva'],
                  help='(obsoleto v3.1: el formato se detecta solo; se ignora si se pasa)')
 ap.add_argument('--heredar', default=None, metavar='XLSX_ANTERIOR',
                  help='Excel de una corrida anterior de la MISMA empresa/mes (ver scripts/heredar_categorias.py): '
-                      'hereda Proveedor/Categoria/Tipo/Observacion de los cargos ya depurados a mano cuando esta '
+                      'hereda Beneficiario/Categoria/Tipo/Observacion de los cargos ya depurados a mano cuando esta '
                       'corrida no los determina automaticamente (ITF/COMISION/JUDICIAL/traspasos siempre ganan la '
                       'regla nueva). Util para regenerar un mes (ej. cambio de formato de EECC, o se perdio el '
                       'JSON de constancias de Gmail) sin perder la depuracion previa.')
@@ -791,7 +791,15 @@ wb = openpyxl.Workbook()
 wb.remove(wb.active)
 
 CARGOS_HEADERS = ['Fecha de operacion', 'Dia', 'Semana', 'Fecha de proceso', 'Nro. de operacion', 'Movimiento', 'Descripcion', 'Canal',
-                  'Cargo (S/)', 'Saldo contable', 'Tipo', 'Categoria', 'Proveedor', 'Observacion',
+                  # 'Beneficiario' y no 'Proveedor' (renombrado 2026-08-29): esta columna
+                  # nunca es el proveedor de una factura, es quien recibio el dinero del
+                  # cargo -sea una constancia de transferencia (el 'para' de Interbank), la
+                  # descripcion del propio banco, o un traspaso entre cuentas propias. Un
+                  # prestamo a una persona natural salia marcado 'PROVEEDOR' y confundia.
+                  # La columna 'Proveedor' de verdad (facturas reales, con RUC) sigue
+                  # llamandose asi en BOLETAS RENDIDAS (ver wcc('Fecha', 'Proveedor', ...)
+                  # mas abajo) y en el dict 'comprobantes': esas si son proveedores.
+                  'Cargo (S/)', 'Saldo contable', 'Tipo', 'Categoria', 'Beneficiario', 'Observacion',
                   'N Comprobante', 'Link comprobante', 'Conciliado', 'Motivo pendiente']
 CARGOS_WIDTHS = [15, 11, 8, 15, 15, 22, 28, 9, 12, 13, 26, 20, 32, 28, 28, 40, 12, 24]
 ABONOS_HEADERS = ['Fecha de operacion', 'Dia', 'Semana', 'Fecha de proceso', 'Nro. de operacion', 'Movimiento', 'Descripcion', 'Canal',
@@ -835,11 +843,11 @@ def procesar_cuenta_cargos(sheet_name, movs, transfer_ids, heredar_map=None, her
         elif 'TRANSFER' in mN and dN not in ('', '-', 'I BANC'): prov = str(d['desc']).strip(); obs = 'BENEFICIARIO DEL ESTADO'
         elif dN not in ('', '-', 'I BANC'): prov = str(d['desc']).strip(); obs = 'DESCRIPCION DEL ESTADO'
 
-        # ---- Herencia de Proveedor (--heredar), ANTES de calcular Categoria ----
+        # ---- Herencia de Beneficiario (--heredar), ANTES de calcular Categoria ----
         # Se hace antes que cat_by_prov/person_cat a proposito: si esta corrida no
         # identifico al beneficiario (I-BANC sin constancia -> PENDIENTE CONSTANCIA,
         # tipico cuando no hay JSON de Gmail), pero el archivo anterior SI lo tenia
-        # (constancia que ya no esta disponible), recuperar ese Proveedor permite que
+        # (constancia que ya no esta disponible), recuperar ese Beneficiario permite que
         # cat_by_prov() lo reconozca de nuevo por su regla normal (ej. "VELARDE" ->
         # PLANILLA) en vez de caer en la heuristica generica person_cat() por monto.
         # Los traspasos entre cuentas nunca heredan (la regla nueva siempre gana).
@@ -1410,8 +1418,8 @@ wv(f'VERIFICACION DE CUADRE - {EMP} - {PERIODO_LABEL}', '', '', True, tfill); rv
 
 if HEREDAR_MAP is not None:
     wv('HEREDAR CATEGORIAS DE CORRIDA ANTERIOR', os.path.basename(args.heredar),
-       'ver scripts/heredar_categorias.py - Proveedor/Categoria heredados cuando esta corrida no los determino sola', True, tfill)
-    wv('Cargos que heredaron Proveedor', HEREDAR_STATS['prov'])
+       'ver scripts/heredar_categorias.py - Beneficiario/Categoria heredados cuando esta corrida no los determino sola', True, tfill)
+    wv('Cargos que heredaron Beneficiario', HEREDAR_STATS['prov'])
     wv('Cargos que heredaron Categoria', HEREDAR_STATS['cat'])
     if HEREDAR_STATS['reclasificaciones']:
         wv('Cargos reclasificados vs archivo anterior', len(HEREDAR_STATS['reclasificaciones']),
@@ -1497,7 +1505,7 @@ for sh in wb.worksheets:
 wb.save(dst)
 
 if HEREDAR_MAP is not None:
-    print(f"HEREDAR ({args.heredar}): Proveedor heredado en {HEREDAR_STATS['prov']} cargo(s), "
+    print(f"HEREDAR ({args.heredar}): Beneficiario heredado en {HEREDAR_STATS['prov']} cargo(s), "
           f"Categoria heredada en {HEREDAR_STATS['cat']} cargo(s).")
     if HEREDAR_STATS['reclasificaciones']:
         print(f"Reclasificaciones vs archivo anterior ({len(HEREDAR_STATS['reclasificaciones'])}):")
