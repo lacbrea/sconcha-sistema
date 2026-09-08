@@ -6,13 +6,16 @@ hay que pasarlo a mano a ningún cuaderno ni a ningún Excel.
 
 ## Desde el celular
 
-1. Abre la app **Google Drive** con la cuenta del negocio.
-2. Entra a **SCONCHA → 00_BUZON**.
-3. Entra a la carpeta que corresponda (las cuatro están abajo).
-4. Toca el botón **+** → **Subir** → toma la foto o elige el archivo.
+1. Abre la app **Google Drive** con **tu propia cuenta de Google** (la tuya,
+   no la del negocio: te compartimos una carpeta, no hace falta otra cuenta).
+2. Toca el menú **☰** y entra a **Compartido conmigo**.
+3. Ahí vas a ver la carpeta de tu local — **EL_TEMPLO** o **INSTITUCION**,
+   la que te compartimos. Entra a esa.
+4. Entra a la carpeta que corresponda (las cuatro están abajo).
+5. Toca el botón **+** → **Subir** → toma la foto o elige el archivo.
 
-Desde la computadora es lo mismo en drive.google.com: arrastrar el archivo a la
-carpeta.
+Desde la computadora es lo mismo en drive.google.com: **Compartido conmigo**
+está en la barra de la izquierda. Arrastra el archivo a la carpeta.
 
 ## Las cuatro carpetas
 
@@ -34,14 +37,15 @@ quede sin subir.
    tiene que buscar en físico.
 3. **Súbelo el mismo día.** Juntar la semana es como se pierden.
 4. **No lo subas dos veces.** Si ya está, déjalo.
-5. **No cambies el nombre del archivo** ni muevas nada de las otras carpetas
-   (01_PROCESADO, 02_REVISAR). Esas las maneja el sistema solo.
+5. **No cambies el nombre del archivo** ni muevas archivos entre estas cuatro
+   carpetas. Lo que pasa después lo maneja el sistema solo.
 
 ## Qué pasa después
 
-El archivo desaparece de `00_BUZON` en cuanto el sistema lo lee: se va solo a
-`01_PROCESADO`, ordenado por mes. **Que se vacíe la carpeta es la señal de que
-salió bien.** Si un comprobante no se pudo leer, va a `02_REVISAR` y se avisa.
+El archivo desaparece de la carpeta en cuanto el sistema lo lee: significa que
+ya entró a la contabilidad. **Que la carpeta quede vacía es la señal de que
+salió bien.** Si un comprobante no se pudo leer, te avisamos para que lo subas
+de nuevo o lo busques en físico.
 
 ## Lo que ya no se usa
 
