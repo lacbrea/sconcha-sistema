@@ -485,6 +485,61 @@ def advertencia_fecha_nombre_vs_extraida(nombre_original: str, comp: "Comprobant
     )
 
 
+# Token tipo serie SUNAT dentro del nombre ORIGINAL de un archivo (ej. 'F558'
+# en 'TAI LOY F558-242355 04-07-26.pdf', 'FT20' en 'ROKY 15-08-26
+# FT20-1134.pdf'): letra inicial obligatoria -- así nunca confunde con una
+# fecha DD-MM-AA al inicio del nombre, que es todo dígitos (ver
+# advertencia_serie_nombre_vs_extraida) -- seguida de hasta 3 caracteres más
+# de serie, un guion y el número.
+_PATRON_SERIE_EN_NOMBRE = re.compile(r"\b([A-Z]{1,2}[A-Z0-9]{1,3})-(\d{1,8})\b", re.IGNORECASE)
+
+
+def advertencia_serie_nombre_vs_extraida(nombre_original: str, comp: "ComprobanteExtraido") -> str | None:
+    """Compara la serie-número que trae el nombre ORIGINAL del archivo (ej.
+    'TAI LOY F558-242355 04-07-26.pdf') contra comp.serie_numero, que el
+    modelo/XML devuelve ya normalizado con ceros a la izquierda (ej.
+    'F558-0242355').
+
+    Caso real que la motiva (2026-09-13): en 'TAI LOY F558-242355
+    04-07-26.pdf' un '0' desteñido del ticket se leyó como '6' y la serie
+    extraída quedó 'F558-6242355' en vez de la real 'F558-0242355' -- mismo
+    prefijo de serie que trae el nombre del archivo, pero con el número
+    cambiado. El número se compara como ENTERO (242355 == 0242355) para no
+    disparar por el relleno de ceros que agrega el modelo y sí mostrar el
+    descuadre real.
+
+    Solo advierte si algún token del nombre comparte el prefijo de serie (sin
+    distinguir mayúsculas) con comp.serie_numero: si ninguno coincide, el
+    nombre puede traer otra cosa (fecha, proveedor, lo que sea) y no hay que
+    adivinar -- se devuelve None. También devuelve None si comp.serie_numero
+    está vacío, es 'SINSERIE', o no tiene el formato prefijo-número esperado.
+    Nunca cambia el enrutado: solo se agrega a comp.advertencias, igual que
+    advertencia_fecha_nombre_vs_extraida.
+    """
+    serie_extraida = (getattr(comp, "serie_numero", None) or "").strip()
+    if not serie_extraida or serie_extraida.upper() == "SINSERIE" or "-" not in serie_extraida:
+        return None
+
+    prefijo_extraido, _, numero_extraido_txt = serie_extraida.partition("-")
+    if not prefijo_extraido or not numero_extraido_txt.isdigit():
+        return None
+    numero_extraido = int(numero_extraido_txt)
+
+    stem = pathlib.PurePosixPath(nombre_original).stem
+    for coincidencia in _PATRON_SERIE_EN_NOMBRE.finditer(stem):
+        prefijo_nombre, numero_nombre_txt = coincidencia.group(1), coincidencia.group(2)
+        if prefijo_nombre.upper() != prefijo_extraido.upper():
+            continue
+        if int(numero_nombre_txt) == numero_extraido:
+            return None
+        return (
+            f"el nombre del archivo trae la serie {prefijo_nombre}-{numero_nombre_txt}, pero la "
+            f"extraída es {serie_extraida}"
+        )
+
+    return None
+
+
 def nombre_destino(comp: "ComprobanteExtraido", extension: str) -> str:
     ruc = (getattr(comp, "proveedor_ruc", None) or "SINRUC").strip()
     serie_numero = (getattr(comp, "serie_numero", None) or "SINSERIE").strip()
@@ -1113,6 +1168,15 @@ def procesar_uno(
         if advertencia_fecha:
             comp.advertencias.append(advertencia_fecha)
             logger.warning("%s: %s", principal.name, advertencia_fecha)
+
+        # Misma idea, pero comparando la serie del nombre contra la
+        # extraída -- habría detectado en el momento el caso real de
+        # 2026-09-13 (TAI LOY F558-242355, serie leída como F558-6242355 por
+        # un '0' desteñido). Tampoco cambia el enrutado.
+        advertencia_serie = advertencia_serie_nombre_vs_extraida(principal.name, comp)
+        if advertencia_serie:
+            comp.advertencias.append(advertencia_serie)
+            logger.warning("%s: %s", principal.name, advertencia_serie)
 
         try:
             problemas = comp.validar() or []

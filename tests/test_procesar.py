@@ -1493,3 +1493,93 @@ def test_advertencia_fecha_nombre_integrada_en_procesar_uno_no_coincide():
     advertencias = registro.escritos[0]["comp"].advertencias
     assert len(advertencias) == 1
     assert "19/07" in advertencias[0] and "20/07/2026" in advertencias[0]
+
+
+# -----------------------------------------------------------------------------
+# Cambio 2026-09-13: serie del nombre del archivo original vs. la extraída
+# (cualquier tipo de comprobante). Solo advierte (comp.advertencias); nunca
+# cambia el enrutado. Caso real: 3 tickets térmicos desteñidos del
+# 2026-09-13 con un dígito mal leído por el modelo -- uno de ellos en la
+# serie ('TAI LOY F558-242355 04-07-26.pdf' leído como 'F558-6242355').
+# -----------------------------------------------------------------------------
+def test_advertencia_serie_nombre_tai_loy_coincide_no_advierte():
+    comp = ComprobanteFalso(serie_numero="F558-0242355")
+    assert procesar.advertencia_serie_nombre_vs_extraida(
+        "TAI LOY F558-242355 04-07-26.pdf", comp
+    ) is None
+
+
+def test_advertencia_serie_nombre_dolmer_coincide_no_advierte():
+    comp = ComprobanteFalso(serie_numero="FC01-0000783")
+    assert procesar.advertencia_serie_nombre_vs_extraida(
+        "DOLMER FC01-783 03-07-26.pdf", comp
+    ) is None
+
+
+def test_advertencia_serie_nombre_02_09_coincide_no_advierte():
+    comp = ComprobanteFalso(serie_numero="E001-00000210")
+    assert procesar.advertencia_serie_nombre_vs_extraida("02.09 E001-210.pdf", comp) is None
+
+
+def test_advertencia_serie_nombre_roky_coincide_no_advierte():
+    comp = ComprobanteFalso(serie_numero="FT20-0001134")
+    assert procesar.advertencia_serie_nombre_vs_extraida(
+        "ROKY 15-08-26 FT20-1134.pdf", comp
+    ) is None
+
+
+def test_advertencia_serie_nombre_xml_con_ruc_delante_coincide_no_advierte():
+    # El RUC del emisor al inicio del nombre ('20603235780-01-...') no debe
+    # confundirse con una serie: no empieza con letra.
+    comp = ComprobanteFalso(serie_numero="F001-20962703")
+    assert procesar.advertencia_serie_nombre_vs_extraida(
+        "20603235780-01-F001-20962703.xml", comp
+    ) is None
+
+
+def test_advertencia_serie_nombre_tai_loy_no_coincide_advierte():
+    # El caso real: el nombre trae '242355', la extracción quedó '6242355'
+    # por el 0 desteñido leído como 6, mismo prefijo de serie 'F558'.
+    comp = ComprobanteFalso(serie_numero="F558-6242355")
+    advertencia = procesar.advertencia_serie_nombre_vs_extraida(
+        "TAI LOY F558-242355 04-07-26.pdf", comp
+    )
+    assert advertencia is not None
+    assert "F558-242355" in advertencia
+    assert "F558-6242355" in advertencia
+
+
+def test_advertencia_serie_nombre_sin_patron_de_serie_no_advierte():
+    comp = ComprobanteFalso(serie_numero="F001-0000123")
+    assert procesar.advertencia_serie_nombre_vs_extraida("recibo_agua_julio.pdf", comp) is None
+
+
+def test_advertencia_serie_nombre_prefijo_distinto_no_advierte():
+    # El nombre sí trae una serie, pero de otro prefijo (otro documento
+    # referenciado en el nombre, por ejemplo): no se adivina, no se advierte.
+    comp = ComprobanteFalso(serie_numero="F001-0000783")
+    assert procesar.advertencia_serie_nombre_vs_extraida(
+        "DOLMER FC01-783 03-07-26.pdf", comp
+    ) is None
+
+
+def test_advertencia_serie_nombre_sin_serie_extraida_no_advierte():
+    comp = ComprobanteFalso(serie_numero="SINSERIE")
+    assert procesar.advertencia_serie_nombre_vs_extraida(
+        "TAI LOY F558-242355 04-07-26.pdf", comp
+    ) is None
+
+
+def test_advertencia_serie_nombre_integrada_en_procesar_uno_no_coincide():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    archivo = _crear_archivo(almacen, buzon_id, "TAI LOY F558-242355 04-07-26.pdf")
+
+    def falso_modelo(ruta, tipo, config=None, tipo_esperado=None):
+        return ComprobanteFalso(fecha_emision="2026-07-04", serie_numero="F558-6242355")
+
+    _modulo_extractor_modelo.extraer = falso_modelo
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "procesado"  # solo advierte, no cambia el enrutado
+    advertencias = registro.escritos[0]["comp"].advertencias
+    assert any("F558-242355" in a and "F558-6242355" in a for a in advertencias)

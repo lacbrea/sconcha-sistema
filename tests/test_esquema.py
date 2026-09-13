@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from esquema import ComprobanteExtraido, ESQUEMA_JSON, ItemExtraido, _ITEM_JSON
+from esquema import ComprobanteExtraido, ESQUEMA_JSON, ItemExtraido, _ITEM_JSON, ruc_digito_valido
 
 
 def _comprobante_base(**overrides) -> ComprobanteExtraido:
@@ -141,6 +141,54 @@ def test_validar_acepta_ruc_de_11_digitos():
     comp = _comprobante_base(proveedor_ruc="20608901494")
     advertencias = comp.validar()
     assert not any("RUC" in a for a in advertencias)
+
+
+# --- dígito verificador del RUC (bug real 2026-09-13: 2 de 24 tickets --------
+# desteñidos con RUC mal leído por el modelo, con 11 dígitos "válidos" en
+# formato pero inventados en el contenido) -----------------------------------
+
+def test_ruc_digito_valido_acepta_rucs_reales():
+    for ruc in ("10106598903", "20100049181", "20612506036"):
+        assert ruc_digito_valido(ruc), ruc
+
+
+def test_ruc_digito_valido_rechaza_rucs_mal_leidos():
+    # Casos reales del 2026-09-13: un dígito desteñido/mal leído cambia el
+    # RUC pero conserva el formato de 11 dígitos.
+    for ruc in ("10106698903", "20100491701"):
+        assert not ruc_digito_valido(ruc), ruc
+
+
+def test_ruc_digito_valido_rechaza_prefijo_invalido():
+    # '30...' no es un tipo de contribuyente que exista en SUNAT.
+    assert not ruc_digito_valido("30106598903")
+
+
+def test_ruc_digito_valido_rechaza_longitud_distinta():
+    assert not ruc_digito_valido("1010659890")
+    assert not ruc_digito_valido("101065989033")
+
+
+def test_validar_marca_ruc_con_digito_verificador_invalido():
+    comp = _comprobante_base(proveedor_ruc="10106698903")
+    advertencias = comp.validar()
+    assert any("dígito verificador" in a for a in advertencias)
+
+
+def test_validar_marca_ruc_de_cliente_con_digito_verificador_invalido():
+    comp = _comprobante_base(cliente_ruc="20100491701")
+    advertencias = comp.validar()
+    assert any("dígito verificador" in a and "cliente" in a for a in advertencias)
+
+
+def test_validar_prioriza_mensaje_de_formato_sobre_digito_verificador():
+    # Un RUC que no tiene 11 dígitos ni siquiera llega a evaluarse contra el
+    # algoritmo del dígito verificador: el mensaje debe seguir siendo el de
+    # formato, no el de "no pasa el dígito verificador".
+    comp = _comprobante_base(proveedor_ruc="12345")
+    advertencias = comp.validar()
+    assert any("no tiene 11 dígitos" in a for a in advertencias)
+    assert not any("dígito verificador" in a for a in advertencias)
 
 
 def test_validar_marca_fecha_con_formato_invalido():

@@ -124,11 +124,23 @@ class ComprobanteExtraido:
                         + " ni con ".join(referencias)
                     )
 
-        if self.proveedor_ruc is not None and not _ruc_valido(self.proveedor_ruc):
-            advertencias.append(f"El RUC del proveedor '{self.proveedor_ruc}' no tiene 11 dígitos")
+        if self.proveedor_ruc is not None:
+            if not _ruc_valido(self.proveedor_ruc):
+                advertencias.append(f"El RUC del proveedor '{self.proveedor_ruc}' no tiene 11 dígitos")
+            elif not ruc_digito_valido(self.proveedor_ruc):
+                advertencias.append(
+                    f"El RUC del proveedor '{self.proveedor_ruc}' no pasa el dígito verificador "
+                    "de SUNAT (probable lectura errónea)"
+                )
 
-        if self.cliente_ruc is not None and not _ruc_valido(self.cliente_ruc):
-            advertencias.append(f"El RUC del cliente '{self.cliente_ruc}' no tiene 11 dígitos")
+        if self.cliente_ruc is not None:
+            if not _ruc_valido(self.cliente_ruc):
+                advertencias.append(f"El RUC del cliente '{self.cliente_ruc}' no tiene 11 dígitos")
+            elif not ruc_digito_valido(self.cliente_ruc):
+                advertencias.append(
+                    f"El RUC del cliente '{self.cliente_ruc}' no pasa el dígito verificador "
+                    "de SUNAT (probable lectura errónea)"
+                )
 
         if self.fecha_emision is not None and not _fecha_valida(self.fecha_emision):
             advertencias.append(f"La fecha de emisión '{self.fecha_emision}' no tiene formato YYYY-MM-DD")
@@ -174,6 +186,48 @@ def _valores_cercanos(a: float, b: float, tolerancia: float = _TOLERANCIA_SOLES)
 def _ruc_valido(ruc: str) -> bool:
     ruc_limpio = ruc.strip()
     return ruc_limpio.isdigit() and len(ruc_limpio) == 11
+
+
+# Pesos del algoritmo módulo 11 de SUNAT para el dígito verificador del RUC,
+# aplicados sobre los primeros 10 dígitos (posición 0 = primer dígito).
+_PESOS_DIGITO_VERIFICADOR_RUC = [5, 4, 3, 2, 7, 6, 5, 4, 3, 2]
+
+# Los dos primeros dígitos del RUC identifican el tipo de contribuyente ante
+# SUNAT; solo estos prefijos existen en la práctica (10: persona natural, 15:
+# persona natural extranjera, 16/17: sucesión indivisa / sociedad conyugal,
+# 20: persona jurídica). Cualquier otro prefijo es, de por sí, una lectura
+# imposible.
+_PREFIJOS_RUC_VALIDOS = ("10", "15", "16", "17", "20")
+
+
+def ruc_digito_valido(ruc: str) -> bool:
+    """Verifica el dígito verificador de un RUC peruano (módulo 11 de SUNAT).
+
+    Existe porque `_ruc_valido()` solo confirma el FORMATO (11 dígitos), y
+    eso no basta: caso real (2026-09-13), el modelo leyó mal 2 RUCs de
+    tickets térmicos desteñidos y ambos "colaron" con 11 dígitos numéricos
+    perfectamente válidos en formato pero inventados en el contenido
+    ('10106698903' en vez de '10106598903', '20100491701' en vez de
+    '20100049181'). El dígito verificador SUNAT detecta ambos casos.
+
+    No reemplaza a `_ruc_valido()`: se llama después, solo cuando el formato
+    ya pasó (si no son 11 dígitos numéricos, ni siquiera tiene sentido correr
+    el algoritmo). Tampoco valida el caso de RUC ausente (None) o vacío --
+    eso lo sigue decidiendo el `is not None` de quien llama, para no romper
+    el caso legítimo de liquidaciones de compra sin RUC de proveedor.
+    """
+    ruc_limpio = ruc.strip()
+    if not ruc_limpio.isdigit() or len(ruc_limpio) != 11:
+        return False
+    if ruc_limpio[:2] not in _PREFIJOS_RUC_VALIDOS:
+        return False
+    suma = sum(int(digito) * peso for digito, peso in zip(ruc_limpio[:10], _PESOS_DIGITO_VERIFICADOR_RUC))
+    resto = 11 - (suma % 11)
+    if resto == 10:
+        resto = 0
+    elif resto == 11:
+        resto = 1
+    return resto == int(ruc_limpio[10])
 
 
 def _fecha_valida(fecha: str) -> bool:
