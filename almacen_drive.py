@@ -39,7 +39,15 @@ class AlmacenDrive:
     # -------------------------------------------------------------------
     def listar(self, carpeta_id: str) -> list[dict]:
         """Archivos directos de la carpeta (no recursivo). Cada dict trae
-        id, name, mimeType, size.
+        id, name, mimeType, size, md5Checksum.
+
+        md5Checksum se pide junto al resto porque procesar.py lo necesita
+        para deduplicar por CONTENIDO (huella_archivo(), ver procesar.py)
+        ANTES de descargar y extraer -- no solo por RUC|SERIE|TOTAL, que
+        recién se conoce después de pagar la llamada al modelo. Drive no lo
+        calcula para archivos nativos de Google Docs/Sheets/Slides (no
+        aplica: no son comprobantes), así que puede venir ausente; f.get()
+        lo deja en None sin romper nada.
 
         Excluye carpetas y archivos en papelera SIEMPRE del lado de
         Python, aunque la query ya se lo pida al servidor: es defensa en
@@ -54,7 +62,7 @@ class AlmacenDrive:
                 self._servicio.files()
                 .list(
                     q=query,
-                    fields="nextPageToken, files(id, name, mimeType, size, trashed)",
+                    fields="nextPageToken, files(id, name, mimeType, size, trashed, md5Checksum)",
                     pageSize=1000,
                     pageToken=token,
                 )
@@ -71,6 +79,7 @@ class AlmacenDrive:
                         "name": f["name"],
                         "mimeType": f.get("mimeType", ""),
                         "size": f.get("size"),
+                        "md5Checksum": f.get("md5Checksum"),
                     }
                 )
             token = resp.get("nextPageToken")

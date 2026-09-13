@@ -1149,7 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             logger.error(str(exc))
             return 1
-        rango = (config.get("sheets") or {}).get("rango_contable", "A1:AF")
+        rango = (config.get("sheets") or {}).get("rango_contable", "A1:AG")
         filas = leer_filas_sheet_contable(servicio_sheets, id_contable, rango)
         ruta_csv = trabajo_dir / "comprobantes.csv"
         n_comprobantes = filtrar_y_escribir_csv(

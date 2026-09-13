@@ -102,6 +102,36 @@ def test_validar_acepta_lineas_con_igv_incluido():
     assert not any("no cuadra" in a for a in comp.validar())
 
 
+def test_validar_acepta_lineas_con_igv_sin_isc_caso_pisco():
+    """Caso real: facturas de pisco con ISC (Impuesto Selectivo al Consumo).
+    Valor de venta (subtotal) 149.70, IGV 30.52, ISC 19.84, total 200.06. La
+    línea del detalle trae el importe CON IGV pero SIN el ISC: 180.22 =
+    149.70 + 30.52 (no cuadra ni con el subtotal solo ni con el total, que sí
+    incluye el ISC). La extracción es correcta campo por campo; antes de esta
+    tercera forma válida, este comprobante terminaba en revisión manual."""
+    comp = _comprobante_base(
+        subtotal=149.70,
+        igv=30.52,
+        total=200.06,
+        items=[ItemExtraido(orden=1, descripcion="PISCO ACHOLADO 750ML", total_linea=180.22)],
+    )
+    assert not any("no cuadra" in a for a in comp.validar())
+
+
+def test_validar_detecta_diferencia_cuando_no_cuadra_ni_con_subtotal_mas_igv():
+    """La tercera forma (subtotal + IGV) no puede dejar pasar un descuadre
+    real: 50 no es ni el subtotal (149.70), ni el total (200.06), ni
+    subtotal+IGV (180.22)."""
+    comp = _comprobante_base(
+        subtotal=149.70,
+        igv=30.52,
+        total=200.06,
+        items=[ItemExtraido(orden=1, descripcion="PISCO ACHOLADO 750ML", total_linea=50.00)],
+    )
+    advertencias = comp.validar()
+    assert any("no cuadra" in a for a in advertencias)
+
+
 def test_validar_detecta_diferencia_cuando_no_cuadra_ni_con_subtotal_ni_con_total():
     """Relajar la regla para aceptar lineas con IGV no puede dejar pasar un
     descuadre real: 50 no es ni el subtotal (100) ni el total (118)."""

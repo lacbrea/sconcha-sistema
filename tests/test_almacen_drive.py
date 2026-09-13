@@ -46,6 +46,7 @@ class FakeServicioDrive:
         content: bytes = b"",
         web_view_link: str | None = None,
         app_properties: dict[str, str] | None = None,
+        md5_checksum: str | None = None,
     ) -> str:
         self._contador += 1
         file_id = f"id-{self._contador}"
@@ -58,6 +59,7 @@ class FakeServicioDrive:
             "content": content,
             "webViewLink": web_view_link or f"https://drive.google.com/file/d/{file_id}/view",
             "appProperties": dict(app_properties or {}),
+            "md5Checksum": md5_checksum,
         }
         return file_id
 
@@ -177,6 +179,7 @@ class FakeServicioDrive:
                     "mimeType": archivo["mimeType"],
                     "size": str(len(archivo["content"])),
                     "trashed": archivo["trashed"],
+                    "md5Checksum": archivo.get("md5Checksum"),
                 }
             )
         return resultado
@@ -204,6 +207,31 @@ def test_listar_carpeta_vacia():
     servicio = FakeServicioDrive()
     almacen = AlmacenDrive(servicio)
     assert almacen.listar("carpeta-vacia") == []
+
+
+def test_listar_incluye_md5checksum():
+    """procesar.py necesita el md5 de cada archivo para deduplicar por
+    contenido ANTES de descargar y extraer (ver huella_archivo() en
+    procesar.py); listar() debe pedirlo y devolverlo tal cual."""
+    servicio = FakeServicioDrive()
+    servicio.agregar("a.pdf", parents=["carpeta-1"], md5_checksum="abc123")
+
+    almacen = AlmacenDrive(servicio)
+    resultado = almacen.listar("carpeta-1")
+
+    assert resultado[0]["md5Checksum"] == "abc123"
+
+
+def test_listar_md5checksum_ausente_da_none():
+    """Un Google Doc nativo (o cualquier archivo sin md5 calculado por
+    Drive) no debe romper listar(): el campo llega en None."""
+    servicio = FakeServicioDrive()
+    servicio.agregar("nota.gdoc", parents=["carpeta-1"])
+
+    almacen = AlmacenDrive(servicio)
+    resultado = almacen.listar("carpeta-1")
+
+    assert resultado[0]["md5Checksum"] is None
 
 
 # -----------------------------------------------------------------------------

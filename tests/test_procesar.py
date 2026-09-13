@@ -75,9 +75,23 @@ def _extraer_excel_por_defecto(ruta):
     raise NotImplementedError("configurar _modulo_excel_liquidacion.extraer en el test")
 
 
+def _huella_excel_por_defecto(comp) -> str:
+    """Doble de excel_liquidacion.huella(): no necesita ser bit a bit igual a
+    la implementación real (esa se prueba aparte, en
+    tests/test_excel_liquidacion.py), solo determinista y dependiente del
+    CONTENIDO del comprobante falso (fecha, total, ítems) -- lo mínimo que
+    procesar.py necesita para ejercitar la deduplicación por huella de
+    liquidaciones sin acoplarse al algoritmo real."""
+    partes = [str(getattr(comp, "fecha_emision", "")), str(getattr(comp, "total", ""))]
+    for item in getattr(comp, "items", None) or []:
+        partes.append(f"{item.descripcion}|{item.cantidad}|{item.precio_unitario}|{item.total_linea}")
+    return "liq:" + "|".join(partes)
+
+
 _modulo_xml_ubl.extraer = _extraer_xml_por_defecto
 _modulo_extractor_modelo.extraer = _extraer_modelo_por_defecto
 _modulo_excel_liquidacion.extraer = _extraer_excel_por_defecto
+_modulo_excel_liquidacion.huella = _huella_excel_por_defecto
 _modulo_auth_google.servicio_drive = lambda: None
 _modulo_auth_google.servicio_sheets = lambda: None
 _modulo_auth_google.ErrorAutenticacion = RuntimeError
@@ -101,15 +115,26 @@ class _RegistroFalso:
         self.config = config
         self.escritos = []
         self._claves_existentes = set()
+        self._huellas_existentes = set()
         self.respaldos_caja = []
         self._respaldos_existentes = set()
 
     def claves_existentes(self):
         return set(self._claves_existentes)
 
-    def escribir(self, comp, empresa, local, link_drive, archivo):
+    def huellas_existentes(self):
+        return set(self._huellas_existentes)
+
+    def escribir(self, comp, empresa, local, link_drive, archivo, huella=""):
         self.escritos.append(
-            {"comp": comp, "empresa": empresa, "local": local, "link_drive": link_drive, "archivo": archivo}
+            {
+                "comp": comp,
+                "empresa": empresa,
+                "local": local,
+                "link_drive": link_drive,
+                "archivo": archivo,
+                "huella": huella,
+            }
         )
 
     def respaldos_existentes(self):
@@ -154,6 +179,7 @@ def _aislar_dependencias(monkeypatch):
     _modulo_xml_ubl.extraer = _extraer_xml_por_defecto
     _modulo_extractor_modelo.extraer = _extraer_modelo_por_defecto
     _modulo_excel_liquidacion.extraer = _extraer_excel_por_defecto
+    _modulo_excel_liquidacion.huella = _huella_excel_por_defecto
     yield
 
 
@@ -234,9 +260,14 @@ class AlmacenDriveFalso:
         return f"{prefijo}-{self._contador}"
 
     # -- helpers de test para poblar estado -------------------------------
-    def agregar_archivo(self, carpeta_id: str, nombre: str, contenido: bytes = b"contenido de prueba") -> str:
+    def agregar_archivo(
+        self, carpeta_id: str, nombre: str, contenido: bytes = b"contenido de prueba", md5: str | None = None
+    ) -> str:
         file_id = self._nuevo_id("archivo")
-        self.archivos[file_id] = {"name": nombre, "parent": carpeta_id, "contenido": contenido, "mimeType": "application/octet-stream"}
+        self.archivos[file_id] = {
+            "name": nombre, "parent": carpeta_id, "contenido": contenido,
+            "mimeType": "application/octet-stream", "md5": md5,
+        }
         return file_id
 
     def agregar_carpeta(self, nombre: str, padre_id: str | None = None) -> str:
@@ -247,7 +278,10 @@ class AlmacenDriveFalso:
     # -- interfaz de AlmacenDrive ------------------------------------------
     def listar(self, carpeta_id: str) -> list[dict]:
         return [
-            {"id": fid, "name": f["name"], "mimeType": f["mimeType"], "size": len(f["contenido"])}
+            {
+                "id": fid, "name": f["name"], "mimeType": f["mimeType"], "size": len(f["contenido"]),
+                "md5Checksum": f.get("md5"),
+            }
             for fid, f in self.archivos.items()
             if f["parent"] == carpeta_id
         ]
@@ -385,12 +419,20 @@ def _crear_archivo_local(carpeta: pathlib.Path, nombre: str, contenido: bytes = 
     return ruta
 
 
-def _crear_archivo(almacen: AlmacenDriveFalso, carpeta_id: str, nombre: str, contenido: bytes = b"contenido de prueba") -> "procesar.ArchivoDrive":
-    file_id = almacen.agregar_archivo(carpeta_id, nombre, contenido)
-    return procesar.ArchivoDrive(id=file_id, name=nombre, mime_type="application/octet-stream", size=len(contenido))
+def _crear_archivo(
+    almacen: AlmacenDriveFalso, carpeta_id: str, nombre: str, contenido: bytes = b"contenido de prueba",
+    md5: str | None = None,
+) -> "procesar.ArchivoDrive":
+    file_id = almacen.agregar_archivo(carpeta_id, nombre, contenido, md5=md5)
+    return procesar.ArchivoDrive(
+        id=file_id, name=nombre, mime_type="application/octet-stream", size=len(contenido), md5=md5
+    )
 
 
-def _procesar_uno(archivo, respaldos, config, registro, catalogo_obj, almacen, carpeta_procesado_id, carpeta_revisar_id, dry_run=False):
+def _procesar_uno(
+    archivo, respaldos, config, registro, catalogo_obj, almacen, carpeta_procesado_id, carpeta_revisar_id,
+    dry_run=False, claves_procesadas_en_lote=None, huellas_procesadas_en_lote=None,
+):
     return procesar.procesar_uno(
         archivo,
         respaldos,
@@ -398,11 +440,12 @@ def _procesar_uno(archivo, respaldos, config, registro, catalogo_obj, almacen, c
         registro=registro,
         catalogo_obj=catalogo_obj,
         almacen=almacen,
-        claves_procesadas_en_lote=set(),
+        claves_procesadas_en_lote=set() if claves_procesadas_en_lote is None else claves_procesadas_en_lote,
         nombres_por_carpeta={},
         carpeta_procesado_id=carpeta_procesado_id,
         carpeta_revisar_id=carpeta_revisar_id,
         dry_run=dry_run,
+        huellas_procesadas_en_lote=huellas_procesadas_en_lote,
     )
 
 
@@ -596,6 +639,110 @@ def test_duplicado_va_a_revisar_sin_escribir():
     assert "duplicado" in resultado.motivo
     assert registro.escritos == []
     assert almacen.archivos[archivo.id]["parent"] == revisar_id
+
+
+# -----------------------------------------------------------------------------
+# Duplicado por HUELLA de contenido (md5 del archivo o, para Excel, huella de
+# los datos ya extraídos) -- deduplicación ANTES de descargar/extraer, no
+# solo la clave RUC|SERIE|TOTAL de después. Ver huella_archivo() en
+# procesar.py y extractores.excel_liquidacion.huella().
+# -----------------------------------------------------------------------------
+def test_duplicado_por_huella_md5_no_llama_al_modelo_ni_descarga():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    registro._huellas_existentes.add("md5:abc123")
+    archivo = _crear_archivo(almacen, buzon_id, "f.pdf", md5="ABC123")
+
+    def modelo_no_debe_llamarse(*args, **kwargs):
+        raise AssertionError("un archivo con huella ya registrada no debe llegar al extractor")
+
+    _modulo_extractor_modelo.extraer = modelo_no_debe_llamarse
+
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "duplicado"
+    assert "huella md5:abc123" in resultado.motivo
+    assert resultado.llamadas_modelo == 0
+    assert registro.escritos == []
+    assert almacen.archivos[archivo.id]["parent"] == revisar_id
+    # Tampoco se descargó: no quedó ninguna llamada a descargar() que
+    # AlmacenDriveFalso no sepa resolver (habría lanzado KeyError/excepción
+    # si procesar.py hubiera intentado descargar antes del chequeo).
+
+
+def test_duplicado_por_huella_md5_repetido_en_el_mismo_lote():
+    """Dos archivos con el MISMO md5 en la misma corrida: el primero se
+    procesa, el segundo se detecta como duplicado sin esperar a que
+    registro.huellas_existentes() refleje lo recién escrito (mismo criterio
+    que ya existe para claves_procesadas_en_lote)."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    comp1 = ComprobanteFalso(serie_numero="F001-1", total=10.0)
+    _modulo_xml_ubl.extraer = lambda ruta: comp1
+    archivo1 = _crear_archivo(almacen, buzon_id, "f1.xml", md5="MISMOMD5")
+    archivo2 = _crear_archivo(almacen, buzon_id, "f2.xml", md5="mismomd5")  # mismo hash, otra mayúscula/minúscula
+
+    huellas_lote: set[str] = set()
+    resultado1 = _procesar_uno(
+        archivo1, [], config, registro, cat, almacen, procesado_id, revisar_id,
+        huellas_procesadas_en_lote=huellas_lote,
+    )
+    resultado2 = _procesar_uno(
+        archivo2, [], config, registro, cat, almacen, procesado_id, revisar_id,
+        huellas_procesadas_en_lote=huellas_lote,
+    )
+
+    assert resultado1.estado == "procesado"
+    assert resultado2.estado == "duplicado"
+    assert "huella md5:mismomd5" in resultado2.motivo
+    assert len(registro.escritos) == 1
+
+
+def test_excel_con_md5_distinto_pero_huella_de_contenido_ya_registrada_es_duplicado():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    comp = ComprobanteFalso(
+        origen="excel", proveedor_ruc=None, serie_numero=None, subtotal=None, igv=None,
+        fecha_emision="2026-09-01", total=100.0, items=[],
+    )
+    _modulo_excel_liquidacion.extraer = lambda ruta: comp
+    huella_existente = _huella_excel_por_defecto(comp)
+    registro._huellas_existentes.add(huella_existente)
+    archivo = _crear_archivo(almacen, buzon_id, "CAQUETA 01.09.26.xlsx", md5="MD5DISTINTO")
+
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "duplicado"
+    assert "liquidación duplicada" in resultado.motivo
+    assert resultado.llamadas_modelo == 0
+    assert registro.escritos == []
+
+
+def test_registro_exitoso_de_pdf_escribe_huella_md5():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    comp = ComprobanteFalso()
+    _modulo_xml_ubl.extraer = lambda ruta: comp
+    archivo = _crear_archivo(almacen, buzon_id, "f.xml", md5="ABCDEF")
+
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "procesado"
+    assert len(registro.escritos) == 1
+    assert registro.escritos[0]["huella"] == "md5:abcdef"
+
+
+def test_registro_exitoso_de_excel_escribe_huella_liq():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    comp = ComprobanteFalso(
+        origen="excel", proveedor_ruc=None, serie_numero=None, subtotal=None, igv=None,
+        fecha_emision="2026-09-01", total=100.0, items=[],
+    )
+    _modulo_excel_liquidacion.extraer = lambda ruta: comp
+    archivo = _crear_archivo(almacen, buzon_id, "CAQUETA 01.09.26.xlsx", md5="MD5CUALQUIERA")
+
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "procesado"
+    assert len(registro.escritos) == 1
+    assert registro.escritos[0]["huella"] == _huella_excel_por_defecto(comp)
+    assert registro.escritos[0]["huella"].startswith("liq:")
 
 
 # -----------------------------------------------------------------------------

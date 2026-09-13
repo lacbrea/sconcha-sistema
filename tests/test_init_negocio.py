@@ -149,11 +149,14 @@ def test_encabezados_detalle_identicos_a_registro_sheets():
     assert init_negocio.ENCABEZADOS_DETALLE == registro_sheets.COLUMNAS_DETALLE
 
 
-def test_encabezados_contable_termina_en_archivo():
+def test_encabezados_contable_termina_en_huella():
     """Regresión explícita del bug real: la copia divergente terminaba en
-    ADVERTENCIAS (31 columnas) y le faltaba ARCHIVO (columna 32)."""
-    assert init_negocio.ENCABEZADOS_CONTABLE[-1] == "ARCHIVO"
-    assert len(init_negocio.ENCABEZADOS_CONTABLE) == 32
+    ADVERTENCIAS (31 columnas) y le faltaba ARCHIVO (columna 32). Con la
+    huella de deduplicación por contenido (columna nueva, 2026-09), la
+    cabecera ahora termina en HUELLA (columna 33), después de ARCHIVO."""
+    assert init_negocio.ENCABEZADOS_CONTABLE[-1] == "HUELLA"
+    assert init_negocio.ENCABEZADOS_CONTABLE[-2] == "ARCHIVO"
+    assert len(init_negocio.ENCABEZADOS_CONTABLE) == 33
 
 
 def test_encabezados_detalle_longitud_correcta():

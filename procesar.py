@@ -190,6 +190,11 @@ class ArchivoDrive:
     name: str
     mime_type: str = ""
     size: int | None = None
+    # md5Checksum del archivo, tal como lo reporta Drive (ver
+    # AlmacenDrive.listar()). None para archivos que Drive no calcula md5
+    # (Google Docs/Sheets/Slides nativos, que de todas formas nunca son
+    # comprobantes) -- huella_archivo() lo maneja sin fallar.
+    md5: str | None = None
 
     @property
     def stem(self) -> str:
@@ -198,6 +203,24 @@ class ArchivoDrive:
     @property
     def suffix(self) -> str:
         return pathlib.PurePosixPath(self.name).suffix
+
+
+def huella_archivo(archivo: ArchivoDrive) -> str | None:
+    """Huella de deduplicación por CONTENIDO del archivo principal, a partir
+    de su md5Checksum de Drive: 'md5:<hex en minúsculas>'.
+
+    Existe para poder deduplicar ANTES de descargar y extraer (0 llamadas al
+    modelo), no solo después vía ComprobanteExtraido.clave() -- caso real
+    (2026-09-13): 70 copias byte a byte idénticas de facturas en 02_REVISAR,
+    cada una detectada como duplicada recién DESPUÉS de pagar su llamada al
+    modelo. Además cubre las liquidaciones, que no tienen RUC ni serie con
+    los que armar esa clave. Devuelve None si el archivo no trae md5 (Google Docs
+    nativos, o el campo ausente por cualquier motivo): en ese caso no hay con
+    qué comparar, y quien llama debe tratarlo como "sin huella", nunca como
+    "huella vacía que coincide con otra vacía"."""
+    if not archivo.md5:
+        return None
+    return f"md5:{archivo.md5.lower()}"
 
 
 # -----------------------------------------------------------------------------
@@ -219,7 +242,15 @@ def listar_buzon(almacen: AlmacenDrive, carpeta_buzon_id: str) -> list[ArchivoDr
             continue
         if nombre.startswith(PREFIJOS_IGNORADOS):
             continue
-        archivos.append(ArchivoDrive(id=f["id"], name=nombre, mime_type=f.get("mimeType", ""), size=f.get("size")))
+        archivos.append(
+            ArchivoDrive(
+                id=f["id"],
+                name=nombre,
+                mime_type=f.get("mimeType", ""),
+                size=f.get("size"),
+                md5=f.get("md5Checksum"),
+            )
+        )
     return sorted(archivos, key=lambda a: a.name.lower())
 
 
@@ -1074,6 +1105,7 @@ def procesar_uno(
     dry_run: bool,
     tipo: str | None = None,
     empresa_carpeta: str | None = None,
+    huellas_procesadas_en_lote: set[str] | None = None,
 ) -> ResultadoArchivo:
     """'tipo' es la clave de buzon_tipos/buzon_empresas de la que salió el
     archivo ('facturas'|'notas_venta'|'liquidaciones'|'otros'),
@@ -1084,7 +1116,17 @@ def procesar_uno(
     nombre_corto de la empresa dueña de la subcarpeta de origen (solo con
     buzon_empresas; None en cualquier otro caso). Ver
     construir_planes_enrutados().
+
+    'huellas_procesadas_en_lote' (default None -> set nuevo, para no romper
+    llamadas existentes que no lo pasan) es el equivalente de
+    claves_procesadas_en_lote pero para la huella de deduplicación por
+    CONTENIDO (ver huella_archivo()/extractores.excel_liquidacion.huella()):
+    dos archivos con la misma huella dentro del mismo lote (misma corrida)
+    se detectan entre sí, no solo contra lo ya registrado.
     """
+    if huellas_procesadas_en_lote is None:
+        huellas_procesadas_en_lote = set()
+
     nombre = principal.name
 
     if tipo == "notas_venta":
@@ -1163,6 +1205,22 @@ def procesar_uno(
         mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
         return ResultadoArchivo(nombre, "revisar", motivo)
 
+    # Chequeo de huella por CONTENIDO (md5 del archivo principal), ANTES de
+    # descargar y extraer: 0 llamadas al modelo, 0 descargas. Cubre lo que
+    # ComprobanteExtraido.clave() no puede -RUC|SERIE|TOTAL no existe para una
+    # liquidación- y adelanta la detección para cualquier otro tipo de
+    # archivo, con el mismo costo (una comparación de sets). No aplica a
+    # notas_venta: esa rama ya resolvió su propio archivo más arriba, antes de
+    # este punto, y su idempotencia es por ARCHIVO+EMPRESA (ver
+    # registrar_respaldo_caja), no por huella de contenido.
+    huella_principal = huella_archivo(principal)
+    if huella_principal is not None and (
+        huella_principal in huellas_procesadas_en_lote or huella_principal in registro.huellas_existentes()
+    ):
+        motivo = f"archivo duplicado (huella {huella_principal} ya registrada)"
+        mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
+        return ResultadoArchivo(nombre, "duplicado", motivo, llamadas_modelo=0)
+
     with tempfile.TemporaryDirectory(prefix="sconcha_") as carpeta_temporal:
         ruta_local = pathlib.Path(carpeta_temporal) / principal.name
         try:
@@ -1210,6 +1268,21 @@ def procesar_uno(
             motivo = "datos incompletos o inválidos: " + "; ".join(problemas)
             mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
             return ResultadoArchivo(nombre, "revisar", motivo, llamadas_modelo=llamadas_modelo)
+
+        # Huella de CONTENIDO propia para liquidaciones en Excel (ver
+        # extractores.excel_liquidacion.huella): el md5 del archivo
+        # (huella_principal, ya chequeado antes de descargar) no alcanza para
+        # detectar dos liquidaciones idénticas re-guardadas/re-exportadas con
+        # bytes distintos -- solo se puede calcular DESPUÉS de extraer,
+        # porque depende de los datos ya parseados (fecha, total, ítems), no
+        # del archivo crudo.
+        huella_contenido = extractor_excel.huella(comp) if comp.origen == "excel" else None
+        if huella_contenido is not None and (
+            huella_contenido in huellas_procesadas_en_lote or huella_contenido in registro.huellas_existentes()
+        ):
+            motivo = f"liquidación duplicada (huella {huella_contenido} ya registrada)"
+            mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
+            return ResultadoArchivo(nombre, "duplicado", motivo, llamadas_modelo=llamadas_modelo)
 
         empresa_cfg, motivo_empresa = resolver_empresa_con_carpeta(config, comp, empresa_carpeta)
         if empresa_cfg is None:
@@ -1262,9 +1335,24 @@ def procesar_uno(
             clave,
             len(getattr(comp, "items", None) or []),
         )
-        registro.escribir(comp, empresa_cfg["nombre_corto"], local, link_drive, nombre_final_deseado)
+        # Qué huella se graba en la columna HUELLA: la de contenido ('liq:')
+        # para una liquidación en Excel, la del archivo ('md5:') para
+        # cualquier otro origen -- o "" si el archivo no trajo md5 (no debe
+        # pasar en la práctica, pero registro.escribir() la acepta igual).
+        huella_a_escribir = huella_contenido if huella_contenido is not None else (huella_principal or "")
+        registro.escribir(
+            comp, empresa_cfg["nombre_corto"], local, link_drive, nombre_final_deseado, huella=huella_a_escribir
+        )
 
         claves_procesadas_en_lote.add(clave)
+        # Las dos huellas (md5 del archivo Y, si aplica, la de contenido del
+        # Excel) se agregan al set del lote: una segunda copia subida en la
+        # MISMA corrida se detecta por cualquiera de las dos, sin esperar a
+        # que registro.huellas_existentes() refleje lo recién escrito.
+        if huella_principal is not None:
+            huellas_procesadas_en_lote.add(huella_principal)
+        if huella_contenido is not None:
+            huellas_procesadas_en_lote.add(huella_contenido)
 
         # Las subcarpetas AAAA-MM/EMPRESA dentro de 01_PROCESADO se crean
         # sobre la marcha. En dry-run NO se llama a asegurar_carpeta (eso
@@ -1512,6 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
         planes = planes[: args.limite]
 
     claves_procesadas_en_lote: set[str] = set()
+    huellas_procesadas_en_lote: set[str] = set()
     nombres_por_carpeta: dict[str, set[str]] = {}
     resultados: list[ResultadoArchivo] = []
 
@@ -1531,6 +1620,7 @@ def main(argv: list[str] | None = None) -> int:
                 dry_run=args.dry_run,
                 tipo=tipo,
                 empresa_carpeta=empresa_carpeta,
+                huellas_procesadas_en_lote=huellas_procesadas_en_lote,
             )
         except Exception as exc:
             # Red de seguridad final: un archivo que falla de cualquier forma

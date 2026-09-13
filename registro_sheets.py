@@ -52,6 +52,12 @@ COLUMNAS_CONTABLE = [
     "DETRACCION_MONTO", "RETENCION", "ICBPER", "DESCUENTO_GLOBAL",
     "CLIENTE_RUC", "DOC_REFERENCIA", "ORIGEN", "CONFIANZA", "ADVERTENCIAS",
     "ARCHIVO",
+    # Huella de contenido (md5 del archivo, o "liq:<sha256>" para una
+    # liquidación en Excel -- ver huella_archivo()/excel_liquidacion.huella()
+    # en procesar.py) para deduplicar ANTES de pagar la llamada al modelo.
+    # Al final de todo, como ARCHIVO: no reordena ninguna de las columnas de
+    # las que depende el motor de conciliación (las primeras 18).
+    "HUELLA",
 ]
 
 COLUMNAS_DETALLE = [
@@ -162,7 +168,7 @@ class Registro:
           "sheets": {
               "contable": "<spreadsheet id>",
               "detalle": "<spreadsheet id>",
-              "rango_contable": "A1:AF" (opcional, default "A1:AF"),
+              "rango_contable": "A1:AG" (opcional, default "A1:AG"),
               "rango_detalle": "A1:O" (opcional, default "A1:O"),
           },
           "dry_run": True/False,
@@ -190,11 +196,11 @@ class Registro:
         sheets_cfg = config.get("sheets") or {}
         self.id_contable = sheets_cfg.get("contable")
         self.id_detalle = sheets_cfg.get("detalle")
-        # Rango amplio de columnas (31 en contable, 15 en detalle) sin fijar
-        # cuantas filas: Sheets API acepta un rango abierto tipo 'A1:AF'
+        # Rango amplio de columnas (33 en contable, 15 en detalle) sin fijar
+        # cuantas filas: Sheets API acepta un rango abierto tipo 'A1:AG'
         # como destino de values().append/get, y usa la primera hoja del
         # spreadsheet cuando el rango no lleva nombre de hoja.
-        self._rango_contable = sheets_cfg.get("rango_contable", "A1:AF")
+        self._rango_contable = sheets_cfg.get("rango_contable", "A1:AG")
         self._rango_detalle = sheets_cfg.get("rango_detalle", "A1:O")
         # RESPALDOS_CAJA vive en una pestaña propia del MISMO spreadsheet
         # contable (self.id_contable), así que su rango SÍ lleva el nombre de
@@ -252,6 +258,45 @@ class Registro:
         )
         return self._claves_desde_filas(resp.get("values", []))
 
+    def huellas_existentes(self) -> set[str]:
+        """Huellas de CONTENIDO ('md5:<hex>' / 'liq:<sha256>', ver el
+        docstring de escribir()) ya presentes en la columna HUELLA del sheet
+        contable (o en salida/contable.csv si dry_run).
+
+        A diferencia de claves_existentes() (RUC|SERIE|TOTAL, calculada
+        DESPUÉS de extraer), esta huella se puede calcular ANTES de llamar al
+        modelo -- procesar.py la usa para saltarse la extracción entera de un
+        archivo ya registrado, incluidas las liquidaciones (sin RUC ni serie,
+        hasta ahora sin ninguna protección contra subir el mismo Excel dos
+        veces).
+
+        Si el sheet es viejo y su cabecera todavía no tiene HUELLA (negocio
+        que no corrió esta migración), se devuelve un set vacío en vez de
+        fallar: ese sheet simplemente no tiene con qué comparar todavía, no
+        es un error."""
+        if self.dry_run:
+            return self._huellas_desde_csv(self._csv_contable)
+
+        servicio = self._obtener_servicio()
+        # Mismas dos opciones de renderizado que claves_existentes() (ver su
+        # comentario): UNFORMATTED_VALUE + FORMATTED_STRING. La huella es
+        # texto plano, así que en la práctica esto no cambia nada para ella,
+        # pero comparte la misma llamada a values().get() sobre el mismo
+        # rango -- no hay motivo para pedirle a la API dos combinaciones
+        # distintas de la misma lectura.
+        resp = (
+            servicio.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=self.id_contable,
+                range=self._rango_contable,
+                valueRenderOption="UNFORMATTED_VALUE",
+                dateTimeRenderOption="FORMATTED_STRING",
+            )
+            .execute()
+        )
+        return self._huellas_desde_filas(resp.get("values", []))
+
     def escribir(
         self,
         comp: "ComprobanteExtraido",
@@ -259,9 +304,17 @@ class Registro:
         local: str,
         link_drive: str,
         archivo: str,
+        huella: str = "",
     ) -> None:
         """Registra un comprobante: primero sus items en el sheet de detalle,
         despues la fila del sheet contable.
+
+        'huella' (opcional, default "" para no romper llamadas existentes) es
+        la huella de deduplicación por CONTENIDO del archivo -- 'md5:<hex>'
+        para el md5Checksum de Drive, o 'liq:<sha256>' para una liquidación en
+        Excel (ver huella_archivo()/extractores.excel_liquidacion.huella() en
+        procesar.py) -- que se graba en la columna HUELLA, al final de la
+        fila contable.
 
         Orden deliberado (items primero, contable al final): claves_existentes()
         solo lee el sheet CONTABLE. Si el proceso falla a media escritura
@@ -281,7 +334,7 @@ class Registro:
         if filas_detalle:
             self._append(self.id_detalle, self._rango_detalle, COLUMNAS_DETALLE, filas_detalle, self._csv_detalle)
 
-        fila_contable = self._fila_contable(comp, empresa, local, link_drive, archivo, fecha_registro)
+        fila_contable = self._fila_contable(comp, empresa, local, link_drive, archivo, fecha_registro, huella)
         self._append(self.id_contable, self._rango_contable, COLUMNAS_CONTABLE, [fila_contable], self._csv_contable)
 
     def respaldos_existentes(self) -> set[str]:
@@ -427,6 +480,7 @@ class Registro:
         link_drive: str,
         archivo: str,
         fecha_registro: str,
+        huella: str = "",
     ) -> list[Any]:
         # ESTADO_PAGO se deja vacio a proposito al registrar: lo llena
         # despues el flujo de pagos. El motor de conciliacion SOLO cruza
@@ -478,6 +532,7 @@ class Registro:
             comp.confianza,
             advertencias,
             archivo,
+            huella,
         ]
 
     # -- Escritura (sheets reales o CSV en dry_run) -----------------------
@@ -571,6 +626,35 @@ class Registro:
             if clave:
                 claves.add(clave)
         return claves
+
+    def _huellas_desde_csv(self, csv_path: pathlib.Path) -> set[str]:
+        if not csv_path.exists():
+            return set()
+        huellas: set[str] = set()
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            for fila in csv.DictReader(f):
+                huella = str(fila.get("HUELLA") or "").strip()
+                if huella:
+                    huellas.add(huella)
+        return huellas
+
+    def _huellas_desde_filas(self, valores: list[list[Any]]) -> set[str]:
+        if not valores:
+            return set()
+        header = valores[0]
+        try:
+            i_huella = header.index("HUELLA")
+        except ValueError:
+            # Sheet viejo, todavia sin la columna HUELLA: nada que comparar.
+            return set()
+
+        huellas: set[str] = set()
+        for fila in valores[1:]:
+            valor = fila[i_huella] if i_huella < len(fila) else ""
+            huella = str(valor or "").strip()
+            if huella:
+                huellas.add(huella)
+        return huellas
 
     def _respaldos_desde_csv(self, csv_path: pathlib.Path) -> set[str]:
         if not csv_path.exists():

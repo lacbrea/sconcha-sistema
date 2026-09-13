@@ -255,3 +255,63 @@ def test_fila_sin_cantidad_o_precio_se_agrega_con_advertencia(tmp_path):
     assert comp.items[1].precio_unitario is None
     mensajes = " ".join(comp.advertencias)
     assert "YUCA" in mensajes and "CAMOTE" in mensajes
+
+
+# -----------------------------------------------------------------------------
+# Layout del pescado del terminal pesquero: a diferencia de las liquidaciones
+# de Caquetá (título en fila 2, encabezados en fila 3, arrancando en columna
+# B), este archivo real arranca en A1: título en A1, encabezados en A2:E2
+# (CANTIDAD | U. DE MEDIDA | PRODUCTO | P. UNITARIO | IMPORTE), ítems desde
+# la fila 3, fila TOTAL con fórmula =SUM(...) al final.
+# -----------------------------------------------------------------------------
+def test_layout_pesquero_arranca_en_a1_se_lee_bien(tmp_path):
+    filas = [(2, "KG", "PEJERREY", 12.0), (1, "KG", "BONITO", 8.5)]
+    ruta = _crear_xlsx(
+        tmp_path,
+        "PESQUERO 12.09.26.xlsx",
+        filas,
+        titulo="PESCADO PESQUERO 12.09.26",
+        fila_titulo=1,
+        fila_encabezado=2,
+        col_inicio=1,
+    )
+
+    comp = excel_liquidacion.extraer(ruta)
+
+    assert comp.fecha_emision == "2026-09-12"
+    assert comp.proveedor_razon_social == "PESCADO PESQUERO"
+    assert len(comp.items) == 2
+    total_esperado = round(2 * 12.0 + 1 * 8.5, 2)
+    assert comp.total == total_esperado
+    assert comp.validar(hoy=date(2026, 9, 13)) == []
+
+
+# -----------------------------------------------------------------------------
+# huella(): deduplicación por contenido, independiente del nombre de archivo
+# o del proveedor/título -- ver el docstring de excel_liquidacion.huella().
+# -----------------------------------------------------------------------------
+def test_huella_mismo_contenido_distinto_nombre_y_titulo_da_la_misma_huella(tmp_path):
+    filas = [(10, "KG", "LIMON", 1.5), (2, "KG", "AJO", 3.25)]
+    ruta_a = _crear_xlsx(tmp_path, "CAQUETA 05.09.26.xlsx", filas, titulo="VERDURA CAQUETA 05.09.26")
+    ruta_b = _crear_xlsx(tmp_path, "OTRO NOMBRE 05.09.26.xlsx", filas, titulo="OTRO PROVEEDOR 05.09.26")
+
+    comp_a = excel_liquidacion.extraer(ruta_a)
+    comp_b = excel_liquidacion.extraer(ruta_b)
+
+    assert excel_liquidacion.huella(comp_a) == excel_liquidacion.huella(comp_b)
+
+
+def test_huella_cambia_si_cambia_una_cantidad(tmp_path):
+    ruta_a = _crear_xlsx(tmp_path, "CAQUETA 05.09.26.xlsx", [(10, "KG", "LIMON", 1.5)])
+    ruta_b = _crear_xlsx(tmp_path, "CAQUETA2 05.09.26.xlsx", [(11, "KG", "LIMON", 1.5)])
+
+    comp_a = excel_liquidacion.extraer(ruta_a)
+    comp_b = excel_liquidacion.extraer(ruta_b)
+
+    assert excel_liquidacion.huella(comp_a) != excel_liquidacion.huella(comp_b)
+
+
+def test_huella_empieza_con_prefijo_liq(tmp_path):
+    ruta = _crear_xlsx(tmp_path, "CAQUETA 05.09.26.xlsx", [(1, "KG", "APIO", 1.0)])
+    comp = excel_liquidacion.extraer(ruta)
+    assert excel_liquidacion.huella(comp).startswith("liq:")

@@ -113,7 +113,21 @@ class ComprobanteExtraido:
                 # algo mal, y la advertencia nombra ambas referencias.
                 cuadra_subtotal = self.subtotal is not None and _valores_cercanos(suma_items, self.subtotal)
                 cuadra_total = self.total is not None and _valores_cercanos(suma_items, self.total)
-                if not cuadra_subtotal and not cuadra_total:
+                # Tercera forma válida: subtotal + IGV, sin ISC (Impuesto
+                # Selectivo al Consumo). Caso real: facturas de pisco con ISC
+                # -- valor de venta (subtotal) 149.70, IGV 30.52, ISC 19.84,
+                # total 200.06 -- donde el detalle imprime el importe CON IGV
+                # pero SIN el ISC: la única línea trae 180.22 (= 149.70 +
+                # 30.52), que no cuadra ni con el subtotal solo ni con el
+                # total (que sí incluye el ISC). Mismo motivo cubre cualquier
+                # otro cargo que se sume fuera de las líneas de detalle
+                # (ICBPER u otro adicional), no solo ISC.
+                cuadra_subtotal_mas_igv = (
+                    self.subtotal is not None
+                    and self.igv is not None
+                    and _valores_cercanos(suma_items, self.subtotal + self.igv)
+                )
+                if not cuadra_subtotal and not cuadra_total and not cuadra_subtotal_mas_igv:
                     referencias = []
                     if self.subtotal is not None:
                         referencias.append(f"el subtotal (S/ {round(self.subtotal, 2)})")

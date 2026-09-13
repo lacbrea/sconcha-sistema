@@ -250,7 +250,7 @@ def test_columnas_contable_orden_y_nombres_exactos():
         "MONEDA", "TIPO_CAMBIO", "FECHA_VENCIMIENTO", "DETRACCION_PCT",
         "DETRACCION_MONTO", "RETENCION", "ICBPER", "DESCUENTO_GLOBAL",
         "CLIENTE_RUC", "DOC_REFERENCIA", "ORIGEN", "CONFIANZA", "ADVERTENCIAS",
-        "ARCHIVO",
+        "ARCHIVO", "HUELLA",
     ]
 
 
@@ -516,6 +516,111 @@ def test_claves_existentes_detecta_duplicado_con_total_formateado_coma_decimal(t
         items=[],
     )
     assert nuevo.clave() in claves  # se detecta como duplicado: no se vuelve a registrar
+
+
+# ---------------------------------------------------------------------------
+# HUELLA: deduplicación por contenido (md5 del archivo, o 'liq:<sha256>' para
+# una liquidación en Excel), calculable ANTES de pagar la llamada al modelo.
+# ---------------------------------------------------------------------------
+def test_escribir_graba_la_huella_en_la_columna_huella(tmp_path):
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+    comp = _comprobante_con_items()
+
+    registro.escribir(comp, empresa="SCONCHA", local="MIRAFLORES", link_drive="", archivo="a.pdf", huella="md5:abc123")
+
+    csv_contable = tmp_path / "salida" / "contable.csv"
+    with csv_contable.open(encoding="utf-8", newline="") as f:
+        filas = list(csv.DictReader(f))
+    assert filas[0]["HUELLA"] == "md5:abc123"
+
+
+def test_escribir_sin_huella_deja_la_columna_vacia_por_default(tmp_path):
+    """El parámetro 'huella' tiene default "" a propósito: no debe romper
+    ninguna llamada existente a escribir() que no lo pase."""
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+    registro.escribir(_comprobante_sin_items(), empresa="SCONCHA", local="LINCE", link_drive="", archivo="b.pdf")
+
+    csv_contable = tmp_path / "salida" / "contable.csv"
+    with csv_contable.open(encoding="utf-8", newline="") as f:
+        filas = list(csv.DictReader(f))
+    assert filas[0]["HUELLA"] == ""
+
+
+def test_huellas_existentes_dry_run_vacio_si_no_hay_csv(tmp_path):
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+    assert registro.huellas_existentes() == set()
+
+
+def test_huellas_existentes_dry_run_refleja_lo_escrito(tmp_path):
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+    registro.escribir(_comprobante_con_items(), empresa="SCONCHA", local="MIRAFLORES", link_drive="", archivo="a.pdf", huella="md5:abc123")
+    registro.escribir(_comprobante_sin_items(), empresa="SCONCHA", local="LINCE", link_drive="", archivo="b.xlsx", huella="liq:def456")
+
+    assert registro.huellas_existentes() == {"md5:abc123", "liq:def456"}
+
+
+def test_huellas_existentes_dry_run_ignora_filas_sin_huella(tmp_path):
+    """Un comprobante registrado antes de esta migración (o escrito sin pasar
+    'huella') no debe colar una cadena vacía como si fuera una huella real."""
+    config = _config_dry_run(tmp_path)
+    registro = Registro(config)
+    registro.escribir(_comprobante_con_items(), empresa="SCONCHA", local="MIRAFLORES", link_drive="", archivo="a.pdf")
+
+    assert registro.huellas_existentes() == set()
+
+
+def test_huellas_existentes_via_servicio_fake(tmp_path):
+    fake = FakeServicioSheets()
+    config = {
+        "dry_run": False,
+        "catalogo_csv": str(_catalogo_csv_minimo(tmp_path)),
+        "sheets": {"contable": "SHEET_CONTABLE", "detalle": "SHEET_DETALLE"},
+    }
+    registro = Registro(config, servicio=fake)
+    registro.escribir(_comprobante_con_items(), empresa="SCONCHA", local="MIRAFLORES", link_drive="", archivo="a.pdf", huella="md5:abc123")
+
+    assert registro.huellas_existentes() == {"md5:abc123"}
+
+
+def test_huellas_existentes_pide_unformatted_value(tmp_path):
+    """Mismo criterio que claves_existentes(): UNFORMATTED_VALUE +
+    FORMATTED_STRING, para no arrastrar el mismo bug de coma decimal a otra
+    lectura del sheet contable."""
+    fake = FakeServicioSheets()
+    config = {
+        "dry_run": False,
+        "catalogo_csv": str(_catalogo_csv_minimo(tmp_path)),
+        "sheets": {"contable": "SHEET_CONTABLE", "detalle": "SHEET_DETALLE"},
+    }
+    registro = Registro(config, servicio=fake)
+
+    registro.huellas_existentes()
+
+    llamadas = [l for l in fake.llamadas_get if l["spreadsheetId"] == "SHEET_CONTABLE"]
+    assert llamadas, "huellas_existentes() no llamo a values().get() sobre el sheet contable"
+    assert llamadas[-1]["valueRenderOption"] == "UNFORMATTED_VALUE"
+    assert llamadas[-1]["dateTimeRenderOption"] == "FORMATTED_STRING"
+
+
+def test_huellas_existentes_sheet_viejo_sin_columna_huella_da_set_vacio(tmp_path):
+    """Un Sheet contable que todavía no tiene la columna HUELLA (negocio que
+    no corrió esta migración) no debe fallar: solo no tiene con qué
+    comparar."""
+    fake = FakeServicioSheets()
+    cabecera_vieja = [c for c in COLUMNAS_CONTABLE if c != "HUELLA"]
+    fake.store["SHEET_CONTABLE"] = [cabecera_vieja, ["" for _ in cabecera_vieja]]
+    config = {
+        "dry_run": False,
+        "catalogo_csv": str(_catalogo_csv_minimo(tmp_path)),
+        "sheets": {"contable": "SHEET_CONTABLE", "detalle": "SHEET_DETALLE"},
+    }
+    registro = Registro(config, servicio=fake)
+
+    assert registro.huellas_existentes() == set()
 
 
 # ---------------------------------------------------------------------------

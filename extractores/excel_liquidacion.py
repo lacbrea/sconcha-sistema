@@ -18,6 +18,7 @@ razonable que extraer.
 """
 from __future__ import annotations
 
+import hashlib
 import pathlib
 import re
 import unicodedata
@@ -113,6 +114,42 @@ def extraer(ruta: pathlib.Path) -> ComprobanteExtraido:
     comp.items = items
     comp.advertencias = advertencias
     return comp
+
+
+def huella(comp: ComprobanteExtraido) -> str:
+    """Huella de deduplicación por CONTENIDO de una liquidación ya extraída
+    (contraparte de huella_archivo() en procesar.py, que usa el md5 del
+    archivo para PDF/imagen/XML).
+
+    Motivo de una huella propia para Excel en vez de reusar el md5 del
+    archivo: el md5 depende de los BYTES exactos del .xlsx, y dos copias
+    idénticas en los datos visibles pueden tener md5 distinto si alguien
+    reabrió y reguardó el archivo con Excel (la metadata interna del zip del
+    .xlsx cambia). El caso real que motiva esto -70 copias byte a byte
+    idénticas subidas dos veces- sí lo habría cubierto el md5 solo, pero una
+    huella basada en el CONTENIDO ya extraído (fecha, total, cada ítem)
+    también cubre el caso más general de un mismo reparto re-guardado o
+    re-exportado antes de subirlo de nuevo. Nunca depende del nombre del
+    archivo ni del proveedor/título -dos liquidaciones con los mismos datos
+    pero nombres distintos deben dar la MISMA huella-, ni de nada que no sea
+    el contenido que ya quedó en `comp`.
+
+    'liq:' al inicio la distingue de la 'md5:' de huella_archivo(): las dos
+    conviven en la misma columna HUELLA del sheet contable
+    (registro_sheets.COLUMNAS_CONTABLE).
+    """
+    partes = [
+        str(comp.fecha_emision or ""),
+        f"{comp.total:.2f}" if comp.total is not None else "",
+    ]
+    for item in comp.items:
+        partes.append((item.descripcion or "").strip().upper())
+        partes.append(f"{item.cantidad:.4f}" if item.cantidad is not None else "")
+        partes.append(item.unidad or "")
+        partes.append(f"{item.precio_unitario:.4f}" if item.precio_unitario is not None else "")
+        partes.append(f"{item.total_linea:.4f}" if item.total_linea is not None else "")
+    texto_normalizado = "|".join(partes)
+    return "liq:" + hashlib.sha256(texto_normalizado.encode("utf-8")).hexdigest()
 
 
 # -----------------------------------------------------------------------------
