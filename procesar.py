@@ -81,7 +81,10 @@ NOMBRES_IGNORADOS = {"desktop.ini", "thumbs.db"}
 # imagen). Es un valor de referencia, NO el precio real de la API de
 # Anthropic: ajústalo en esta constante si cambia el precio del modelo o el
 # nivel de esfuerzo configurado en config.yaml (modelo / esfuerzo).
-COSTO_ESTIMADO_USD_POR_LLAMADA_MODELO = 0.02
+# 0.012 medido el 2026-09-13 con claude-sonnet-5 / esfuerzo low sobre
+# comprobantes reales (rango 0.009-0.019; la primera llamada de la corrida
+# paga la escritura del caché del prompt). Con claude-opus-5 eran ~0.024.
+COSTO_ESTIMADO_USD_POR_LLAMADA_MODELO = 0.012
 
 FORMATOS_FECHA = ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y")
 
