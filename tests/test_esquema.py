@@ -1,6 +1,7 @@
 """Tests de esquema.py: clave() de deduplicación y validar(). Sin red, sin credenciales."""
 import pathlib
 import sys
+from datetime import date, timedelta
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -177,6 +178,74 @@ def test_validar_nunca_lanza_excepcion_con_comprobante_vacio():
     # No debe lanzar, incluso sin ningún dato.
     advertencias = comp.validar()
     assert isinstance(advertencias, list)
+
+
+# --- plausibilidad de fecha (bug: el modelo inventa el año) ------------------
+#
+# Bug real: sin esta validación, un "2024" pasaba en silencio porque
+# `_fecha_valida()` solo mira el FORMATO (strptime), no si la fecha tiene
+# sentido -- así el comprobante quedaba fuera de la ventana de conciliación
+# sin que nadie se enterara. La ventana es holgada a propósito: dos meses de
+# atraso es un caso legítimo y NO debe marcarse.
+
+def test_validar_marca_fecha_de_2024_como_demasiado_antigua():
+    comp = _comprobante_base(fecha_emision="2024-05-15")
+    advertencias = comp.validar(hoy=date(2026, 9, 11))
+    assert any("antigua" in a.lower() for a in advertencias)
+
+
+def test_validar_fecha_de_hace_dos_meses_pasa_limpia():
+    hoy = date(2026, 9, 11)
+    comp = _comprobante_base(fecha_emision=(hoy - timedelta(days=60)).isoformat())
+    advertencias = comp.validar(hoy=hoy)
+    assert not any("antigua" in a.lower() or "futura" in a.lower() for a in advertencias)
+
+
+def test_validar_marca_fecha_a_30_dias_en_el_futuro():
+    hoy = date(2026, 9, 11)
+    comp = _comprobante_base(fecha_emision=(hoy + timedelta(days=30)).isoformat())
+    advertencias = comp.validar(hoy=hoy)
+    assert any("futura" in a.lower() for a in advertencias)
+
+
+def test_validar_acepta_fecha_futura_dentro_de_la_ventana_de_7_dias():
+    hoy = date(2026, 9, 11)
+    comp = _comprobante_base(fecha_emision=(hoy + timedelta(days=5)).isoformat())
+    advertencias = comp.validar(hoy=hoy)
+    assert not any("futura" in a.lower() for a in advertencias)
+
+
+def test_validar_evalua_tambien_la_plausibilidad_de_fecha_vencimiento():
+    hoy = date(2026, 9, 11)
+    comp = _comprobante_base(fecha_vencimiento="2024-01-01")
+    advertencias = comp.validar(hoy=hoy)
+    assert any("vencimiento" in a.lower() and "antigua" in a.lower() for a in advertencias)
+
+
+def test_validar_acepta_vencimiento_futuro_de_factura_a_credito():
+    # Una factura a 60 días vence en el futuro por diseño: no debe caer a
+    # 02_REVISAR (validar() devuelve advertencias y procesar.py manda a
+    # revisar ante cualquiera).
+    hoy = date(2026, 9, 11)
+    comp = _comprobante_base(fecha_emision=hoy.isoformat(), fecha_vencimiento=(hoy + timedelta(days=60)).isoformat())
+    advertencias = comp.validar(hoy=hoy)
+    assert not any("futura" in a.lower() for a in advertencias)
+
+
+def test_validar_sin_hoy_explicito_usa_la_fecha_de_hoy_del_sistema(monkeypatch):
+    import esquema
+
+    class _FechaFalsa(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 9, 11)
+
+    monkeypatch.setattr(esquema, "date", _FechaFalsa)
+    comp = _comprobante_base(fecha_emision="2024-05-15")
+
+    advertencias = comp.validar()
+
+    assert any("antigua" in a.lower() for a in advertencias)
 
 
 # --- límite de uniones de la API --------------------------------------------

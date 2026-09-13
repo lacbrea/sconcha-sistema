@@ -23,6 +23,7 @@ import base64
 import json
 import os
 import pathlib
+from datetime import date
 
 import anthropic
 
@@ -30,7 +31,7 @@ from esquema import ComprobanteExtraido, ESQUEMA_JSON, ItemExtraido
 
 # Defaults si `config` no trae 'modelo' / 'esfuerzo', o si se llama sin config
 # (por ejemplo desde un test). El valor real de negocio sale de config.yaml.
-_MODELO_DEFECTO = "claude-opus-5"
+_MODELO_DEFECTO = "claude-sonnet-5"
 _ESFUERZO_DEFECTO = "low"
 
 # El thinking adaptativo de Opus 5 viene encendido por defecto y max_tokens
@@ -66,7 +67,11 @@ class RespuestaRechazadaError(ErrorModeloClaude):
 
 
 def extraer(
-    ruta: pathlib.Path, tipo: str, config: dict | None = None, tipo_esperado: str | None = None
+    ruta: pathlib.Path,
+    tipo: str,
+    config: dict | None = None,
+    tipo_esperado: str | None = None,
+    hoy: date | None = None,
 ) -> ComprobanteExtraido:
     """Extrae un comprobante con el modelo Claude a partir de un PDF o una foto.
 
@@ -78,7 +83,7 @@ def extraer(
       `cliente_ruc` / `cliente_razon_social` tal cual aparecen en el
       documento — quien orqueste hace la asignación de empresa a partir de
       ahí, así que no es indispensable.
-    - `config['modelo']`: nombre del modelo (default `claude-opus-5`).
+    - `config['modelo']`: nombre del modelo (default `claude-sonnet-5`).
     - `config['esfuerzo']`: `effort` de structured outputs (default `low`).
 
     `tipo_esperado` es opcional (default `None`) y viene de procesar.py cuando
@@ -95,6 +100,11 @@ def extraer(
     (una liquidación seguida de un recibo de servicio), así que meterlo en el
     system invalidaría el cache en cada llamada distinta.
 
+    `hoy` es opcional (default `None`, usa `date.today()`) y existe para que
+    los tests puedan inyectar una fecha fija sin pisar el reloj del sistema.
+    Es la ancla temporal que el prompt necesita para no inventar el año de
+    una fecha sin año legible (ver docstring de `_construir_prompt`).
+
     Lanza `ErrorModeloClaude` (o una de sus subclases) ante cualquier fallo
     irrecuperable — no hay resultado parcial razonable que devolver si la
     llamada a la API falla del todo o la respuesta no se puede interpretar.
@@ -107,6 +117,7 @@ def extraer(
     empresas = config.get("empresas")
     modelo = config.get("modelo") or _MODELO_DEFECTO
     esfuerzo = config.get("esfuerzo") or _ESFUERZO_DEFECTO
+    hoy = hoy or date.today()
 
     if tipo == "imagen" and ruta.suffix.lower() in _EXTENSIONES_NO_SOPORTADAS:
         raise FormatoNoSoportadoError(
@@ -125,7 +136,7 @@ def extraer(
     bloque_documento = _construir_bloque_documento(ruta, tipo)
 
     system = [
-        {"type": "text", "text": _construir_prompt(empresas), "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": _construir_prompt(empresas, hoy), "cache_control": {"type": "ephemeral"}},
     ]
     texto_instruccion = (
         "Extrae la información estructurada de este comprobante en JSON, "
@@ -181,7 +192,7 @@ def extraer(
     return _procesar_respuesta(respuesta, tipo)
 
 
-def _construir_prompt(empresas: list[dict] | None) -> str:
+def _construir_prompt(empresas: list[dict] | None, hoy: date | None = None) -> str:
     """Arma el prompt del sistema.
 
     Determinista a propósito: para el mismo `config` (misma lista de
@@ -197,7 +208,19 @@ def _construir_prompt(empresas: list[dict] | None) -> str:
     que poder instalarse en cualquier empresa con solo cambiar `config.yaml`;
     el modelo igual extrae `cliente_ruc` / `cliente_razon_social` tal cual
     aparecen en el documento, y quien orqueste hace la asignación de empresa.
+
+    `hoy` (default `None`, usa `date.today()`) es la ancla temporal que evita
+    que el modelo invente el año de una fecha sin año legible (bug real: 10
+    liquidaciones salieron con año 2024/2025 o vacío porque el prompt nunca
+    decía qué fecha era "hoy"). Va en ESTE bloque de system (cacheado), no en
+    el mensaje de usuario, a propósito: cambia como máximo una vez por día
+    (`date.today()`), así que invalida el `cache_control` a lo sumo una vez
+    cada 24 horas en vez de en cada documento — a diferencia de
+    `tipo_esperado`, que cambia de un archivo a otro dentro de la misma
+    corrida y por eso sí va en el turno del usuario (ver docstring de
+    `extraer`).
     """
+    hoy = hoy or date.today()
     bullets_proveedor_cliente = [
         "- PROVEEDOR = la empresa que EMITE el comprobante. Aparece en el encabezado/parte superior del "
         "documento (nombre comercial, RUC, dirección fiscal). NO es el cliente/comprador.",
@@ -268,6 +291,14 @@ total_linea Y PRECIO:
 total_linea / cantidad.
 - Los precios son en soles peruanos, sin símbolo, salvo que el documento indique explícitamente USD.
 - Las fechas vienen en formato dd/mm/yyyy en la factura — conviértelas a YYYY-MM-DD
+
+ANCLA TEMPORAL — hoy es {hoy.isoformat()}:
+- Si el documento no muestra el año con claridad (recibo borroso, cortado, o que de verdad no imprime el \
+año), usa el año más reciente que NO deje la fecha en el futuro respecto a hoy. En la práctica: el año en \
+curso, salvo en enero, donde un documento de diciembre sin año pertenece al año anterior (diciembre no \
+puede ser una fecha futura de enero).
+- Nunca inventes un año más antiguo que ese criterio — no adivines 2024 ni 2025 porque "suena razonable" \
+para un comprobante viejo; usa siempre el más reciente que sea válido según la regla anterior.
 
 DETRACCIÓN:
 - Busca la leyenda típica "Operación sujeta al Sistema de Pago de Obligaciones Tributarias (SPOT)" o \

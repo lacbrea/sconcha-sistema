@@ -105,7 +105,7 @@ drive:
 # Modelo de Claude usado por extractores/modelo.py para leer PDF e imágenes.
 # "esfuerzo" controla el nivel de esfuerzo de razonamiento (low/medium/high);
 # "low" alcanza para lectura de comprobantes y mantiene el costo bajo.
-modelo: claude-opus-5
+modelo: claude-sonnet-5
 esfuerzo: low
 
 # Una entrada por cada razón social (RUC) que factura a nombre de este

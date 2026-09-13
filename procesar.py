@@ -39,6 +39,14 @@ import yaml
 
 from almacen_drive import AlmacenDrive
 
+# egresos_caja.py es del otro pipeline (conciliar.py), pero su parser de
+# contenido (parsear_egresos/_resolver_tabla) es justo lo que necesita
+# procesar.py para reconocer, por CONTENIDO y no por extensión, un reporte
+# de egresos de caja que llegó a la subcarpeta notas_venta del buzón (ver
+# procesar_reporte_egresos más abajo). No se toca egresos_caja.py: solo se
+# reutiliza su función pública.
+import egresos_caja
+
 # Los tipos del contrato compartido (esquema.py) solo se usan para anotar;
 # procesar.py nunca los importa en tiempo de ejecución (duck typing), así
 # que puede correr aunque esquema.py todavía no exista.
@@ -122,6 +130,28 @@ NOMBRE_CARPETA_POR_CLAVE_BUZON = {
 # Patrón de fecha al inicio del nombre de un respaldo de caja chica
 # (NOTAS_DE_VENTA), ej. "01.07 BOLETAS.pdf" -> día 01, mes 07.
 _PATRON_FECHA_NOMBRE_NOTA_VENTA = re.compile(r"^(\d{2})\.(\d{2})")
+
+# Patrón de fecha al inicio del nombre ORIGINAL de un comprobante cualquiera
+# (convención del negocio, ej. "19.07 Compras pesquero.pdf" -> día 19, mes
+# 07), usado para advertir si no coincide con la fecha de emisión extraída
+# (ver advertencia_fecha_nombre_vs_extraida). Más permisivo que
+# _PATRON_FECHA_NOMBRE_NOTA_VENTA (1 o 2 dígitos, no exige cero a la
+# izquierda) porque acá no hay que construir una fecha válida con el año en
+# curso: solo comparar día y mes tal como aparecen.
+_PATRON_FECHA_NOMBRE_COMPROBANTE = re.compile(r"^(\d{1,2})\.(\d{1,2})\b")
+
+# Motivo para 02_REVISAR cuando se reconoce por contenido que un archivo de
+# notas_venta ES un reporte de egresos de caja (trae el <link id=shLink> del
+# frameset de Excel, ver egresos_caja.py) pero en el formato .xls que Drive
+# no puede abrir porque le falta su carpeta hermana "<nombre>_archivos/"
+# (Drive no sube carpetas sueltas, solo el archivo principal). Detectar este
+# caso puntual es barato (mismo _resolver_tabla que ya usa parsear_egresos)
+# y evita que el reporte se archive como si fuera una boleta cualquiera.
+MOTIVO_EGRESOS_XLS_SIN_HTM = (
+    "parece el reporte de egresos de caja, pero en formato .xls (frameset de Excel): "
+    "le falta su carpeta '_archivos/' con los datos, que Drive no conserva al subir solo "
+    "el archivo principal. Pide que lo vuelvan a guardar/exportar como .htm y súbelo de nuevo."
+)
 
 
 @dataclasses.dataclass
@@ -398,6 +428,63 @@ def extraer_fecha_nombre_archivo(nombre: str, hoy: datetime.date | None = None) 
         return ""
 
 
+def _parsear_fecha_emision(comp: "ComprobanteExtraido") -> datetime.date | None:
+    """Igual que anio_mes(), pero devuelve la fecha completa (no solo
+    AAAA-MM) para poder comparar día y mes contra el nombre del archivo (ver
+    advertencia_fecha_nombre_vs_extraida). Devuelve None si no hay
+    fecha_emision o no se pudo interpretar en ninguno de los formatos
+    conocidos."""
+    valor = getattr(comp, "fecha_emision", None)
+    if valor is None:
+        return None
+    if isinstance(valor, datetime.datetime):
+        return valor.date()
+    if isinstance(valor, datetime.date):
+        return valor
+    texto = str(valor).strip()
+    for formato in FORMATOS_FECHA:
+        try:
+            return datetime.datetime.strptime(texto, formato).date()
+        except ValueError:
+            continue
+    return None
+
+
+def advertencia_fecha_nombre_vs_extraida(nombre_original: str, comp: "ComprobanteExtraido") -> str | None:
+    """Compara el DD.MM al inicio del nombre ORIGINAL del archivo (convención
+    del negocio, ej. '19.07 Compras pesquero.pdf') contra el día y mes de la
+    fecha de emisión que extrajo el modelo/XML.
+
+    El nombre del archivo NUNCA trae el año (igual que en
+    extraer_fecha_nombre_archivo), así que el año nunca se compara — solo
+    día y mes. Esto es lo que habría detectado en el momento las 10
+    liquidaciones con año inventado por el modelo (ver bug de la coma /
+    fecha inventada en la memoria del proyecto).
+
+    Devuelve un texto de advertencia si no coinciden, o None si coinciden o
+    si no hay nada que comparar (el nombre no trae el patrón DD.MM al
+    inicio, o no se pudo extraer una fecha de emisión utilizable). Nunca
+    cambia el enrutado del archivo: solo se agrega a comp.advertencias.
+    """
+    stem = pathlib.PurePosixPath(nombre_original).stem
+    coincidencia = _PATRON_FECHA_NOMBRE_COMPROBANTE.match(stem)
+    if not coincidencia:
+        return None
+
+    fecha_extraida = _parsear_fecha_emision(comp)
+    if fecha_extraida is None:
+        return None
+
+    dia_nombre, mes_nombre = int(coincidencia.group(1)), int(coincidencia.group(2))
+    if dia_nombre == fecha_extraida.day and mes_nombre == fecha_extraida.month:
+        return None
+
+    return (
+        f"el nombre del archivo sugiere {dia_nombre:02d}/{mes_nombre:02d}, pero la fecha de "
+        f"emisión extraída es {fecha_extraida.strftime('%d/%m/%Y')} (no se compara el año)"
+    )
+
+
 def nombre_destino(comp: "ComprobanteExtraido", extension: str) -> str:
     ruc = (getattr(comp, "proveedor_ruc", None) or "SINRUC").strip()
     serie_numero = (getattr(comp, "serie_numero", None) or "SINSERIE").strip()
@@ -672,6 +759,179 @@ def resolver_empresa_local_nota_venta(
 
 
 # -----------------------------------------------------------------------------
+# Reporte de egresos de caja llegado a notas_venta (desde septiembre 2026)
+# -----------------------------------------------------------------------------
+def _resolver_empresa_reporte_egresos(config: dict, empresa_carpeta: str | None) -> tuple[str, str | None]:
+    """Nombre_corto de la empresa dueña de un reporte de egresos detectado
+    en notas_venta. Mismo criterio de asignación que
+    resolver_empresa_local_nota_venta() (la carpeta de origen manda cuando
+    hay buzon_empresas; si no, solo se adivina cuando el negocio tiene una
+    única empresa configurada) pero sin resolver_local(): el reporte se
+    archiva por empresa/mes en CONCILIACION/<mes>/EGRESOS/<nombre_corto>/,
+    nunca por local.
+
+    Devuelve (nombre_corto, None) si se pudo resolver, o ("", motivo) si no.
+    """
+    if empresa_carpeta:
+        empresa_cfg = _buscar_empresa_por_nombre_corto(config, empresa_carpeta)
+        if empresa_cfg is not None:
+            return str(empresa_cfg.get("nombre_corto") or ""), None
+        # No debería pasar: la carpeta se nombró con un nombre_corto real de
+        # config['empresas'] (init_negocio.py lo valida al crearla).
+        return "", (
+            f"la carpeta de origen indica la empresa '{empresa_carpeta}', que no está en "
+            f"config['empresas']; corregir config.yaml"
+        )
+
+    empresas = config.get("empresas") or []
+    if len(empresas) != 1:
+        return "", (
+            f"hay {len(empresas)} empresas configuradas; no se puede asignar automáticamente la "
+            f"empresa dueña de un reporte de egresos de caja; corregir manualmente en Drive"
+        )
+    return str(empresas[0].get("nombre_corto") or ""), None
+
+
+def _mes_predominante_egresos(gastos: list[dict]) -> tuple[str | None, str | None]:
+    """AAAA-MM del mes predominante entre gastos[].fecha ('DD/MM/AAAA', tal
+    como los devuelve egresos_caja.parsear_egresos — esa función ya descarta
+    en 'filas_ignoradas' cualquier fecha que no pudo interpretar, así que
+    todo lo que llega aquí es una fecha válida).
+
+    Devuelve (mes, advertencia): 'advertencia' no es None si el reporte trae
+    gastos de más de un mes (con el conteo por mes, para que quede en el
+    log); (None, None) si 'gastos' viene vacío (nada de qué sacar mes).
+    """
+    if not gastos:
+        return None, None
+
+    contador: dict[str, int] = {}
+    for gasto in gastos:
+        m = re.match(r"(\d{2})/(\d{2})/(\d{4})", str(gasto.get("fecha") or ""))
+        if not m:
+            continue
+        mes = f"{m.group(3)}-{m.group(2)}"
+        contador[mes] = contador.get(mes, 0) + 1
+
+    if not contador:
+        return None, None
+
+    mes_predominante = max(contador.items(), key=lambda kv: kv[1])[0]
+    advertencia = None
+    if len(contador) > 1:
+        detalle = ", ".join(f"{mes}: {cant}" for mes, cant in sorted(contador.items()))
+        advertencia = (
+            f"el reporte trae gastos de más de un mes ({detalle}); se usa el mes "
+            f"predominante {mes_predominante}"
+        )
+    return mes_predominante, advertencia
+
+
+def _intentar_parsear_egresos(ruta_local: pathlib.Path) -> tuple[dict | None, str | None]:
+    """Intenta reconocer y parsear 'ruta_local' como reporte de egresos de
+    caja (egresos_caja.parsear_egresos), por CONTENIDO y no por extensión.
+
+    Devuelve:
+      - (datos, None) si se pudo parsear: SÍ es un reporte de egresos.
+      - (None, motivo) si se reconoció que ES un reporte pero en un formato
+        que el parser no puede abrir: el .xls-frameset de Excel al que le
+        falta su carpeta hermana '_archivos/' (ver MOTIVO_EGRESOS_XLS_SIN_HTM
+        y el docstring de egresos_caja._resolver_tabla). Es la única
+        excepción que se distingue del resto porque egresos_caja la levanta
+        con un FileNotFoundError propio y explícito, no porque se adivine el
+        contenido.
+      - (None, None) si NO es un reporte de egresos: cualquier otra
+        excepción del parser (una foto .jpg, un PDF de boleta, un .htm que
+        no es de este sistema) se interpreta así, nunca debe romper el
+        procesamiento normal de boletas de notas_venta.
+    """
+    try:
+        return egresos_caja.parsear_egresos(ruta_local), None
+    except FileNotFoundError:
+        return None, MOTIVO_EGRESOS_XLS_SIN_HTM
+    except Exception as exc:
+        logger.debug(
+            "'%s' no se reconoce como reporte de egresos de caja (%s); sigue como respaldo normal.",
+            ruta_local.name,
+            exc,
+        )
+        return None, None
+
+
+def procesar_reporte_egresos(
+    archivo: ArchivoDrive,
+    datos_egresos: dict,
+    *,
+    config: dict,
+    almacen: AlmacenDrive,
+    nombres_por_carpeta: dict[str, set[str]],
+    carpeta_revisar_id: str,
+    dry_run: bool,
+    empresa_carpeta: str | None,
+) -> ResultadoArchivo:
+    """Enruta un reporte de egresos de caja (ya parseado, ver
+    _intentar_parsear_egresos) a CONCILIACION/<mes>/EGRESOS/<nombre_corto>/,
+    la misma ruta que conciliar.py ya busca (ver conciliar.py:957-965: primero
+    <mes> bajo config['conciliacion']['carpeta'], luego 'EGRESOS', luego el
+    nombre_corto de la empresa). Nunca llama al modelo ni pasa por
+    procesar_nota_venta: es un movimiento de archivo, costo $0.
+    """
+    nombre = archivo.name
+    gastos = datos_egresos.get("gastos") or []
+
+    mes, advertencia_mes = _mes_predominante_egresos(gastos)
+    if advertencia_mes:
+        logger.warning("%s: %s", nombre, advertencia_mes)
+
+    if mes is None:
+        motivo = (
+            "el archivo tiene forma de reporte de egresos de caja (mismo formato que reconoce "
+            "egresos_caja.py) pero no trae ningún gasto con fecha reconocible; revisar si es el "
+            "reporte correcto o si el sistema de ventas lo exportó vacío"
+        )
+        mover_a_revisar(almacen, [archivo], carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
+        return ResultadoArchivo(nombre, "revisar", motivo)
+
+    nombre_corto, motivo_empresa = _resolver_empresa_reporte_egresos(config, empresa_carpeta)
+    if not nombre_corto:
+        mover_a_revisar(almacen, [archivo], carpeta_revisar_id, motivo_empresa, nombres_por_carpeta, dry_run)
+        return ResultadoArchivo(nombre, "revisar", motivo_empresa)
+
+    carpeta_conciliacion_id = ((config.get("conciliacion") or {}).get("carpeta") or "").strip()
+    if not carpeta_conciliacion_id:
+        motivo = "config['conciliacion']['carpeta'] está vacío en config.yaml; no se puede enrutar el reporte"
+        mover_a_revisar(almacen, [archivo], carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
+        return ResultadoArchivo(nombre, "revisar", motivo)
+
+    # Igual que en procesar_uno: en dry-run no se llama a asegurar_carpeta
+    # (crearía carpetas), se usa una clave sintética solo para el caché de
+    # nombres y el mensaje de log.
+    if dry_run:
+        carpeta_destino_id = f"[DRY-RUN] {carpeta_conciliacion_id}/{mes}/EGRESOS/{nombre_corto}"
+    else:
+        carpeta_mes_id = almacen.asegurar_carpeta(mes, carpeta_conciliacion_id)
+        carpeta_egresos_id = almacen.asegurar_carpeta("EGRESOS", carpeta_mes_id)
+        carpeta_destino_id = almacen.asegurar_carpeta(nombre_corto, carpeta_egresos_id)
+
+    # mover_archivo nunca pisa un nombre existente (agrega sufijo con
+    # nombre_destino_unico, ej. '..._2') — mismo mecanismo de siempre en este
+    # archivo para no sobrescribir nada en la carpeta destino.
+    destino_nombre = mover_archivo(almacen, archivo, carpeta_destino_id, nombre, nombres_por_carpeta, dry_run)
+    if destino_nombre is None:
+        logger.error(
+            "'%s' es el reporte de egresos de %s/%s pero no se pudo mover; queda en el buzón.",
+            nombre, mes, nombre_corto,
+        )
+    else:
+        logger.info(
+            "%s: reporte de egresos de caja -> CONCILIACION/%s/EGRESOS/%s/%s (%d gasto(s), %d depósito(s))",
+            nombre, mes, nombre_corto, destino_nombre, len(gastos), len(datos_egresos.get("depositos") or []),
+        )
+
+    return ResultadoArchivo(nombre, "procesado", None, n_items=0, llamadas_modelo=0)
+
+
+# -----------------------------------------------------------------------------
 # Extracción
 # -----------------------------------------------------------------------------
 def extraer_comprobante(
@@ -759,6 +1019,43 @@ def procesar_uno(
     nombre = principal.name
 
     if tipo == "notas_venta":
+        # Desde septiembre 2026 la caja chica se documenta con el reporte de
+        # egresos del sistema de ventas (Restaurant.pe), no con boletas
+        # sueltas: el personal lo guarda en la misma subcarpeta notas_venta.
+        # Se detecta por CONTENIDO (nunca por extensión: el .htm bueno y el
+        # .xls-frameset roto comparten extensión con boletas normales) ANTES
+        # de tocar procesar_nota_venta, y sin llamar nunca al modelo — es
+        # solo un mover_archivo si es reporte, o el camino de siempre si no.
+        with tempfile.TemporaryDirectory(prefix="sconcha_egresos_") as carpeta_temporal:
+            ruta_local = pathlib.Path(carpeta_temporal) / principal.name
+            try:
+                almacen.descargar(principal.id, ruta_local)
+            except Exception as exc:
+                motivo = f"no se pudo descargar el archivo desde Drive: {exc}"
+                logger.exception("Error al descargar '%s' de Drive", principal.name)
+                mover_a_revisar(almacen, [principal], carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
+                return ResultadoArchivo(nombre, "revisar", motivo)
+
+            datos_egresos, motivo_formato_invalido = _intentar_parsear_egresos(ruta_local)
+
+        if datos_egresos is not None:
+            return procesar_reporte_egresos(
+                principal,
+                datos_egresos,
+                config=config,
+                almacen=almacen,
+                nombres_por_carpeta=nombres_por_carpeta,
+                carpeta_revisar_id=carpeta_revisar_id,
+                dry_run=dry_run,
+                empresa_carpeta=empresa_carpeta,
+            )
+
+        if motivo_formato_invalido is not None:
+            mover_a_revisar(
+                almacen, [principal], carpeta_revisar_id, motivo_formato_invalido, nombres_por_carpeta, dry_run
+            )
+            return ResultadoArchivo(nombre, "revisar", motivo_formato_invalido)
+
         return procesar_nota_venta(
             principal,
             config=config,
@@ -805,6 +1102,17 @@ def procesar_uno(
             logger.exception("Error al extraer '%s'", principal.name)
             mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)
             return ResultadoArchivo(nombre, "revisar", motivo)
+
+        # Advertencia (nunca cambia el enrutado) si el DD.MM del nombre
+        # original no coincide con el día/mes de la fecha de emisión
+        # extraída — habría detectado en el momento las liquidaciones con
+        # año inventado por el modelo. Va al mismo canal (comp.advertencias)
+        # que ya usa comp.validar() más abajo, así llega a la misma columna
+        # del Sheet vía registro_sheets.py.
+        advertencia_fecha = advertencia_fecha_nombre_vs_extraida(principal.name, comp)
+        if advertencia_fecha:
+            comp.advertencias.append(advertencia_fecha)
+            logger.warning("%s: %s", principal.name, advertencia_fecha)
 
         try:
             problemas = comp.validar() or []

@@ -1233,3 +1233,263 @@ def test_archivo_en_carpeta_plana_huerfana_se_procesa_y_advierte(caplog):
     assert resultado.estado == "procesado"
     assert registro.escritos[0]["empresa"] == "INSTITUCION"  # cliente_ruc por defecto del doble
     assert any("huérfana" in r.getMessage() for r in caplog.records)
+
+
+# -----------------------------------------------------------------------------
+# Reporte de egresos de caja llegado a notas_venta (septiembre 2026): se
+# detecta por CONTENIDO (nunca por extensión) y se enruta a
+# CONCILIACION/<mes>/EGRESOS/<empresa>/ sin pasar por procesar_nota_venta ni
+# por el modelo. Ver procesar.procesar_reporte_egresos / _intentar_parsear_egresos.
+# -----------------------------------------------------------------------------
+def _fila_egresos(
+    fecha: str,
+    motivo: str,
+    entregado_a: str = "EFECTIVO",
+    monto: str = "100.00",
+    usuario: str = "CAJA.LINCE",
+    estado: str = "ACTIVO",
+    moneda: str = "Soles",
+) -> str:
+    """Una fila <tr> con las 10 columnas que reconoce egresos_caja.py
+    (Fecha, Usuario, Categoria, Caja, Motivo, Entregado A, Moneda, Tarjeta,
+    Estado, Monto)."""
+    return (
+        f"<tr><td>{fecha}</td><td>{usuario}</td><td>CATEGORIA</td><td>CAJA1</td>"
+        f"<td>{motivo}</td><td>{entregado_a}</td><td>{moneda}</td><td></td>"
+        f"<td>{estado}</td><td>{monto}</td></tr>"
+    )
+
+
+def _html_egresos(filas: list[str]) -> bytes:
+    """HTML de tabla único (caso 3 de egresos_caja._resolver_tabla: no es
+    frameset, ya trae <tr> con datos), suficiente para que
+    egresos_caja.parsear_egresos lo reconozca sin necesitar la carpeta
+    hermana '_archivos/'."""
+    return ("<html><body><table>" + "".join(filas) + "</table></body></html>").encode("utf-8")
+
+
+def test_egresos_htm_en_notas_venta_se_mueve_a_conciliacion_egresos(monkeypatch):
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    carpeta_conciliacion_id = almacen.agregar_carpeta("CONCILIACION")
+    config["conciliacion"] = {"carpeta": carpeta_conciliacion_id}
+
+    contenido = _html_egresos([_fila_egresos("15/07/2026 12:00", "compra de insumos", monto="120.50")])
+    archivo = _crear_archivo(almacen, ids_por_empresa["EL TEMPLO"]["notas_venta"], "Egresos.htm", contenido)
+
+    def modelo_no_debe_llamarse(*args, **kwargs):
+        raise AssertionError("un reporte de egresos no debe llamar al extractor de modelo")
+
+    def nota_venta_no_debe_llamarse(*args, **kwargs):
+        raise AssertionError("un reporte de egresos no debe pasar por procesar_nota_venta")
+
+    _modulo_extractor_modelo.extraer = modelo_no_debe_llamarse
+    monkeypatch.setattr(procesar, "procesar_nota_venta", nota_venta_no_debe_llamarse)
+
+    resultado = procesar.procesar_uno(
+        archivo, [], config=config, registro=registro, catalogo_obj=cat, almacen=almacen,
+        claves_procesadas_en_lote=set(), nombres_por_carpeta={}, carpeta_procesado_id=procesado_id,
+        carpeta_revisar_id=revisar_id, dry_run=False, tipo="notas_venta", empresa_carpeta="EL TEMPLO",
+    )
+
+    assert resultado.estado == "procesado"
+    assert resultado.llamadas_modelo == 0
+    assert registro.escritos == []  # no es un comprobante normal
+    assert registro.respaldos_caja == []  # no pasó por RESPALDOS_CAJA (eso es solo para boletas sueltas)
+
+    carpeta_final = almacen.carpetas[almacen.archivos[archivo.id]["parent"]]
+    assert carpeta_final["nombre"] == "EL TEMPLO"
+    carpeta_egresos = almacen.carpetas[carpeta_final["padre_id"]]
+    assert carpeta_egresos["nombre"] == "EGRESOS"
+    carpeta_mes = almacen.carpetas[carpeta_egresos["padre_id"]]
+    assert carpeta_mes["nombre"] == "2026-07"
+    assert carpeta_mes["padre_id"] == carpeta_conciliacion_id
+
+
+def test_egresos_boleta_normal_en_notas_venta_sigue_a_procesar_nota_venta():
+    """Una boleta cualquiera (no un reporte de egresos) en notas_venta debe
+    seguir el camino de siempre: procesar_nota_venta, sin modelo, registrada
+    en RESPALDOS_CAJA."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    archivo = _crear_archivo(
+        almacen, buzon_id, "01.07 BOLETAS.pdf", b"%PDF-1.4 esto es una boleta escaneada, no un reporte de egresos"
+    )
+
+    resultado = _procesar_uno_con_tipo(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id, tipo="notas_venta")
+
+    assert resultado.estado == "procesado"
+    assert len(registro.respaldos_caja) == 1
+    assert registro.respaldos_caja[0]["archivo"] == "01.07 BOLETAS.pdf"
+
+
+def test_egresos_nombre_repetido_en_destino_agrega_sufijo():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    carpeta_conciliacion_id = almacen.agregar_carpeta("CONCILIACION")
+    config["conciliacion"] = {"carpeta": carpeta_conciliacion_id}
+    carpeta_mes_id = almacen.agregar_carpeta("2026-07", carpeta_conciliacion_id)
+    carpeta_egresos_id = almacen.agregar_carpeta("EGRESOS", carpeta_mes_id)
+    carpeta_destino_id = almacen.agregar_carpeta("EL TEMPLO", carpeta_egresos_id)
+    almacen.agregar_archivo(carpeta_destino_id, "Egresos.htm", b"ya estaba en destino")
+
+    contenido = _html_egresos([_fila_egresos("15/07/2026 12:00", "compra de insumos")])
+    archivo = _crear_archivo(almacen, ids_por_empresa["EL TEMPLO"]["notas_venta"], "Egresos.htm", contenido)
+
+    resultado = procesar.procesar_uno(
+        archivo, [], config=config, registro=registro, catalogo_obj=cat, almacen=almacen,
+        claves_procesadas_en_lote=set(), nombres_por_carpeta={}, carpeta_procesado_id=procesado_id,
+        carpeta_revisar_id=revisar_id, dry_run=False, tipo="notas_venta", empresa_carpeta="EL TEMPLO",
+    )
+
+    assert resultado.estado == "procesado"
+    assert almacen.archivos[archivo.id]["parent"] == carpeta_destino_id
+    assert almacen.archivos[archivo.id]["name"] == "Egresos_2.htm"  # no pisa el que ya estaba
+
+
+def test_egresos_xls_frameset_sin_carpeta_va_a_revisar_con_motivo_htm():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    # Frameset de Excel real: trae el <link id=shLink> pero, como en Drive,
+    # nunca existe la carpeta hermana 'Egresos_archivos/' con los datos.
+    contenido = b'<html><head><link id=shLink href="Egresos_archivos/sheet001.htm"></head><frameset></frameset></html>'
+    archivo = _crear_archivo(almacen, ids_por_empresa["EL TEMPLO"]["notas_venta"], "Egresos.xls", contenido)
+
+    resultado = _procesar_uno_con_tipo(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id, tipo="notas_venta")
+
+    assert resultado.estado == "revisar"
+    assert resultado.motivo == procesar.MOTIVO_EGRESOS_XLS_SIN_HTM
+    assert almacen.archivos[archivo.id]["parent"] == revisar_id
+    assert any(nombre.endswith(".motivo.txt") for _, nombre, _ in almacen.textos_creados)
+
+
+def test_egresos_reconocido_sin_gastos_con_fecha_va_a_revisar():
+    """Tabla reconocible pero sin ningún GASTO con fecha válida (acá solo
+    trae un depósito): no hay de dónde sacar el mes, se manda a revisar."""
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    contenido = _html_egresos(
+        [_fila_egresos("15/07/2026 12:00", "DEPOSITO DE VENTA", entregado_a="BANCO", monto="500.00")]
+    )
+    archivo = _crear_archivo(almacen, ids_por_empresa["EL TEMPLO"]["notas_venta"], "Egresos.htm", contenido)
+
+    resultado = _procesar_uno_con_tipo(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id, tipo="notas_venta")
+
+    assert resultado.estado == "revisar"
+    assert "no trae ningún gasto" in resultado.motivo
+
+
+def test_egresos_mes_predominante_con_fechas_de_dos_meses_advierte(caplog):
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    carpeta_conciliacion_id = almacen.agregar_carpeta("CONCILIACION")
+    config["conciliacion"] = {"carpeta": carpeta_conciliacion_id}
+    contenido = _html_egresos(
+        [
+            _fila_egresos("30/06/2026 10:00", "compra menor"),
+            _fila_egresos("01/07/2026 10:00", "compra insumos"),
+            _fila_egresos("02/07/2026 10:00", "compra insumos 2"),
+        ]
+    )
+    archivo = _crear_archivo(almacen, ids_por_empresa["EL TEMPLO"]["notas_venta"], "Egresos.htm", contenido)
+
+    with caplog.at_level(logging.WARNING, logger="procesar"):
+        resultado = procesar.procesar_uno(
+            archivo, [], config=config, registro=registro, catalogo_obj=cat, almacen=almacen,
+            claves_procesadas_en_lote=set(), nombres_por_carpeta={}, carpeta_procesado_id=procesado_id,
+            carpeta_revisar_id=revisar_id, dry_run=False, tipo="notas_venta", empresa_carpeta="EL TEMPLO",
+        )
+
+    assert resultado.estado == "procesado"
+    carpeta_final = almacen.carpetas[almacen.archivos[archivo.id]["parent"]]
+    carpeta_egresos = almacen.carpetas[carpeta_final["padre_id"]]
+    carpeta_mes = almacen.carpetas[carpeta_egresos["padre_id"]]
+    assert carpeta_mes["nombre"] == "2026-07"  # predominan 2 filas de julio contra 1 de junio
+    assert any("más de un mes" in r.getMessage() for r in caplog.records)
+
+
+def test_egresos_dry_run_no_mueve_ni_crea_carpetas():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat, ids_por_empresa = _entorno_con_buzon_empresas(
+        ["EL TEMPLO"]
+    )
+    carpeta_conciliacion_id = almacen.agregar_carpeta("CONCILIACION")
+    config["conciliacion"] = {"carpeta": carpeta_conciliacion_id}
+    contenido = _html_egresos([_fila_egresos("15/07/2026 12:00", "compra insumos")])
+    origen_id = ids_por_empresa["EL TEMPLO"]["notas_venta"]
+    archivo = _crear_archivo(almacen, origen_id, "Egresos.htm", contenido)
+
+    resultado = procesar.procesar_uno(
+        archivo, [], config=config, registro=registro, catalogo_obj=cat, almacen=almacen,
+        claves_procesadas_en_lote=set(), nombres_por_carpeta={}, carpeta_procesado_id=procesado_id,
+        carpeta_revisar_id=revisar_id, dry_run=True, tipo="notas_venta", empresa_carpeta="EL TEMPLO",
+    )
+
+    assert resultado.estado == "procesado"
+    assert almacen.archivos[archivo.id]["parent"] == origen_id  # no se movió
+    assert almacen.movimientos == []
+    assert almacen.carpetas_aseguradas == []  # dry-run no crea CONCILIACION/.../EGRESOS/...
+
+
+# -----------------------------------------------------------------------------
+# Tarea 2: DD.MM del nombre original vs. fecha de emisión extraída (cualquier
+# tipo de comprobante). Solo advierte (comp.advertencias); nunca cambia el
+# enrutado ni compara el año (el nombre nunca lo trae).
+# -----------------------------------------------------------------------------
+def test_advertencia_fecha_nombre_sin_patron_no_advierte():
+    comp = ComprobanteFalso(fecha_emision="2026-07-20")
+    assert procesar.advertencia_fecha_nombre_vs_extraida("factura_random.pdf", comp) is None
+
+
+def test_advertencia_fecha_nombre_sin_fecha_extraida_no_advierte():
+    comp = ComprobanteFalso(fecha_emision=None)
+    assert procesar.advertencia_fecha_nombre_vs_extraida("19.07 x.pdf", comp) is None
+
+
+def test_advertencia_fecha_nombre_coincide_dia_mes_ignora_anio():
+    # El nombre nunca trae año: 2024 (nombre, implícito) vs 2024 real de la
+    # extracción da igual, lo que importa es que día/mes SÍ coinciden pese a
+    # que el año extraído (2024) es distinto del año en curso (2026).
+    comp = ComprobanteFalso(fecha_emision="2024-07-19")
+    assert procesar.advertencia_fecha_nombre_vs_extraida("19.07 x.pdf", comp) is None
+
+
+def test_advertencia_fecha_nombre_no_coincide_advierte():
+    comp = ComprobanteFalso(fecha_emision="2026-07-20")
+    advertencia = procesar.advertencia_fecha_nombre_vs_extraida("19.07 x.pdf", comp)
+    assert advertencia is not None
+    assert "19/07" in advertencia
+    assert "20/07/2026" in advertencia
+
+
+def test_advertencia_fecha_nombre_integrada_en_procesar_uno_coincide():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    archivo = _crear_archivo(almacen, buzon_id, "19.07 Compras pesquero.pdf")
+
+    def falso_modelo(ruta, tipo, config=None, tipo_esperado=None):
+        return ComprobanteFalso(fecha_emision="2024-07-19")
+
+    _modulo_extractor_modelo.extraer = falso_modelo
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "procesado"
+    assert registro.escritos[0]["comp"].advertencias == []
+
+
+def test_advertencia_fecha_nombre_integrada_en_procesar_uno_no_coincide():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    archivo = _crear_archivo(almacen, buzon_id, "19.07 Compras pesquero.pdf")
+
+    def falso_modelo(ruta, tipo, config=None, tipo_esperado=None):
+        return ComprobanteFalso(fecha_emision="2026-07-20")
+
+    _modulo_extractor_modelo.extraer = falso_modelo
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "procesado"  # solo advierte, no cambia el enrutado
+    advertencias = registro.escritos[0]["comp"].advertencias
+    assert len(advertencias) == 1
+    assert "19/07" in advertencias[0] and "20/07/2026" in advertencias[0]

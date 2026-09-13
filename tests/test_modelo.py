@@ -8,6 +8,7 @@ donde fallaría por falta de credenciales, sin llegar a la red.
 import json
 import pathlib
 import sys
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
@@ -140,6 +141,72 @@ def test_prompt_del_sistema_no_cambia_con_tipo_esperado():
     # acepta tipo_esperado en absoluto -- es un parámetro de extraer(), que
     # lo mete en el turno del usuario, no en el de system.
     assert "tipo_esperado" not in modelo._construir_prompt(None)
+
+
+# --- (b.2) ANCLA TEMPORAL: el prompt lleva inyectada la fecha de hoy --------------
+#
+# Bug real: sin decirle al modelo qué fecha es "hoy", una fecha sin año
+# legible se inventaba (10 liquidaciones salieron con 2024/2025 o vacío).
+
+def test_prompt_incluye_la_fecha_de_hoy_inyectada():
+    prompt = modelo._construir_prompt(None, hoy=date(2026, 9, 11))
+    assert "2026-09-11" in prompt
+
+
+def test_prompt_cambia_de_fecha_pero_no_de_las_demas_reglas():
+    prompt_1 = modelo._construir_prompt(None, hoy=date(2026, 9, 11))
+    prompt_2 = modelo._construir_prompt(None, hoy=date(2026, 9, 12))
+
+    assert "2026-09-11" in prompt_1
+    assert "2026-09-12" in prompt_2
+    # Sin contar la fecha misma, el resto del prompt es idéntico -- la fecha
+    # es la única parte que cambia de un día a otro.
+    assert prompt_1.replace("2026-09-11", "X") == prompt_2.replace("2026-09-12", "X")
+
+
+def test_prompt_sin_hoy_explicito_usa_la_fecha_de_hoy_del_sistema(monkeypatch):
+    class _FechaFalsa(date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 1, 5)
+
+    monkeypatch.setattr(modelo, "date", _FechaFalsa)
+
+    prompt = modelo._construir_prompt(None)
+
+    assert "2026-01-05" in prompt
+
+
+def test_extraer_pasa_la_fecha_de_hoy_inyectada_al_prompt(monkeypatch):
+    # extraer() acepta `hoy` como 5to parámetro y lo hace llegar tal cual al
+    # prompt de sistema de la llamada real -- sin tocar la red: se reemplaza
+    # anthropic.Anthropic por un doble que solo captura los argumentos de la
+    # llamada y devuelve una respuesta mínima ya válida contra el esquema.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "clave-de-prueba")
+    capturado = {}
+
+    class _RespuestaFalsa:
+        stop_reason = "end_turn"
+        content = [SimpleNamespace(type="text", text=json.dumps(_datos_minimos()))]
+
+    class _MensajesFalsos:
+        def create(self, **kwargs):
+            capturado.update(kwargs)
+            return _RespuestaFalsa()
+
+    class _ClienteFalso:
+        def __init__(self, *args, **kwargs):
+            self.messages = _MensajesFalsos()
+
+    monkeypatch.setattr(modelo.anthropic, "Anthropic", _ClienteFalso)
+
+    # Cualquier archivo legible sirve: extraer() solo lo lee en bytes y lo
+    # codifica en base64, no valida que sea un PDF real.
+    ruta = pathlib.Path(__file__)
+    modelo.extraer(ruta, "pdf", hoy=date(2026, 9, 11))
+
+    prompt_sistema = capturado["system"][0]["text"]
+    assert "2026-09-11" in prompt_sistema
 
 
 # --- (c) JSON truncado sale como ErrorModeloClaude, no JSONDecodeError -----------

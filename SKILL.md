@@ -335,6 +335,25 @@ trae), empresa y local, sin montos ni ítems, porque ese dato vive en el
 reporte de egresos— (ver `procesar.py`, `procesar_nota_venta` y
 `resolver_empresa_local_nota_venta`).
 
+Desde septiembre 2026 el propio reporte de egresos también entra por
+`NOTAS_DE_VENTA`: `procesar_uno` descarga cada archivo de esa subcarpeta y
+prueba `egresos_caja.parsear_egresos()` **antes** de tratarlo como boleta
+(se reconoce por contenido, no por extensión). Si es el reporte, se mueve
+—sin modelo, costo S/0— a `CONCILIACION/<mes>/EGRESOS/<nombre_corto>/`, que
+es donde `conciliar.py` ya lo busca; el mes es el predominante entre las
+fechas de los gastos (warning si trae más de uno) y la empresa sale de la
+subcarpeta del buzón (ver `procesar_reporte_egresos`). Si es el `.xls`
+frameset sin su carpeta `_archivos/`, va a `02_REVISAR` pidiendo
+re-exportarlo como `.htm`; si se reconoce el formato pero no hay gastos
+con fecha, también va a revisar. Cualquier otra cosa sigue el camino de
+boletas de siempre.
+
+Además, para todo comprobante cuyo nombre original empiece con `DD.MM`
+(ej. `19.07 Compras pesquero.pdf`), `procesar_uno` compara día y mes —nunca
+el año, que el nombre no trae— contra la fecha de emisión extraída y, si no
+coinciden, agrega una advertencia que llega a la columna de advertencias
+del Sheet. No cambia el enrutado (ver `advertencia_fecha_nombre_vs_extraida`).
+
 `egresos_caja.py` (raíz del repo) parsea ese reporte y arma el JSON
 intermedio que consume `--egresos` de `build_conciliacion.py`; el motor
 vendorizado no toca HTML directamente, a propósito. Acepta 3 formas de
@@ -494,6 +513,12 @@ final del propio estado de cuenta — y el mismo conteo de conciliación:
   gratis porque no llaman al modelo) y las multiplica por la constante
   `COSTO_ESTIMADO_USD_POR_LLAMADA_MODELO` en `procesar.py`. Ajustar esa
   constante si cambia el precio o el modelo/esfuerzo configurado.
+- **`procesar.py --dry-run` cuesta exactamente lo mismo que la corrida
+  real**: sigue llamando al modelo por cada PDF/imagen del buzón, solo se
+  salta las escrituras (Sheets, mover archivos, `.motivo.txt`). Para
+  validar antes de una corrida grande sin pagar por todo el lote, usar
+  `procesar.py --limite 5`. `conciliar.py`, en cambio, no llama al modelo
+  en absoluto: su costo es $0.
 - **Archivos que se ignoran al listar el buzón** (no se procesan ni van a
   revisar, porque no son comprobantes): los que empiezan con `~$` o `.`, y
   `desktop.ini` / `Thumbs.db` — artefactos de Office o de Windows/Drive.

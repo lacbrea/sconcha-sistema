@@ -9,12 +9,21 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 # Tolerancia para comparar importes en soles. Existe porque el redondeo de
 # céntimos entre el total de la factura y la suma de sus líneas casi nunca da
 # exacto (cada línea se redondea a 2 decimales por separado, el total no).
 _TOLERANCIA_SOLES = 0.10
+
+# Ventana de plausibilidad de fechas, deliberadamente holgada: cargar un
+# comprobante con dos meses de atraso es legítimo y NO debe rechazarse. Solo
+# se advierte lo claramente sospechoso -- una fecha futura de verdad, o una
+# tan vieja que casi seguro el modelo inventó/confundió el año (bug real: 10
+# liquidaciones salieron con año 2024/2025 o vacío porque nada validaba más
+# que el formato).
+_DIAS_FUTURO_MAX = 7
+_DIAS_ANTIGUEDAD_MAX = 730  # ~24 meses (aproximado en días, no en meses calendario)
 
 
 @dataclass
@@ -72,13 +81,18 @@ class ComprobanteExtraido:
             return f"SIN_CLAVE|{uuid.uuid4().hex}"
         return f"{ruc}|{serie}|{round(self.total, 2):.2f}"
 
-    def validar(self) -> list[str]:
+    def validar(self, hoy: date | None = None) -> list[str]:
         """Devuelve una lista de advertencias; nunca lanza excepción.
 
         Pensado para correr después de cualquier extractor (determinista o
         por modelo) y antes de grabar en el registro: son las señales que le
         dicen a un humano "revisa este comprobante antes de confiar en él".
+
+        `hoy` es opcional (default `None`, usa `date.today()`) e inyectable
+        para tests: es la referencia contra la que se juzga la plausibilidad
+        de fecha_emision/fecha_vencimiento (ver más abajo).
         """
+        hoy = hoy or date.today()
         advertencias: list[str] = []
 
         if self.total is None:
@@ -118,9 +132,21 @@ class ComprobanteExtraido:
 
         if self.fecha_emision is not None and not _fecha_valida(self.fecha_emision):
             advertencias.append(f"La fecha de emisión '{self.fecha_emision}' no tiene formato YYYY-MM-DD")
+        elif self.fecha_emision is not None:
+            advertencia = _advertencia_plausibilidad_fecha("emisión", self.fecha_emision, hoy)
+            if advertencia:
+                advertencias.append(advertencia)
 
         if self.fecha_vencimiento is not None and not _fecha_valida(self.fecha_vencimiento):
             advertencias.append(f"La fecha de vencimiento '{self.fecha_vencimiento}' no tiene formato YYYY-MM-DD")
+        elif self.fecha_vencimiento is not None:
+            # Sin chequeo de "futura": una factura a crédito vence a 30/60/90
+            # días y eso es lo normal, no una señal de año mal leído.
+            advertencia = _advertencia_plausibilidad_fecha(
+                "vencimiento", self.fecha_vencimiento, hoy, permitir_futura=True
+            )
+            if advertencia:
+                advertencias.append(advertencia)
 
         if self.detraccion_pct is not None:
             if self.detraccion_monto is None:
@@ -156,6 +182,26 @@ def _fecha_valida(fecha: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _advertencia_plausibilidad_fecha(
+    etiqueta: str, fecha: str, hoy: date, permitir_futura: bool = False
+) -> str | None:
+    """Advierte si `fecha` (ya en formato YYYY-MM-DD válido) es implausible.
+
+    Solo se llama sobre fechas que ya pasaron `_fecha_valida()` -- por eso no
+    vuelve a intentar/capturar el parseo. Dos señales, ninguna un error duro
+    (nunca se rechaza el comprobante, solo se marca para revisión humana):
+    futura en más de `_DIAS_FUTURO_MAX` días, o más vieja que
+    `_DIAS_ANTIGUEDAD_MAX` (~24 meses). La ventana es holgada a propósito:
+    cargar un comprobante con dos meses de atraso es legítimo.
+    """
+    dias_desde_hoy = (datetime.strptime(fecha, "%Y-%m-%d").date() - hoy).days
+    if not permitir_futura and dias_desde_hoy > _DIAS_FUTURO_MAX:
+        return f"La fecha de {etiqueta} '{fecha}' es futura (más de {_DIAS_FUTURO_MAX} días respecto de hoy)"
+    if -dias_desde_hoy > _DIAS_ANTIGUEDAD_MAX:
+        return f"La fecha de {etiqueta} '{fecha}' es demasiado antigua (más de 24 meses respecto de hoy)"
+    return None
 
 
 # JSON Schema del comprobante para "structured outputs" de la API de Anthropic
