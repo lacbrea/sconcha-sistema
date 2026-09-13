@@ -53,8 +53,10 @@ _paquete_extractores = _crear_modulo_falso("extractores")
 _paquete_extractores.__path__ = []  # lo marca como paquete para el import system
 _modulo_xml_ubl = _crear_modulo_falso("extractores.xml_ubl")
 _modulo_extractor_modelo = _crear_modulo_falso("extractores.modelo")
+_modulo_excel_liquidacion = _crear_modulo_falso("extractores.excel_liquidacion")
 _paquete_extractores.xml_ubl = _modulo_xml_ubl
 _paquete_extractores.modelo = _modulo_extractor_modelo
+_paquete_extractores.excel_liquidacion = _modulo_excel_liquidacion
 
 _modulo_catalogo = _crear_modulo_falso("catalogo")
 _modulo_registro_sheets = _crear_modulo_falso("registro_sheets")
@@ -69,8 +71,13 @@ def _extraer_modelo_por_defecto(ruta, tipo, config=None, tipo_esperado=None):
     raise NotImplementedError("configurar _modulo_extractor_modelo.extraer en el test")
 
 
+def _extraer_excel_por_defecto(ruta):
+    raise NotImplementedError("configurar _modulo_excel_liquidacion.extraer en el test")
+
+
 _modulo_xml_ubl.extraer = _extraer_xml_por_defecto
 _modulo_extractor_modelo.extraer = _extraer_modelo_por_defecto
+_modulo_excel_liquidacion.extraer = _extraer_excel_por_defecto
 _modulo_auth_google.servicio_drive = lambda: None
 _modulo_auth_google.servicio_sheets = lambda: None
 _modulo_auth_google.ErrorAutenticacion = RuntimeError
@@ -137,6 +144,7 @@ def _aislar_dependencias(monkeypatch):
     """
     monkeypatch.setattr(procesar, "extractor_xml", _modulo_xml_ubl)
     monkeypatch.setattr(procesar, "extractor_modelo", _modulo_extractor_modelo)
+    monkeypatch.setattr(procesar, "extractor_excel", _modulo_excel_liquidacion)
     monkeypatch.setattr(procesar, "catalogo_mod", _modulo_catalogo)
     monkeypatch.setattr(procesar, "registro_mod", _modulo_registro_sheets)
     monkeypatch.setitem(sys.modules, "auth_google", _modulo_auth_google)
@@ -145,6 +153,7 @@ def _aislar_dependencias(monkeypatch):
     # que una prueba no herede el doble que dejó la anterior.
     _modulo_xml_ubl.extraer = _extraer_xml_por_defecto
     _modulo_extractor_modelo.extraer = _extraer_modelo_por_defecto
+    _modulo_excel_liquidacion.extraer = _extraer_excel_por_defecto
     yield
 
 
@@ -411,20 +420,29 @@ def test_clasificacion_por_extension(tmp_path):
         llamadas.append((tipo, ruta.name))
         return ComprobanteFalso()
 
+    def falso_excel(ruta):
+        llamadas.append(("excel", ruta.name))
+        return ComprobanteFalso()
+
     _modulo_xml_ubl.extraer = falso_xml
     _modulo_extractor_modelo.extraer = falso_modelo
+    _modulo_excel_liquidacion.extraer = falso_excel
 
     ruta_xml = _crear_archivo_local(tmp_path, "a.xml")
     ruta_zip = _crear_archivo_local(tmp_path, "b.zip")
     ruta_pdf = _crear_archivo_local(tmp_path, "c.pdf")
     ruta_jpg = _crear_archivo_local(tmp_path, "d.jpg")
     ruta_png = _crear_archivo_local(tmp_path, "e.png")
+    ruta_xlsx = _crear_archivo_local(tmp_path, "f.xlsx")
+    ruta_xlsm = _crear_archivo_local(tmp_path, "g.xlsm")
 
     procesar.extraer_comprobante(ruta_xml, ".xml")
     procesar.extraer_comprobante(ruta_zip, ".zip")
     procesar.extraer_comprobante(ruta_pdf, ".pdf")
     procesar.extraer_comprobante(ruta_jpg, ".jpg")
     procesar.extraer_comprobante(ruta_png, ".png")
+    procesar.extraer_comprobante(ruta_xlsx, ".xlsx")
+    procesar.extraer_comprobante(ruta_xlsm, ".xlsm")
 
     assert llamadas == [
         ("xml", "a.xml"),
@@ -432,6 +450,8 @@ def test_clasificacion_por_extension(tmp_path):
         ("pdf", "c.pdf"),
         ("imagen", "d.jpg"),
         ("imagen", "e.png"),
+        ("excel", "f.xlsx"),
+        ("excel", "g.xlsm"),
     ]
 
 
@@ -477,6 +497,59 @@ def test_heic_va_a_revisar():
     motivo_id = next(fid for fid, f in almacen.archivos.items() if f["name"] == "foto.heic.motivo.txt")
     assert almacen.archivos[motivo_id]["contenido"] == procesar.MOTIVO_HEIC.encode("utf-8")
     assert registro.escritos == []
+
+
+# -----------------------------------------------------------------------------
+# .xls (formato binario viejo) va a revisar con motivo específico; .xlsx sí
+# se procesa (0 llamadas al modelo), ya no cae en "extensión no soportada".
+# -----------------------------------------------------------------------------
+def test_xls_antiguo_va_a_revisar():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    archivo = _crear_archivo(almacen, buzon_id, "liquidacion.xls")
+
+    def modelo_no_debe_llamarse(*args, **kwargs):
+        raise AssertionError("un .xls no debe llegar a ningún extractor")
+
+    _modulo_extractor_modelo.extraer = modelo_no_debe_llamarse
+    _modulo_excel_liquidacion.extraer = modelo_no_debe_llamarse
+
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "revisar"
+    assert resultado.motivo == procesar.MOTIVO_XLS_ANTIGUO
+    assert almacen.archivos[archivo.id]["parent"] == revisar_id
+    assert registro.escritos == []
+
+
+def test_xlsx_se_procesa_sin_llamar_al_modelo():
+    config, almacen, buzon_id, procesado_id, revisar_id, registro, cat = _entorno()
+    archivo = _crear_archivo(almacen, buzon_id, "CAQUETA 01.09.26.xlsx")
+
+    comp = ComprobanteFalso(
+        origen="excel",
+        confianza=1.0,
+        proveedor_ruc=None,
+        serie_numero=None,
+        cliente_ruc="20612506036",
+        tipo_documento="liquidacion",
+        fecha_emision="2026-09-01",
+        subtotal=None,
+        igv=None,
+        total=2009.0,
+        items=[],
+    )
+
+    def modelo_no_debe_llamarse(*args, **kwargs):
+        raise AssertionError("un .xlsx no debe llamar al modelo")
+
+    _modulo_excel_liquidacion.extraer = lambda ruta: comp
+    _modulo_extractor_modelo.extraer = modelo_no_debe_llamarse
+
+    resultado = _procesar_uno(archivo, [], config, registro, cat, almacen, procesado_id, revisar_id)
+
+    assert resultado.estado == "procesado"
+    assert resultado.llamadas_modelo == 0
+    assert len(registro.escritos) == 1
 
 
 # -----------------------------------------------------------------------------

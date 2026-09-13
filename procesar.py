@@ -58,6 +58,7 @@ if TYPE_CHECKING:
 # antes de importar procesar.py. No se tocan ni se crean aquí.
 from extractores import modelo as extractor_modelo
 from extractores import xml_ubl as extractor_xml
+from extractores import excel_liquidacion as extractor_excel
 import catalogo as catalogo_mod
 import registro_sheets as registro_mod
 
@@ -67,8 +68,16 @@ EXT_XML = {".xml", ".zip"}
 EXT_PDF = {".pdf"}
 EXT_IMAGEN = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 EXT_HEIC = {".heic"}
+# Liquidaciones de compra (verdura de Caquetá, pescado del terminal pesquero)
+# en el formato Excel propio del negocio, desde septiembre 2026. Se leen
+# determinísticamente con extractores.excel_liquidacion (0 llamadas al
+# modelo) -- ver EXT_XLS_ANTIGUO más abajo para el .xls binario viejo, que
+# openpyxl no puede abrir.
+EXT_EXCEL = {".xlsx", ".xlsm"}
+EXT_XLS_ANTIGUO = {".xls"}
 
 MOTIVO_HEIC = "formato HEIC no soportado por la API, convertir a JPEG"
+MOTIVO_XLS_ANTIGUO = "Excel en formato .xls antiguo: ábrelo y guárdalo como .xlsx"
 
 # Nombres de archivo que se ignoran por completo al listar el buzón (no son
 # comprobantes: son artefactos de Office o de una sincronización local de
@@ -1011,6 +1020,8 @@ def extraer_comprobante(
     """
     if extension in EXT_XML:
         return extractor_xml.extraer(ruta), 0
+    if extension in EXT_EXCEL:
+        return extractor_excel.extraer(ruta), 0
     if extension in EXT_PDF:
         return extractor_modelo.extraer(ruta, tipo="pdf", config=config, tipo_esperado=tipo_esperado), 1
     if extension in EXT_IMAGEN:
@@ -1137,7 +1148,16 @@ def procesar_uno(
         mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, MOTIVO_HEIC, nombres_por_carpeta, dry_run)
         return ResultadoArchivo(nombre, "revisar", MOTIVO_HEIC)
 
-    extensiones_soportadas = EXT_XML | EXT_PDF | EXT_IMAGEN
+    if extension in EXT_XLS_ANTIGUO:
+        # Solo llega aquí fuera de notas_venta (esa rama ya resolvió su
+        # propio .xls -- el reporte de egresos -- más arriba, antes de este
+        # punto). openpyxl no puede abrir el formato binario viejo.
+        mover_a_revisar(
+            almacen, todos_los_archivos, carpeta_revisar_id, MOTIVO_XLS_ANTIGUO, nombres_por_carpeta, dry_run
+        )
+        return ResultadoArchivo(nombre, "revisar", MOTIVO_XLS_ANTIGUO)
+
+    extensiones_soportadas = EXT_XML | EXT_PDF | EXT_IMAGEN | EXT_EXCEL
     if extension not in extensiones_soportadas:
         motivo = f"extensión no soportada: {extension or '(sin extensión)'}"
         mover_a_revisar(almacen, todos_los_archivos, carpeta_revisar_id, motivo, nombres_por_carpeta, dry_run)

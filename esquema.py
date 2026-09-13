@@ -38,7 +38,7 @@ class ItemExtraido:
 
 @dataclass
 class ComprobanteExtraido:
-    origen: str                        # 'xml' | 'pdf' | 'foto'
+    origen: str                        # 'xml' | 'pdf' | 'foto' | 'excel'
     confianza: float                   # 0.0..1.0 ; xml siempre 1.0
     proveedor_ruc: str | None = None
     proveedor_razon_social: str | None = None
