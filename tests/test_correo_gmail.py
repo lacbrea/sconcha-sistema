@@ -139,17 +139,29 @@ class FakeAlmacenDrive:
         self.llamadas_subir: list[dict] = []
         self.llamadas_descargar: list[tuple] = []
 
-    def agregar_archivo(self, carpeta_id: str, nombre: str, contenido: bytes) -> str:
+    def agregar_archivo(
+        self, carpeta_id: str, nombre: str, contenido: bytes, app_properties: dict | None = None,
+        trashed: bool = False,
+    ) -> str:
         self._contador += 1
         file_id = f"file-{self._contador}"
-        self._archivos[file_id] = {"id": file_id, "name": nombre, "parents": [carpeta_id], "content": contenido}
+        self._archivos[file_id] = {
+            "id": file_id, "name": nombre, "parents": [carpeta_id], "content": contenido,
+            "appProperties": dict(app_properties or {}), "trashed": trashed,
+        }
         return file_id
+
+    def mandar_a_papelera(self, file_id: str) -> None:
+        """Helper de test: simula un archivo mandado a la papelera a
+        propósito, para probar que buscar_por_app_property() lo sigue
+        encontrando (ver AlmacenDrive.buscar_por_app_property real)."""
+        self._archivos[file_id]["trashed"] = True
 
     def listar(self, carpeta_id: str) -> list[dict]:
         return [
             {"id": a["id"], "name": a["name"], "mimeType": "application/json", "size": str(len(a["content"]))}
             for a in self._archivos.values()
-            if carpeta_id in a["parents"]
+            if carpeta_id in a["parents"] and not a.get("trashed")
         ]
 
     def descargar(self, file_id: str, destino):
@@ -161,7 +173,8 @@ class FakeAlmacenDrive:
 
     def buscar_por_nombre(self, carpeta_id: str, nombre: str) -> dict | None:
         """Mismo contrato que AlmacenDrive.buscar_por_nombre: el archivo de esa
-        carpeta con ese nombre exacto, o None si no está.
+        carpeta con ese nombre exacto, o None si no está. Ignora archivos en
+        papelera -mismo criterio que el AlmacenDrive real-.
 
         El doble no lo tenía y la regla `adjunto` sí lo usa (comprueba si el
         adjunto ya está en Drive antes de subirlo, que es lo que hace
@@ -170,6 +183,8 @@ class FakeAlmacenDrive:
         era el doble el que se había quedado atrás.
         """
         for archivo in self._archivos.values():
+            if archivo.get("trashed"):
+                continue
             if archivo["name"] == nombre and carpeta_id in archivo["parents"]:
                 return {
                     "id": archivo["id"],
@@ -179,13 +194,31 @@ class FakeAlmacenDrive:
                 }
         return None
 
-    def subir(self, carpeta_id: str, nombre: str, origen, mimetype: str = "application/octet-stream") -> str:
+    def buscar_por_app_property(self, clave: str, valor: str) -> dict | None:
+        """Mismo contrato que AlmacenDrive.buscar_por_app_property: SIN
+        filtrar por papelera (a propósito, ver Fallo 3 del cierre
+        2026-09-11 y el docstring del método real)."""
+        for archivo in self._archivos.values():
+            if archivo.get("appProperties", {}).get(clave) == valor:
+                return {"id": archivo["id"], "name": archivo["name"], "trashed": archivo.get("trashed", False)}
+        return None
+
+    def subir(
+        self, carpeta_id: str, nombre: str, origen, mimetype: str = "application/octet-stream",
+        app_properties: dict | None = None,
+    ) -> str:
         contenido = bytes(origen) if isinstance(origen, (bytes, bytearray)) else pathlib.Path(origen).read_bytes()
         self._contador += 1
         file_id = f"file-{self._contador}"
-        self._archivos[file_id] = {"id": file_id, "name": nombre, "parents": [carpeta_id], "content": contenido}
+        self._archivos[file_id] = {
+            "id": file_id, "name": nombre, "parents": [carpeta_id], "content": contenido,
+            "appProperties": dict(app_properties or {}), "trashed": False,
+        }
         self.llamadas_subir.append(
-            {"carpeta_id": carpeta_id, "nombre": nombre, "contenido": contenido, "mimetype": mimetype}
+            {
+                "carpeta_id": carpeta_id, "nombre": nombre, "contenido": contenido, "mimetype": mimetype,
+                "app_properties": app_properties,
+            }
         )
         return file_id
 
@@ -895,3 +928,213 @@ def test_ningun_cuerpo_de_correo_se_guarda(caplog):
     # Tampoco quedó en ningún mensaje de log de la corrida.
     for registro in caplog.records:
         assert marca not in registro.getMessage()
+
+
+# -----------------------------------------------------------------------------
+# periodo_de_nombre_eecc(): lectura del periodo a partir del NOMBRE del EECC
+# (Fallo 1 del cierre 2026-09-11)
+# -----------------------------------------------------------------------------
+def test_periodo_de_nombre_eecc_interbank():
+    assert correo_gmail.periodo_de_nombre_eecc("202607010012003007064134.pdf") == "2026-07"
+    assert correo_gmail.periodo_de_nombre_eecc("202608010102003006315965.pdf") == "2026-08"
+
+
+def test_periodo_de_nombre_eecc_bbva_manual():
+    assert correo_gmail.periodo_de_nombre_eecc("EC_BBVA_8579_072026.pdf") == "2026-07"
+    assert correo_gmail.periodo_de_nombre_eecc("EC_BBVA_8579_082026.pdf") == "2026-08"
+
+
+def test_periodo_de_nombre_eecc_sin_patron_reconocible_devuelve_none():
+    assert correo_gmail.periodo_de_nombre_eecc("EC_Agosto 2026.pdf") is None
+    assert correo_gmail.periodo_de_nombre_eecc("estado.pdf") is None
+
+
+def test_periodo_de_nombre_eecc_mes_invalido_devuelve_none():
+    # Mismo formato Interbank (6 dígitos + 8 más), pero '13' no es mes válido.
+    assert correo_gmail.periodo_de_nombre_eecc("202613010012003007064134.pdf") is None
+
+
+# -----------------------------------------------------------------------------
+# Fallo 1: adjunto de destino EECC de un periodo distinto al mes conciliado
+# -----------------------------------------------------------------------------
+def test_adjunto_eecc_de_otro_periodo_se_omite_con_mes():
+    contenido = b"%PDF-1.4 EECC de julio"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("202607010012003007064134.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto(destino="EECC")], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio, mes="2026-08")
+
+    assert resultado["adjuntos"] == 0
+    assert resultado["omitidos"] == 1
+    assert almacen.llamadas_subir == []
+
+
+def test_adjunto_eecc_del_mismo_periodo_se_sube_con_mes():
+    contenido = b"%PDF-1.4 EECC de agosto"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("202608010102003006315965.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto(destino="EECC")], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio, mes="2026-08")
+
+    assert resultado["adjuntos"] == 1
+    assert resultado["omitidos"] == 0
+    assert len(almacen.llamadas_subir) == 1
+
+
+def test_adjunto_eecc_sin_periodo_reconocible_se_acepta_igual_con_mes(caplog):
+    contenido = b"%PDF-1.4 EECC subido a mano"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("estado.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto(destino="EECC")], numeros_cuenta=None)
+
+    with caplog.at_level(logging.INFO, logger="procesar.correo_gmail"):
+        resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio, mes="2026-08")
+
+    assert resultado["adjuntos"] == 1
+    assert len(almacen.llamadas_subir) == 1
+    assert any("no se pudo verificar el periodo" in m for m in caplog.messages)
+
+
+def test_adjunto_eecc_sin_mes_no_aplica_filtro_de_periodo():
+    """Sin 'mes' (el valor por defecto), el comportamiento es EXACTAMENTE el
+    de antes de este cambio: nada se descarta por periodo."""
+    contenido = b"%PDF-1.4 EECC de julio"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("202607010012003007064134.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto(destino="EECC")], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 1
+    assert len(almacen.llamadas_subir) == 1
+
+
+# -----------------------------------------------------------------------------
+# Fallo 3: idempotencia de adjuntos BUZON por appProperties + BUZON_TODAS
+# -----------------------------------------------------------------------------
+def test_adjunto_buzon_nuevo_se_sube_con_app_properties_correcto():
+    contenido = b"%PDF-1.4 factura de proveedor"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("factura.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = FakeAlmacenDrive()
+    config = _config(reglas=[_regla_adjunto(destino="BUZON")], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 1
+    assert len(almacen.llamadas_subir) == 1
+    app_properties = almacen.llamadas_subir[0]["app_properties"]
+    assert set(app_properties.keys()) == {"sconcha_origen"}
+    marca = app_properties["sconcha_origen"]
+    assert marca.startswith("msg-1|")
+    assert len(marca.split("|", 1)[1]) == 16  # hash recortado a 16 hex
+
+
+def test_adjunto_buzon_con_marca_ya_existente_se_omite_aunque_este_en_papelera():
+    """Fallo 3: 'procesar.py' pudo mover/renombrar el archivo (o alguien
+    mandarlo a la papelera a propósito) -la marca viaja con él, así que
+    sigue contando como 'ya bajado'."""
+    contenido = b"%PDF-1.4 factura de proveedor"
+    msg_id = "msg-1"
+    nombre = "factura.pdf"
+    marca = correo_gmail._marca_buzon(msg_id, nombre)
+
+    almacen = FakeAlmacenDrive()
+    file_id = almacen.agregar_archivo(
+        "otra-carpeta-id", "factura ya procesada y renombrada.pdf", b"contenido viejo",
+        app_properties={"sconcha_origen": marca},
+    )
+    almacen.mandar_a_papelera(file_id)
+
+    servicio = FakeServicioGmail()
+    servicio.agregar(msg_id, _payload_con_adjunto(nombre, contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    config = _config(reglas=[_regla_adjunto(destino="BUZON")], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 0
+    assert resultado["omitidos"] == 1
+    assert almacen.llamadas_subir == []
+
+
+def test_adjunto_buzon_con_nombre_en_otra_carpeta_de_buzon_todas_se_omite():
+    """Respaldo por NOMBRE para adjuntos bajados ANTES de que existiera la
+    marca por appProperties: si el mismo nombre ya está en la carpeta BUZON
+    de OTRA empresa (BUZON_TODAS), no se vuelve a bajar."""
+    contenido = b"%PDF-1.4 factura de proveedor"
+    almacen = FakeAlmacenDrive()
+    almacen.agregar_archivo("buzon-otra-empresa-id", "factura.pdf", b"contenido ya bajado antes")
+
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("factura.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    config = _config(reglas=[_regla_adjunto(destino="BUZON")], numeros_cuenta=None)
+    carpetas = {**CARPETAS, "BUZON_TODAS": ["buzon-otra-empresa-id", CARPETAS["BUZON"]]}
+
+    resultado = correo_gmail.descargar(config, almacen, carpetas, servicio=servicio)
+
+    assert resultado["adjuntos"] == 0
+    assert resultado["omitidos"] == 1
+    assert almacen.llamadas_subir == []
+
+
+def test_adjunto_buzon_sin_buzon_todas_solo_mira_la_carpeta_destino():
+    """Sin 'BUZON_TODAS' en carpetas, el respaldo por nombre cae al
+    comportamiento de antes de este cambio: solo mira la carpeta destino."""
+    contenido = b"%PDF-1.4 factura de proveedor"
+    almacen = FakeAlmacenDrive()
+    almacen.agregar_archivo("buzon-otra-empresa-id", "factura.pdf", b"contenido de otra empresa")
+
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("factura.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    config = _config(reglas=[_regla_adjunto(destino="BUZON")], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    # El nombre solo está en la carpeta de "otra empresa"; sin BUZON_TODAS,
+    # eso no cuenta -se sube igual, como antes de este cambio.
+    assert resultado["adjuntos"] == 1
+    assert len(almacen.llamadas_subir) == 1
+
+
+def test_adjunto_buzon_almacen_sin_buscar_por_app_property_no_revienta():
+    """Un almacén sin ese método (doble mínimo de un test viejo, o una
+    versión más vieja de AlmacenDrive) no debe romper descargar(): cae
+    directo al chequeo por nombre (ver getattr en _adjunto_buzon_ya_existe)."""
+
+    class AlmacenMinimo:
+        def __init__(self):
+            self.subidas: list[tuple] = []
+
+        def buscar_por_nombre(self, carpeta_id, nombre):
+            return None
+
+        def subir(self, carpeta_id, nombre, origen, mimetype="application/octet-stream", app_properties=None):
+            self.subidas.append((carpeta_id, nombre, app_properties))
+            return "file-1"
+
+    contenido = b"%PDF-1.4 factura de proveedor"
+    servicio = FakeServicioGmail()
+    servicio.agregar("msg-1", _payload_con_adjunto("factura.pdf", contenido))
+    servicio.agregar_adjunto("attach-1", contenido)
+    almacen = AlmacenMinimo()
+    config = _config(reglas=[_regla_adjunto(destino="BUZON")], numeros_cuenta=None)
+
+    resultado = correo_gmail.descargar(config, almacen, CARPETAS, servicio=servicio)
+
+    assert resultado["adjuntos"] == 1
+    assert len(almacen.subidas) == 1
+    assert almacen.subidas[0][2] == {"sconcha_origen": correo_gmail._marca_buzon("msg-1", "factura.pdf")}

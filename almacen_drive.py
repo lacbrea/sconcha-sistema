@@ -152,12 +152,22 @@ class AlmacenDrive:
         nombre: str,
         origen: pathlib.Path | str | bytes,
         mimetype: str = "application/octet-stream",
+        app_properties: dict[str, str] | None = None,
     ) -> str:
         """Sube un archivo binario a la carpeta y devuelve su id.
 
         'origen' puede ser una ruta local (el .xlsx que acaba de generar el
         motor de conciliación) o los bytes ya en memoria (un adjunto de correo,
         que así nunca toca el disco).
+
+        'app_properties', si se pasa, se guarda como 'appProperties' del
+        archivo en Drive: metadata que viaja con el archivo aunque después lo
+        muevan o renombren (a diferencia del nombre). Existe por el Fallo 3
+        del cierre 2026-09-11: correo_gmail marcaba idempotencia de los
+        adjuntos de BUZON solo por nombre en la carpeta de origen, y
+        'procesar.py' mueve y renombra esos archivos al procesarlos, así que
+        dejaban de "contar" como ya bajados y se volvían a bajar (ver
+        buscar_por_app_property, más abajo).
 
         Siempre CREA, igual que el resto de la clase: no sobrescribe, no
         versiona y no borra. Si el nombre ya existe en la carpeta, es quien
@@ -168,13 +178,38 @@ class AlmacenDrive:
         else:
             datos = pathlib.Path(origen).read_bytes()
         media = MediaIoBaseUpload(io.BytesIO(datos), mimetype=mimetype, resumable=False)
-        metadata = {"name": nombre, "parents": [carpeta_id]}
+        metadata: dict = {"name": nombre, "parents": [carpeta_id]}
+        if app_properties:
+            metadata["appProperties"] = dict(app_properties)
         resultado = (
             self._servicio.files()
             .create(body=metadata, media_body=media, fields="id")
             .execute()
         )
         return resultado["id"]
+
+    # -------------------------------------------------------------------
+    def buscar_por_app_property(self, clave: str, valor: str) -> dict | None:
+        """Devuelve el primer archivo cuyo 'appProperties[clave] == valor',
+        o None si no hay ninguno.
+
+        A propósito NO filtra por 'trashed' (a diferencia de
+        buscar_por_nombre() y listar()): Drive v3 incluye archivos en
+        papelera cuando la query no trae la cláusula 'trashed', y eso es
+        justo lo que necesita correo_gmail para el Fallo 3 del cierre
+        2026-09-11 -un adjunto que 'procesar.py' movió a 02_REVISAR, o que
+        alguien mandó a la papelera a propósito, tiene que seguir contando
+        como "ya bajado" (los appProperties viajan con el archivo al
+        moverlo o renombrarlo; el nombre, no).
+        """
+        query = f"appProperties has {{ key='{_escapar(clave)}' and value='{_escapar(valor)}' }}"
+        resp = (
+            self._servicio.files()
+            .list(q=query, fields="files(id, name, trashed)", pageSize=1)
+            .execute()
+        )
+        encontrados = resp.get("files", [])
+        return encontrados[0] if encontrados else None
 
     # -------------------------------------------------------------------
     def enlace(self, file_id: str) -> str:

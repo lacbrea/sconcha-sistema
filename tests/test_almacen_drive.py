@@ -45,6 +45,7 @@ class FakeServicioDrive:
         trashed: bool = False,
         content: bytes = b"",
         web_view_link: str | None = None,
+        app_properties: dict[str, str] | None = None,
     ) -> str:
         self._contador += 1
         file_id = f"id-{self._contador}"
@@ -56,6 +57,7 @@ class FakeServicioDrive:
             "trashed": trashed,
             "content": content,
             "webViewLink": web_view_link or f"https://drive.google.com/file/d/{file_id}/view",
+            "appProperties": dict(app_properties or {}),
         }
         return file_id
 
@@ -120,6 +122,7 @@ class FakeServicioDrive:
                 "trashed": False,
                 "content": contenido,
                 "webViewLink": f"https://drive.google.com/file/d/{file_id}/view",
+                "appProperties": dict(body.get("appProperties") or {}),
             }
             return {"id": file_id}
 
@@ -143,6 +146,16 @@ class FakeServicioDrive:
         m_nombre = re.search(r"name = '((?:[^'\\]|\\.)*)'", q)
         m_padre = re.search(r"'([^']*)' in parents", q)
         pide_carpeta = f"mimeType = '{MIME_CARPETA}'" in q
+        # buscar_por_app_property() arma "appProperties has { key='...' and
+        # value='...' }": a propósito SIN "trashed = false" (ver su
+        # docstring), así que esta query -a diferencia de las de
+        # listar()/buscar_por_nombre()- no debe excluir archivos en
+        # papelera. Como este doble nunca filtra por 'trashed' salvo que se
+        # lo pidan explícitamente (ver comentario de la clase, arriba), basta
+        # con reconocer la cláusula para no ignorarla en silencio.
+        m_app_property = re.search(
+            r"appProperties has \{ key='((?:[^'\\]|\\.)*)' and value='((?:[^'\\]|\\.)*)' \}", q,
+        )
 
         resultado = []
         for archivo in self._archivos.values():
@@ -152,6 +165,11 @@ class FakeServicioDrive:
                 continue
             if pide_carpeta and archivo["mimeType"] != MIME_CARPETA:
                 continue
+            if m_app_property:
+                clave = m_app_property.group(1).replace("\\'", "'")
+                valor = m_app_property.group(2).replace("\\'", "'")
+                if archivo.get("appProperties", {}).get(clave) != valor:
+                    continue
             resultado.append(
                 {
                     "id": archivo["id"],
@@ -429,6 +447,86 @@ def test_buscar_por_nombre_escapa_comilla_simple_en_la_query():
     almacen = AlmacenDrive(servicio)
 
     resultado = almacen.buscar_por_nombre("carpeta-1", nombre_con_comilla)
+
+    assert resultado is not None
+    assert resultado["id"] == file_id
+
+
+# -----------------------------------------------------------------------------
+# subir() con app_properties / buscar_por_app_property()
+# -----------------------------------------------------------------------------
+def test_subir_con_app_properties_los_guarda_en_el_body():
+    servicio = FakeServicioDrive()
+    almacen = AlmacenDrive(servicio)
+
+    file_id = almacen.subir(
+        "carpeta-1", "estado.pdf", b"contenido",
+        app_properties={"sconcha_origen": "msg-1|abcd1234"},
+    )
+
+    assert servicio._archivos[file_id]["appProperties"] == {"sconcha_origen": "msg-1|abcd1234"}
+
+
+def test_subir_sin_app_properties_no_agrega_la_clave():
+    """Sin 'app_properties', el archivo queda con appProperties vacío -no se
+    manda una clave con valor None ni nada por el estilo a la API real."""
+    servicio = FakeServicioDrive()
+    almacen = AlmacenDrive(servicio)
+
+    file_id = almacen.subir("carpeta-1", "reporte.xlsx", b"contenido")
+
+    assert servicio._archivos[file_id]["appProperties"] == {}
+
+
+def test_buscar_por_app_property_encuentra_el_archivo():
+    servicio = FakeServicioDrive()
+    file_id = servicio.agregar(
+        "estado.pdf", parents=["carpeta-1"], app_properties={"sconcha_origen": "msg-1|abcd1234"},
+    )
+    almacen = AlmacenDrive(servicio)
+
+    resultado = almacen.buscar_por_app_property("sconcha_origen", "msg-1|abcd1234")
+
+    assert resultado is not None
+    assert resultado["id"] == file_id
+
+
+def test_buscar_por_app_property_devuelve_none_si_no_hay_ninguno():
+    servicio = FakeServicioDrive()
+    servicio.agregar("estado.pdf", parents=["carpeta-1"], app_properties={"sconcha_origen": "msg-2|zzzz9999"})
+    almacen = AlmacenDrive(servicio)
+
+    assert almacen.buscar_por_app_property("sconcha_origen", "msg-1|abcd1234") is None
+
+
+def test_buscar_por_app_property_incluye_archivos_en_papelera():
+    """Garantía de diseño (Fallo 3 del cierre 2026-09-11): a diferencia de
+    buscar_por_nombre()/listar(), esta búsqueda SÍ debe encontrar un archivo
+    en papelera -un adjunto mandado a la papelera a propósito sigue
+    contando como 'ya bajado'."""
+    servicio = FakeServicioDrive()
+    file_id = servicio.agregar(
+        "estado.pdf", parents=["carpeta-1"], trashed=True,
+        app_properties={"sconcha_origen": "msg-1|abcd1234"},
+    )
+    almacen = AlmacenDrive(servicio)
+
+    resultado = almacen.buscar_por_app_property("sconcha_origen", "msg-1|abcd1234")
+
+    assert resultado is not None
+    assert resultado["id"] == file_id
+    assert resultado["trashed"] is True
+
+
+def test_buscar_por_app_property_escapa_comilla_simple_en_la_query():
+    servicio = FakeServicioDrive()
+    valor_con_comilla = "msg-1|O'Higgins"
+    file_id = servicio.agregar(
+        "estado.pdf", parents=["carpeta-1"], app_properties={"sconcha_origen": valor_con_comilla},
+    )
+    almacen = AlmacenDrive(servicio)
+
+    resultado = almacen.buscar_por_app_property("sconcha_origen", valor_con_comilla)
 
     assert resultado is not None
     assert resultado["id"] == file_id

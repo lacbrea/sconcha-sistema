@@ -40,6 +40,7 @@ este agente) resuelve las carpetas de Drive y las pasa ya resueltas en
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import pathlib
@@ -86,6 +87,64 @@ TIPO_ADJUNTO = "adjunto"
 
 DIAS_ATRAS_POR_DEFECTO = 45
 MAX_MENSAJES_POR_DEFECTO = 200
+
+# Clave de appProperties con la que se marca en Drive un adjunto de destino
+# BUZON ya bajado (ver _marca_buzon_ya_existe / descargar()). El límite de
+# Drive es 124 bytes por clave+valor de appProperties; esta clave (14 bytes)
+# deja de sobra los ~110 bytes restantes para "<msg_id>|<hash de 16 hex>"
+# (un id de mensaje de Gmail nunca se acerca a esa longitud).
+CLAVE_APP_PROPERTY_BUZON = "sconcha_origen"
+
+
+# =============================================================================
+# Periodo (AAAA-MM) codificado en el NOMBRE de un EECC
+# =============================================================================
+# Interbank: los primeros 6 dígitos del nombre son AAAAMM, seguidos de al
+# menos 8 dígitos más (el resto del código de operación/cuenta). Ej. real:
+# '202607010012003007064134.pdf' -> julio 2026, cuenta 4134.
+_RE_PERIODO_EECC_INTERBANK = re.compile(r"^(\d{4})(\d{2})\d{8,}")
+# BBVA / subido a mano: '_MMAAAA' seguido de un separador ('.', '_') o el fin
+# del nombre. Ej. real: 'EC_BBVA_8579_072026.pdf' -> julio 2026.
+_RE_PERIODO_EECC_BBVA = re.compile(r"_(\d{2})(\d{4})(?=[._]|$)")
+
+
+def _periodo_valido(anio: str, mes: str) -> str | None:
+    """Formatea 'AAAA-MM' si anio/mes validan (mes 01-12, año 2000-2099), o
+    None si no. Un año/mes fuera de rango no es un periodo "raro pero
+    real": es evidencia de que el patrón calzó con algo que no era un
+    periodo, así que se trata igual que 'no se pudo leer' (None)."""
+    anio_i, mes_i = int(anio), int(mes)
+    if not (1 <= mes_i <= 12) or not (2000 <= anio_i <= 2099):
+        return None
+    return f"{anio_i:04d}-{mes_i:02d}"
+
+
+def periodo_de_nombre_eecc(nombre: str) -> str | None:
+    """Intenta leer, del NOMBRE de archivo de un EECC, el periodo (AAAA-MM)
+    que en realidad cubre -no el mes en que llegó el correo ni la carpeta
+    de Drive donde se guardó-. Existe por el Fallo 1 del cierre 2026-09-11:
+    un EECC de julio, dejado por el correo en la carpeta de agosto (el mes
+    que se estaba conciliando), se usó sin más y salió un Excel de "agosto"
+    con el banco de julio.
+
+    Reconoce dos convenciones reales (ver los regex arriba); cualquier otro
+    nombre -o uno que calce con la forma pero con mes/año que no valida,
+    como '202613...'- devuelve None: "no se pudo verificar", nunca un
+    periodo inventado. Quien llama (descargar_eecc de conciliar.py, y
+    descargar() de este módulo) decide qué hacer con ese None -hoy: aceptar
+    igual que antes de este cambio, porque no se puede descartar en
+    silencio algo que no se pudo leer."""
+    m = _RE_PERIODO_EECC_INTERBANK.match(nombre)
+    if m:
+        anio, mes = m.group(1), m.group(2)
+        return _periodo_valido(anio, mes)
+
+    m = _RE_PERIODO_EECC_BBVA.search(nombre)
+    if m:
+        mes, anio = m.group(1), m.group(2)
+        return _periodo_valido(anio, mes)
+
+    return None
 
 
 # =============================================================================
@@ -401,6 +460,51 @@ def _bytes_adjunto(servicio, msg_id: str, parte: dict) -> bytes:
     return _decodificar_base64url(datos)
 
 
+def _marca_buzon(msg_id: str, nombre_saneado: str) -> str:
+    """Valor de appProperties que identifica un adjunto BUZON ya bajado:
+    mensaje + hash corto del nombre (por si un mismo correo trajera dos
+    adjuntos con nombre saneado distinto). No es un hash criptográfico con
+    fines de seguridad -sha1 alcanza de sobra para no colisionar dentro de
+    un mismo mensaje-, y se recorta a 16 hex para dejar margen bajo el
+    límite de 124 bytes de appProperties (ver CLAVE_APP_PROPERTY_BUZON)."""
+    return f"{msg_id}|{hashlib.sha1(nombre_saneado.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _adjunto_buzon_ya_existe(
+    almacen: "AlmacenDrive", carpetas: dict, carpeta_destino_id: str, nombre_saneado: str, marca_valor: str,
+) -> bool:
+    """Idempotencia de los adjuntos de destino BUZON (Fallo 3 del cierre
+    2026-09-11): 'procesar.py' MUEVE y RENOMBRA el archivo al procesarlo, así
+    que buscar por NOMBRE en la carpeta de origen ya no sirve para saber si
+    "ya se bajó" -y los mismos adjuntos se bajaban dos veces (una por
+    empresa) y se iban a volver a bajar después de procesados.
+
+    Dos chequeos, en orden:
+    1. Por appProperties (clave CLAVE_APP_PROPERTY_BUZON = marca_valor):
+       viaja con el archivo aunque lo muevan o renombren, y
+       buscar_por_app_property() incluye la papelera a propósito -un
+       archivo mandado a la papelera sigue contando como "ya bajado". Si
+       'almacen' no trae ese método (dobles de test viejos, o una versión
+       más vieja de AlmacenDrive) se salta sin reventar: cae directo al
+       chequeo por nombre.
+    2. Respaldo por NOMBRE, para adjuntos bajados ANTES de este cambio (sin
+       la marca): busca en todas las carpetas de carpetas['BUZON_TODAS']
+       (todas las empresas del negocio) para no volver a bajar un adjunto
+       que ya cayó en el buzón de otra empresa; si esa clave no está
+       configurada, usa solo la carpeta destino -mismo comportamiento que
+       antes de este cambio."""
+    buscar_por_propiedad = getattr(almacen, "buscar_por_app_property", None)
+    if buscar_por_propiedad is not None:
+        if buscar_por_propiedad(CLAVE_APP_PROPERTY_BUZON, marca_valor) is not None:
+            return True
+
+    carpetas_a_revisar = carpetas.get("BUZON_TODAS") or [carpeta_destino_id]
+    for carpeta_id in carpetas_a_revisar:
+        if almacen.buscar_por_nombre(carpeta_id, nombre_saneado) is not None:
+            return True
+    return False
+
+
 # =============================================================================
 # Punto de entrada
 # =============================================================================
@@ -410,6 +514,7 @@ def descargar(
     carpetas: dict,
     servicio: "Resource | None" = None,
     dry_run: bool = False,
+    mes: str | None = None,
 ) -> dict:
     """Consulta Gmail (solo lectura) según config['correo'] y escribe en
     Drive lo que corresponda a cada regla:
@@ -420,28 +525,31 @@ def descargar(
     - tipo 'adjunto': busca en el mensaje las partes con nombre de archivo
       (pueden venir anidadas), filtra por regla['extensiones'] y sube las
       que calzan -bytes en memoria, nunca pasan por disco- a
-      carpetas[regla['destino']]. Idempotente por nombre de archivo dentro
-      de esa carpeta (ver AlmacenDrive.buscar_por_nombre): correr la misma
-      consulta dos veces no duplica nada en Drive.
+      carpetas[regla['destino']]. La idempotencia depende del destino:
+        * destino 'EECC': por nombre de archivo dentro de esa carpeta (ver
+          AlmacenDrive.buscar_por_nombre), igual que siempre.
+        * destino 'BUZON': por appProperties + respaldo por nombre en
+          carpetas['BUZON_TODAS'] (ver _adjunto_buzon_ya_existe) -el Fallo 3
+          del cierre 2026-09-11: por nombre solo, en la carpeta de origen,
+          dejaba de servir en cuanto 'procesar.py' movía/renombraba el
+          archivo al procesarlo.
+        * cualquier otro destino: por nombre en la carpeta destino, como
+          antes.
 
-    carpetas: {"EECC": "<id de Drive>", "CONSTANCIAS": "<id>", "BUZON": "<id>"}
+    'mes' (formato AAAA-MM, opcional): el mes que se está conciliando. Si se
+    pasa, un adjunto de destino 'EECC' cuyo NOMBRE codifica un periodo
+    reconocible (ver periodo_de_nombre_eecc) y ese periodo es distinto de
+    'mes' se OMITE (no se sube) -el Fallo 1 del cierre 2026-09-11: un EECC de
+    julio se aceptó en la carpeta de agosto sin ningún chequeo. Si el
+    periodo no se pudo leer del nombre, se acepta igual que siempre -no se
+    puede verificar, no se puede descartar en silencio.
+
+    carpetas: {"EECC": "<id>", "CONSTANCIAS": "<id>", "BUZON": "<id>",
+               "BUZON_TODAS": ["<id>", ...]}. "BUZON_TODAS" es opcional (ver
+    _adjunto_buzon_ya_existe): sin ella, el respaldo por nombre de un
+    adjunto BUZON solo mira la carpeta destino, como antes de este cambio.
     Devuelve {"adjuntos": int, "constancias": int, "omitidos": int,
               "archivos": [ {...} ], "errores": [str]}
-
-    LIMITACIÓN CONOCIDA, a propósito no resuelta (ver ALCANCE): el destino de
-    un adjunto es la carpeta que pasa quien llama (carpetas[destino]), y
-    quien llama (conciliar.py) la resuelve por el MES QUE SE ESTÁ
-    CONCILIANDO -no por el periodo que en realidad cubre el documento. El mes
-    del correo no es el mes del documento: verificado que el EECC de julio
-    2026 de Interbank llegó por correo el 2026-08-03, y su nombre de archivo
-    (202607010012003007064134.pdf) codifica el periodo 202607 en los
-    primeros 6 dígitos. Esa numeración es específica de Interbank -no sirve
-    para BBVA, Izipay ni proveedores-, así que este módulo NO intenta leer
-    el periodo del nombre del archivo: quien corre la bajada decide en qué
-    carpeta de mes caen los adjuntos. Con dias_atras: 45 (el valor por
-    defecto) un EECC recién llegado cae en el mes que se está conciliando,
-    que es el caso normal; correr un mes viejo mucho después de que llegó el
-    correo no lo va a encontrar ahí.
     """
     resumen = {"adjuntos": 0, "constancias": 0, "omitidos": 0, "archivos": [], "errores": []}
 
@@ -544,8 +652,36 @@ def descargar(
                         resumen["omitidos"] += 1
                         continue
 
+                    # Fallo 1 (cierre 2026-09-11): un EECC cuyo nombre dice
+                    # que es de OTRO periodo que el que se está conciliando
+                    # no se baja -antes se aceptaba sin más, y julio se coló
+                    # como si fuera agosto.
+                    if destino == "EECC" and mes is not None:
+                        periodo = periodo_de_nombre_eecc(nombre_saneado)
+                        if periodo is not None and periodo != mes:
+                            logger.info(
+                                "mensaje %s: '%s' es un EECC de periodo %s, distinto del mes que se "
+                                "concilia (%s); se omite.",
+                                msg_id, nombre_saneado, periodo, mes,
+                            )
+                            resumen["omitidos"] += 1
+                            continue
+                        if periodo is None:
+                            logger.info(
+                                "mensaje %s: no se pudo verificar el periodo de '%s' a partir del "
+                                "nombre; se acepta igual.",
+                                msg_id, nombre_saneado,
+                            )
+
+                    marca_valor = _marca_buzon(msg_id, nombre_saneado) if destino == "BUZON" else None
+
                     try:
-                        ya_existe = almacen.buscar_por_nombre(carpeta_destino_id, nombre_saneado) is not None
+                        if marca_valor is not None:
+                            ya_existe = _adjunto_buzon_ya_existe(
+                                almacen, carpetas, carpeta_destino_id, nombre_saneado, marca_valor,
+                            )
+                        else:
+                            ya_existe = almacen.buscar_por_nombre(carpeta_destino_id, nombre_saneado) is not None
                     except Exception as exc:
                         motivo = f"mensaje {msg_id}: error al comprobar si '{nombre_saneado}' ya existía: {exc}"
                         logger.error(motivo)
@@ -577,7 +713,13 @@ def descargar(
                     try:
                         contenido = _bytes_adjunto(servicio, msg_id, parte)
                         mimetype = parte.get("mimeType") or "application/octet-stream"
-                        file_id = almacen.subir(carpeta_destino_id, nombre_saneado, contenido, mimetype=mimetype)
+                        if marca_valor is not None:
+                            file_id = almacen.subir(
+                                carpeta_destino_id, nombre_saneado, contenido, mimetype=mimetype,
+                                app_properties={CLAVE_APP_PROPERTY_BUZON: marca_valor},
+                            )
+                        else:
+                            file_id = almacen.subir(carpeta_destino_id, nombre_saneado, contenido, mimetype=mimetype)
                     except Exception as exc:
                         motivo = f"mensaje {msg_id}: error al bajar/subir '{nombre_saneado}': {exc}"
                         logger.error(motivo)

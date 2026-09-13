@@ -184,6 +184,31 @@ def resolver_carpeta_buzon_correo(config: dict, nombre_corto: str) -> str | None
     return carpetas.get("buzon")
 
 
+def resolver_buzon_todas(config: dict) -> list[str]:
+    """Ids de la carpeta 'facturas' de TODAS las empresas configuradas en
+    drive.carpetas.buzon_empresas, sin vacíos ni repetidos.
+
+    Alimenta carpetas['BUZON_TODAS'] en main(): correo_gmail.descargar() la
+    usa como respaldo de idempotencia para adjuntos de destino BUZON que se
+    bajaron ANTES de que existiera la marca por appProperties (ver Fallo 3
+    del cierre 2026-09-11) -sin esto, el mismo adjunto se bajaba una vez por
+    cada empresa (cada una mira solo su propia carpeta de facturas) y además
+    se volvía a bajar en cuanto 'procesar.py' lo movía/renombraba fuera de
+    ahí.
+
+    Tolera que falte 'drive', 'carpetas' o 'buzon_empresas' (negocio de una
+    sola empresa con 'buzon_tipos', o un config a medio llenar): en esos
+    casos devuelve lista vacía, y correo_gmail cae al comportamiento de
+    antes de este cambio (mirar solo la carpeta destino)."""
+    buzon_empresas = ((config.get("drive") or {}).get("carpetas") or {}).get("buzon_empresas") or {}
+    ids: list[str] = []
+    for entrada in buzon_empresas.values():
+        carpeta_id = (entrada or {}).get("facturas")
+        if carpeta_id and carpeta_id not in ids:
+            ids.append(carpeta_id)
+    return ids
+
+
 def directorio_trabajo(nombre_corto: str, mes: str) -> pathlib.Path:
     return pathlib.Path("salida") / "conciliacion" / nombre_corto / mes
 
@@ -215,18 +240,39 @@ def configurar_logging(carpeta_salida: pathlib.Path, verbose: bool) -> None:
 # EECC: selección por número de cuenta, descarga a disco local
 # -----------------------------------------------------------------------------
 def descargar_eecc(
-    almacen: AlmacenDrive, carpeta_eecc_id: str, cuentas: list[dict], destino_dir: pathlib.Path
+    almacen: AlmacenDrive,
+    carpeta_eecc_id: str,
+    cuentas: list[dict],
+    destino_dir: pathlib.Path,
+    mes: str | None = None,
 ) -> tuple[dict[str, list[pathlib.Path]], list[str]]:
     """Descarga los EECC de carpeta_eecc_id cuyo nombre contenga el 'numero'
     de alguna cuenta de esta empresa (criterio del config: así nombra el
     banco el archivo, ej. EC_4134_062026.pdf).
 
+    'mes' (formato AAAA-MM, opcional) es el mes que se está conciliando. Si
+    se pasa y el NOMBRE del archivo codifica un periodo reconocible (ver
+    correo_gmail.periodo_de_nombre_eecc) distinto de 'mes', el archivo NO se
+    descarga -va a 'ignorados' igual que un archivo de otra cuenta-. Es el
+    Fallo 1 del cierre 2026-09-11: el correo dejó el EECC de julio en la
+    carpeta de agosto (la que se estaba conciliando) y este chequeo nunca
+    existió, así que se usó sin más y salió un Excel de "agosto" con el
+    banco de julio. Si el periodo no se pudo leer del nombre (formato
+    desconocido), se acepta igual que antes de este cambio -no se puede
+    verificar, no se puede descartar en silencio- pero queda un log.
+    Import diferido de correo_gmail (ver el mismo criterio en main()): evita
+    un import circular a nivel de módulo, ya que correo_gmail no depende de
+    conciliar pero esta función sí necesita su función pura.
+
     Devuelve (por_cuenta, ignorados):
       por_cuenta: {numero_cuenta: [Path, ...]} (normalmente un archivo por
         cuenta, pero no se asume: si hay más de uno se descargan todos).
-      ignorados: nombres que no calzaron con ninguna cuenta configurada. Se
-        registran siempre en el log, nunca se descartan en silencio.
+      ignorados: nombres que no calzaron con ninguna cuenta configurada, o
+        que sí calzaron pero son de otro periodo. Se registran siempre en
+        el log, nunca se descartan en silencio.
     """
+    from correo_gmail import periodo_de_nombre_eecc
+
     archivos = almacen.listar(carpeta_eecc_id)
     por_cuenta: dict[str, list[pathlib.Path]] = {}
     ignorados: list[str] = []
@@ -237,6 +283,20 @@ def descargar_eecc(
             ignorados.append(nombre)
             logger.warning("EECC ignorado (no calza con ninguna cuenta configurada de esta empresa): %s", nombre)
             continue
+
+        if mes is not None:
+            periodo = periodo_de_nombre_eecc(nombre)
+            if periodo is not None and periodo != mes:
+                ignorados.append(nombre)
+                logger.warning(
+                    "EECC de periodo %s ignorado en la conciliación de %s: %s", periodo, mes, nombre,
+                )
+                continue
+            if periodo is None:
+                logger.info(
+                    "EECC '%s': no se pudo verificar el periodo a partir del nombre; se acepta igual.", nombre,
+                )
+
         destino = destino_dir / nombre
         almacen.descargar(archivo["id"], destino)
         por_cuenta.setdefault(numero_match, []).append(destino)
@@ -810,14 +870,37 @@ def subir_resultado(
     """Sube ruta_local a carpeta_destino_id. AlmacenDrive.subir() siempre
     CREA (no puede sobrescribir), así que si el nombre ya existe se sube con
     sufijo ' v2', ' v3'... en vez de dejar dos archivos con el mismo nombre
-    conviviendo sin explicación. Devuelve (nombre_final, file_id)."""
+    conviviendo sin explicación.
+
+    La siguiente versión se calcula sobre los archivos VIVOS de la carpeta
+    (almacen.listar(), que ya excluye la papelera), no probando nombres uno
+    por uno con buscar_por_nombre() como antes: ese criterio viejo es el
+    Fallo 2 del cierre 2026-09-11. El negocio manda las versiones anteriores
+    a la papelera (ver convención de versiones); si queda viva solo
+    'X v15.xlsx', buscar_por_nombre('X.xlsx') no la encuentra (no existe un
+    archivo vivo con ESE nombre exacto) y la corrida subía 'X.xlsx' como si
+    fuera la primera versión -1 en vez de 16-, y --heredar del mes
+    siguiente habría heredado la v15 vieja en vez de la recién subida.
+    Ahora se toma max(version_de_xlsx) + 1 entre TODOS los .xlsx vivos con
+    el mismo nombre base (el original o 'X vN.xlsx'); un archivo de otra
+    empresa o mes en la misma carpeta no calza con ese patrón y no cuenta.
+
+    Devuelve (nombre_final, file_id)."""
     stem = pathlib.PurePosixPath(nombre_deseado).stem
     suffix = pathlib.PurePosixPath(nombre_deseado).suffix
-    nombre_final = nombre_deseado
-    version = 2
-    while almacen.buscar_por_nombre(carpeta_destino_id, nombre_final) is not None:
-        nombre_final = f"{stem} v{version}{suffix}"
-        version += 1
+    patron_mismo_stem = re.compile(rf"^{re.escape(stem)}(?: v\d+)?{re.escape(suffix)}$", re.IGNORECASE)
+
+    version_mas_alta = 0
+    for archivo in almacen.listar(carpeta_destino_id):
+        nombre = archivo.get("name", "")
+        if not patron_mismo_stem.match(nombre):
+            continue
+        version_mas_alta = max(version_mas_alta, version_de_xlsx(nombre))
+
+    if version_mas_alta == 0:
+        nombre_final = nombre_deseado
+    else:
+        nombre_final = f"{stem} v{version_mas_alta + 1}{suffix}"
 
     if nombre_final != nombre_deseado:
         logger.warning(
@@ -981,9 +1064,16 @@ def main(argv: list[str] | None = None) -> int:
                 "EECC": carpeta_eecc_id,
                 "CONSTANCIAS": carpeta_constancias_id,
                 "BUZON": resolver_carpeta_buzon_correo(config, empresa_cfg["nombre_corto"]),
+                # Respaldo de idempotencia por nombre para adjuntos BUZON
+                # viejos (sin appProperties): todas las empresas, no solo la
+                # que se está conciliando ahora (Fallo 3, ver
+                # resolver_buzon_todas). Lista vacía si el negocio no usa
+                # buzon_empresas: correo_gmail cae al comportamiento de
+                # antes (solo mira la carpeta destino).
+                "BUZON_TODAS": resolver_buzon_todas(config),
             }
             resumen_correo = correo_gmail.descargar(
-                config, almacen, carpetas_correo, servicio=None, dry_run=args.dry_run
+                config, almacen, carpetas_correo, servicio=None, dry_run=args.dry_run, mes=args.mes
             )
             logger.info("Correo: %s", resumen_correo)
         except Exception as exc:
@@ -996,7 +1086,9 @@ def main(argv: list[str] | None = None) -> int:
     trabajo_dir = directorio_trabajo(empresa_cfg["nombre_corto"], args.mes)
     trabajo_dir.mkdir(parents=True, exist_ok=True)
 
-    por_cuenta, ignorados = descargar_eecc(almacen, carpeta_eecc_id, empresa_cfg["cuentas"], trabajo_dir)
+    por_cuenta, ignorados = descargar_eecc(
+        almacen, carpeta_eecc_id, empresa_cfg["cuentas"], trabajo_dir, mes=args.mes
+    )
     total_eecc = sum(len(v) for v in por_cuenta.values())
     if total_eecc == 0:
         raiz_nombre = config.get("drive", {}).get("raiz_nombre", "?")

@@ -37,6 +37,9 @@ if str(RAIZ_PROYECTO) not in sys.path:
 
 import auth_google  # noqa: E402
 import conciliar  # noqa: E402
+import correo_gmail  # noqa: E402 -- el módulo REAL: _stub_correo_gmail() lo necesita para
+# que su doble de sys.modules siga trayendo periodo_de_nombre_eecc (descargar_eecc lo
+# importa de forma diferida) sin arrastrar el resto del comportamiento real (Gmail/Drive).
 from registro_sheets import COLUMNAS_CONTABLE  # noqa: E402
 
 
@@ -170,6 +173,76 @@ def test_descargar_eecc_de_otra_empresa_no_se_descarga_y_queda_en_ignorados(tmp_
     assert por_cuenta == {}
     assert ignorados == ["EC_9999_062026.pdf"]
     assert not (tmp_path / "EC_9999_062026.pdf").exists()  # nunca se descargó
+
+
+# -----------------------------------------------------------------------------
+# Fallo 1 (cierre 2026-09-11): descargar_eecc con 'mes' ignora EECC de otro
+# periodo, aunque el NOMBRE calce con la cuenta configurada.
+# -----------------------------------------------------------------------------
+def test_descargar_eecc_de_otro_periodo_se_ignora_con_mes(tmp_path):
+    almacen = FakeAlmacen()
+    carpeta_eecc_id = almacen.agregar_carpeta("EECC")
+    almacen.agregar_archivo(carpeta_eecc_id, "202607010012003007064134.pdf", b"EECC de julio")  # 4134, periodo 2026-07
+    cuentas = [{"banco": "interbank", "numero": "4134", "moneda": "PEN", "principal": True}]
+
+    por_cuenta, ignorados = conciliar.descargar_eecc(almacen, carpeta_eecc_id, cuentas, tmp_path, mes="2026-08")
+
+    assert por_cuenta == {}
+    assert ignorados == ["202607010012003007064134.pdf"]
+    assert not (tmp_path / "202607010012003007064134.pdf").exists()
+
+
+def test_descargar_eecc_del_mismo_periodo_se_descarga_con_mes(tmp_path):
+    almacen = FakeAlmacen()
+    carpeta_eecc_id = almacen.agregar_carpeta("EECC")
+    almacen.agregar_archivo(carpeta_eecc_id, "202608010012003007064134.pdf", b"EECC de agosto")  # periodo 2026-08
+    cuentas = [{"banco": "interbank", "numero": "4134", "moneda": "PEN", "principal": True}]
+
+    por_cuenta, ignorados = conciliar.descargar_eecc(almacen, carpeta_eecc_id, cuentas, tmp_path, mes="2026-08")
+
+    assert ignorados == []
+    assert list(por_cuenta.keys()) == ["4134"]
+
+
+def test_descargar_eecc_bbva_del_mismo_periodo_se_descarga_con_mes(tmp_path):
+    almacen = FakeAlmacen()
+    carpeta_eecc_id = almacen.agregar_carpeta("EECC")
+    almacen.agregar_archivo(carpeta_eecc_id, "EC_BBVA_8579_082026.pdf", b"EECC BBVA de agosto")
+    cuentas = [{"banco": "bbva", "numero": "8579", "moneda": "PEN", "principal": True}]
+
+    por_cuenta, ignorados = conciliar.descargar_eecc(almacen, carpeta_eecc_id, cuentas, tmp_path, mes="2026-08")
+
+    assert ignorados == []
+    assert list(por_cuenta.keys()) == ["8579"]
+
+
+def test_descargar_eecc_sin_numero_de_cuenta_ignorado_como_siempre_con_mes(tmp_path):
+    """Un nombre sin número de cuenta reconocible se ignora por la razón de
+    siempre (ninguna cuenta calza), no por el filtro de periodo nuevo."""
+    almacen = FakeAlmacen()
+    carpeta_eecc_id = almacen.agregar_carpeta("EECC")
+    almacen.agregar_archivo(carpeta_eecc_id, "EC_Agosto 2026.pdf", b"sin numero de cuenta")
+    cuentas = [{"banco": "interbank", "numero": "4134", "moneda": "PEN", "principal": True}]
+
+    por_cuenta, ignorados = conciliar.descargar_eecc(almacen, carpeta_eecc_id, cuentas, tmp_path, mes="2026-08")
+
+    assert por_cuenta == {}
+    assert ignorados == ["EC_Agosto 2026.pdf"]
+
+
+def test_descargar_eecc_sin_mes_no_aplica_filtro_de_periodo(tmp_path):
+    """Sin 'mes' (el valor por defecto, None), el comportamiento es
+    exactamente el de antes de este cambio: no se descarta nada por
+    periodo, aunque el nombre codifique uno distinto al que se corre."""
+    almacen = FakeAlmacen()
+    carpeta_eecc_id = almacen.agregar_carpeta("EECC")
+    almacen.agregar_archivo(carpeta_eecc_id, "202607010012003007064134.pdf", b"EECC de julio")
+    cuentas = [{"banco": "interbank", "numero": "4134", "moneda": "PEN", "principal": True}]
+
+    por_cuenta, ignorados = conciliar.descargar_eecc(almacen, carpeta_eecc_id, cuentas, tmp_path)
+
+    assert ignorados == []
+    assert list(por_cuenta.keys()) == ["4134"]
 
 
 # -----------------------------------------------------------------------------
@@ -900,6 +973,109 @@ def test_subir_resultado_nunca_pisa_el_archivo_existente(tmp_path):
 
 
 # -----------------------------------------------------------------------------
+# Fallo 2 (cierre 2026-09-11): la siguiente versión se calcula sobre los
+# archivos VIVOS de la carpeta (max(version_de_xlsx) + 1), no probando
+# nombres uno por uno -eso perdía la numeración cuando el negocio manda las
+# versiones viejas a la papelera y solo queda viva una vN alta.
+# -----------------------------------------------------------------------------
+def test_subir_resultado_si_solo_existe_v15_viva_sube_como_v16(tmp_path):
+    """El original ('X.xlsx') está en la papelera (el negocio lo mandó ahí);
+    solo queda viva 'X v15.xlsx'. buscar_por_nombre('X.xlsx') no la
+    encuentra -no hay ningún archivo vivo con ESE nombre exacto-, así que el
+    criterio viejo subía la corrida nueva como 'X.xlsx' (versión 1),
+    perdiendo la numeración."""
+    almacen = FakeAlmacen()
+    carpeta_id = almacen.agregar_carpeta("2026-08")
+    almacen.agregar_archivo(carpeta_id, "CONCILIACION EL TEMPLO - Agosto 2026 v15.xlsx")
+    ruta_local = tmp_path / "salida.xlsx"
+    ruta_local.write_bytes(b"contenido")
+
+    nombre_final, _ = conciliar.subir_resultado(
+        almacen, carpeta_id, "CONCILIACION EL TEMPLO - Agosto 2026.xlsx", ruta_local
+    )
+
+    assert nombre_final == "CONCILIACION EL TEMPLO - Agosto 2026 v16.xlsx"
+
+
+def test_subir_resultado_si_existen_v3_y_base_sube_como_v4(tmp_path):
+    almacen = FakeAlmacen()
+    carpeta_id = almacen.agregar_carpeta("2026-06")
+    almacen.agregar_archivo(carpeta_id, "CONCILIACION EL TEMPLO - Junio 2026.xlsx")
+    almacen.agregar_archivo(carpeta_id, "CONCILIACION EL TEMPLO - Junio 2026 v3.xlsx")
+    ruta_local = tmp_path / "salida.xlsx"
+    ruta_local.write_bytes(b"contenido")
+
+    nombre_final, _ = conciliar.subir_resultado(
+        almacen, carpeta_id, "CONCILIACION EL TEMPLO - Junio 2026.xlsx", ruta_local
+    )
+
+    assert nombre_final == "CONCILIACION EL TEMPLO - Junio 2026 v4.xlsx"
+
+
+def test_subir_resultado_un_archivo_de_otra_empresa_o_mes_no_cuenta(tmp_path):
+    """Un .xlsx con nombre base DISTINTO en la misma carpeta (otra empresa,
+    o de otro mes que terminó compartiendo carpeta por error) no debe
+    afectar el cálculo de versión de este resultado."""
+    almacen = FakeAlmacen()
+    carpeta_id = almacen.agregar_carpeta("2026-06")
+    almacen.agregar_archivo(carpeta_id, "CONCILIACION INSTITUCION CEVICHERA - Junio 2026.xlsx")
+    almacen.agregar_archivo(carpeta_id, "CONCILIACION INSTITUCION CEVICHERA - Junio 2026 v7.xlsx")
+    ruta_local = tmp_path / "salida.xlsx"
+    ruta_local.write_bytes(b"contenido")
+
+    nombre_final, _ = conciliar.subir_resultado(
+        almacen, carpeta_id, "CONCILIACION EL TEMPLO - Junio 2026.xlsx", ruta_local
+    )
+
+    assert nombre_final == "CONCILIACION EL TEMPLO - Junio 2026.xlsx"
+
+
+# -----------------------------------------------------------------------------
+# resolver_buzon_todas(): ids de 'facturas' de TODAS las empresas de
+# buzon_empresas, para el respaldo de idempotencia BUZON (Fallo 3).
+# -----------------------------------------------------------------------------
+def test_resolver_buzon_todas_junta_facturas_de_todas_las_empresas():
+    config = {
+        "drive": {
+            "carpetas": {
+                "buzon_empresas": {
+                    "EL TEMPLO": {"facturas": "facturas-el-templo-id", "otros": "otros-id"},
+                    "INSTITUCION": {"facturas": "facturas-institucion-id"},
+                }
+            }
+        }
+    }
+
+    ids = conciliar.resolver_buzon_todas(config)
+
+    assert set(ids) == {"facturas-el-templo-id", "facturas-institucion-id"}
+
+
+def test_resolver_buzon_todas_sin_repetidos():
+    config = {
+        "drive": {
+            "carpetas": {
+                "buzon_empresas": {
+                    "EL TEMPLO": {"facturas": "misma-id"},
+                    "INSTITUCION": {"facturas": "misma-id"},
+                }
+            }
+        }
+    }
+
+    assert conciliar.resolver_buzon_todas(config) == ["misma-id"]
+
+
+def test_resolver_buzon_todas_sin_buzon_empresas_devuelve_vacio():
+    assert conciliar.resolver_buzon_todas({}) == []
+    assert conciliar.resolver_buzon_todas({"drive": {}}) == []
+    assert conciliar.resolver_buzon_todas({"drive": {"carpetas": {}}}) == []
+    # Una empresa sin 'facturas' (u otras claves vacías) no lanza y no aporta id.
+    config = {"drive": {"carpetas": {"buzon_empresas": {"EL TEMPLO": {"otros": "otros-id"}}}}}
+    assert conciliar.resolver_buzon_todas(config) == []
+
+
+# -----------------------------------------------------------------------------
 # Funciones auxiliares pequeñas, separadas justamente para poder testearse
 # aparte (ver docstring del módulo de conciliar.py): resolver_empresa,
 # leer_filas_sheet_contable, descargar_constancias. No están en la lista de
@@ -1183,12 +1359,20 @@ def _csv_comprobantes_vacio(tmp_path) -> pathlib.Path:
 def _almacen_con_un_eecc(mes: str = "2026-06") -> tuple[FakeAlmacen, str, str, str]:
     """FakeAlmacen con la carpeta del mes ya armada (mismos nombres/padres
     que arma main() vía asegurar_carpeta, así que al correr main() los ids
-    calzan) y un EECC de la cuenta '4134' ya cargado en EECC."""
+    calzan) y un EECC de la cuenta '4134' ya cargado en EECC.
+
+    El nombre codifica el periodo 'MMAAAA' del propio 'mes' (mismo formato
+    que un EECC real, ver descargar_eecc): desde que main() pasa 'mes' a
+    descargar_eecc() (Fallo 1 del cierre 2026-09-11), un nombre con un
+    periodo distinto al que se concilia se ignora, y este fixture se usa
+    justamente para simular una conciliación que SÍ debe encontrar su EECC.
+    """
     almacen = FakeAlmacen()
     carpeta_mes_id = almacen.asegurar_carpeta(mes, "conciliacion-carpeta-id")
     carpeta_eecc_id = almacen.asegurar_carpeta("EECC", carpeta_mes_id)
     carpeta_constancias_id = almacen.asegurar_carpeta("CONSTANCIAS", carpeta_mes_id)
-    almacen.agregar_archivo(carpeta_eecc_id, "EC_4134_062026.pdf", b"contenido eecc de prueba")
+    anio, mes_num = mes.split("-")
+    almacen.agregar_archivo(carpeta_eecc_id, f"EC_4134_{mes_num}{anio}.pdf", b"contenido eecc de prueba")
     return almacen, carpeta_mes_id, carpeta_eecc_id, carpeta_constancias_id
 
 
@@ -1222,9 +1406,15 @@ def _stub_correo_gmail(monkeypatch, falla: bool = False) -> types.ModuleType:
     llamó o no sin depender del correo_gmail real ni de Gmail."""
     modulo = types.ModuleType("correo_gmail")
     modulo.llamadas = []  # type: ignore[attr-defined]
+    # descargar_eecc() hace 'from correo_gmail import periodo_de_nombre_eecc' de
+    # forma diferida (para no crear un import circular a nivel de módulo); con
+    # este doble instalado en sys.modules, ese import tiene que seguir
+    # resolviendo a la función pura real, o revienta con ImportError aunque
+    # descargar() esté completamente mockeado.
+    modulo.periodo_de_nombre_eecc = correo_gmail.periodo_de_nombre_eecc  # type: ignore[attr-defined]
 
-    def descargar_falso(config, almacen, carpetas, servicio=None, dry_run=False):
-        modulo.llamadas.append((config, almacen, carpetas, servicio, dry_run))  # type: ignore[attr-defined]
+    def descargar_falso(config, almacen, carpetas, servicio=None, dry_run=False, mes=None):
+        modulo.llamadas.append((config, almacen, carpetas, servicio, dry_run, mes))  # type: ignore[attr-defined]
         if falla:
             raise RuntimeError("Gmail no responde (prueba)")
         return {"adjuntos": 0, "constancias": 0, "omitidos": 0, "archivos": [], "errores": []}
@@ -1296,14 +1486,18 @@ def test_main_correo_habilitado_llama_con_firma_y_carpetas_correctas(tmp_path, m
 
     assert codigo == 0
     assert len(correo_falso.llamadas) == 1
-    config_pasado, almacen_pasado, carpetas_pasadas, servicio_pasado, dry_run_pasado = correo_falso.llamadas[0]
+    config_pasado, almacen_pasado, carpetas_pasadas, servicio_pasado, dry_run_pasado, mes_pasado = (
+        correo_falso.llamadas[0]
+    )
     assert almacen_pasado is almacen
     assert servicio_pasado is None
     assert dry_run_pasado is False
+    assert mes_pasado == "2026-06"
     assert carpetas_pasadas == {
         "EECC": carpeta_eecc_id,
         "CONSTANCIAS": carpeta_constancias_id,
         "BUZON": "buzon-id",
+        "BUZON_TODAS": [],  # _config_base() no usa buzon_empresas
     }
 
 
