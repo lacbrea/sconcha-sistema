@@ -265,17 +265,62 @@ def construir_planes(
     (ningún XML en el grupo, o más de uno) cada archivo se procesa de forma
     independiente, porque sin un XML de por medio no hay forma barata y
     segura de confirmar que dos archivos son el mismo comprobante.
+
+    Caso especial: la CDR (constancia de recepción de SUNAT, un XML propio
+    llamado "R-<nombre de la factura>.xml") llega junto a la factura pero con
+    un stem distinto (empieza con "R-"), así que por nombre queda en SU
+    PROPIO grupo -- de un solo XML -- y termina como plan principal suelto.
+    xml_ubl.extraer() la reconoce por su raíz (ApplicationResponse) y lanza
+    ValueError, así que sin este caso especial la CDR cae en 02_REVISAR con
+    un motivo de error y encima nunca viaja junto a su factura al archivarla.
+    Caso real (2026-09-13):
+        20603235780-01-F001-20833272.pdf
+        20603235780-01-F001-20833272.xml      <- factura (Invoice)
+        R-20603235780-01-F001-20833272.xml    <- CDR (ApplicationResponse)
+    Por eso, antes de decidir principal/respaldos por grupo, se reubica cada
+    archivo cuyo stem (en minúsculas) empiece con "r-" y tenga extensión
+    ".xml" -- nunca ".zip": la CDR real de SUNAT siempre es un .xml suelto --
+    dentro del grupo de la factura (stem sin el "r-"), pero SOLO si ese grupo
+    tiene exactamente un XML/ZIP (la factura, sola): así la CDR nunca se
+    cuenta como el "segundo XML" que haría perder el agrupado de la factura
+    con su propio PDF. Si la factura no está, o su grupo no tiene exactamente
+    un XML, la CDR queda como estaba: plan propio (y de ahí a 02_REVISAR por
+    el ValueError de xml_ubl.extraer()).
     """
     grupos: dict[str, list[ArchivoDrive]] = {}
     for archivo in archivos:
         grupos.setdefault(archivo.stem.lower(), []).append(archivo)
 
+    # Ver docstring: reubicación de CDR sueltas como respaldo de su factura,
+    # ANTES de calcular xmls/respaldos por grupo.
+    cdrs_reasignadas: dict[str, list[ArchivoDrive]] = {}
+    for stem, archivos_grupo in list(grupos.items()):
+        if not stem.startswith("r-"):
+            continue
+        stem_factura = stem[2:]
+        grupo_factura = grupos.get(stem_factura)
+        if grupo_factura is None:
+            continue
+        xmls_factura = [a for a in grupo_factura if a.suffix.lower() in EXT_XML]
+        if len(xmls_factura) != 1:
+            continue
+        candidatos_cdr = [a for a in archivos_grupo if a.suffix.lower() == ".xml"]
+        if not candidatos_cdr:
+            continue
+        cdrs_reasignadas.setdefault(stem_factura, []).extend(candidatos_cdr)
+        restantes = [a for a in archivos_grupo if a not in candidatos_cdr]
+        if restantes:
+            grupos[stem] = restantes
+        else:
+            del grupos[stem]
+
     planes: list[tuple[ArchivoDrive, list[ArchivoDrive]]] = []
-    for archivos_grupo in grupos.values():
+    for stem, archivos_grupo in grupos.items():
         xmls = [a for a in archivos_grupo if a.suffix.lower() in EXT_XML]
         if len(xmls) == 1:
             principal = xmls[0]
             respaldos = [a for a in archivos_grupo if a != principal]
+            respaldos.extend(cdrs_reasignadas.get(stem, []))
             planes.append((principal, respaldos))
         else:
             for a in archivos_grupo:

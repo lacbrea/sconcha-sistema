@@ -300,5 +300,39 @@ def test_extraer_desde_zip_sin_xml_de_comprobante(tmp_path):
     assert comp.total is None
 
 
+# --- CDR (constancia de recepción de SUNAT) -----------------------------------
+
+CDR_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<ar:ApplicationResponse
+    xmlns:ar="urn:oasis:names:specification:ubl:schema:xsd:ApplicationResponse-2"
+    xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+    xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+  <cbc:ID>R-F001-20833272</cbc:ID>
+  <cbc:ResponseDate>2026-09-13</cbc:ResponseDate>
+</ar:ApplicationResponse>
+"""
+
+
+def test_extraer_cdr_suelta_lanza_valueerror(tmp_path):
+    ruta = tmp_path / "R-20603235780-01-F001-20833272.xml"
+    ruta.write_text(CDR_XML, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="CDR"):
+        xml_ubl.extraer(ruta)
+
+
+def test_extraer_cdr_dentro_de_zip_lanza_valueerror(tmp_path):
+    # Caso de borde: la CDR viene sola dentro de un .zip, sin el prefijo "R-"
+    # en su nombre interno (el filtrado por nombre de _leer_contenido_xml no
+    # aplica). Igual debe detectarse por la raíz del XML, sea cual sea el
+    # contenedor.
+    ruta_zip = tmp_path / "cdr_sola.zip"
+    with zipfile.ZipFile(ruta_zip, "w") as zf:
+        zf.writestr("20603235780-01-F001-20833272.xml", CDR_XML)
+
+    with pytest.raises(ValueError, match="CDR"):
+        xml_ubl.extraer(ruta_zip)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

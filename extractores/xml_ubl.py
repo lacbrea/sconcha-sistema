@@ -8,8 +8,14 @@ Filosofía defensiva: un comprobante real casi nunca trae todos los campos
 opcionales (detracción, ICBPER, vencimiento, forma de pago...). Cada extracción
 de campo está aislada — si una ruta XPath no existe o el archivo viene raro,
 se agrega una advertencia y se sigue, nunca se lanza una excepción por un dato
-faltante. Solo un XML realmente ilegible (mal formado, o un .zip sin XML)
-devuelve un `ComprobanteExtraido` vacío con advertencias.
+faltante. Un XML realmente ilegible (mal formado, o un .zip sin XML) devuelve
+un `ComprobanteExtraido` vacío con advertencias, en vez de lanzar.
+
+La única excepción deliberada: si la raíz del XML es `ApplicationResponse`,
+es la CDR (constancia de recepción de SUNAT) y no un comprobante -- ahí SÍ se
+lanza `ValueError`, para que quien llama (procesar.py) lo mande a 02_REVISAR
+por la ruta de motivo de error, con un mensaje que diga la verdad en vez de
+fingir que falta el total.
 """
 from __future__ import annotations
 
@@ -86,6 +92,20 @@ def extraer(ruta: pathlib.Path) -> ComprobanteExtraido:
         return ComprobanteExtraido(origen="xml", confianza=1.0, advertencias=advertencias)
 
     raiz = etree.QName(root).localname
+    if raiz == "ApplicationResponse":
+        # Es la CDR (constancia de recepción de SUNAT), no un comprobante:
+        # pasa cuando la CDR llega al buzón sin su factura al lado (o con un
+        # nombre que construir_planes() en procesar.py no pudo emparejar, ver
+        # su docstring) y queda como plan principal suelto. Antes esto caía
+        # por "Raíz XML desconocida" y devolvía un ComprobanteExtraido vacío,
+        # que terminaba en 02_REVISAR con el motivo engañoso "falta el total
+        # del comprobante" (caso real 2026-09-13). Se lanza en cambio, para
+        # que procesar_uno() lo mande a 02_REVISAR por la ruta de error con un
+        # motivo que dice la verdad, y sin gastar ninguna llamada al modelo.
+        raise ValueError(
+            "constancia de recepción de SUNAT (CDR), no es un comprobante: súbela junto a su "
+            "factura o descártala"
+        )
     if raiz not in _LINEA_POR_RAIZ:
         advertencias.append(f"Raíz XML desconocida para UBL SUNAT: '{raiz}'")
         return ComprobanteExtraido(origen="xml", confianza=1.0, advertencias=advertencias)

@@ -512,6 +512,55 @@ def test_construir_planes_agrupa_xml_y_pdf_por_nombre():
     assert plan_suelto[1] == []
 
 
+# --- CDR (constancia de recepción de SUNAT) reubicada como respaldo -----------
+def test_construir_planes_cdr_se_reubica_como_respaldo_de_su_factura():
+    pdf = procesar.ArchivoDrive(id="1", name="X.pdf", mime_type="application/pdf")
+    xml = procesar.ArchivoDrive(id="2", name="X.xml", mime_type="text/xml")
+    cdr = procesar.ArchivoDrive(id="3", name="R-X.xml", mime_type="text/xml")
+
+    planes = procesar.construir_planes([pdf, xml, cdr])
+
+    assert len(planes) == 1
+    principal, respaldos = planes[0]
+    assert principal == xml
+    assert set(respaldos) == {pdf, cdr}
+
+
+def test_construir_planes_cdr_suelta_sin_factura_queda_como_plan_propio():
+    cdr_suelta = procesar.ArchivoDrive(id="1", name="R-Y.xml", mime_type="text/xml")
+
+    planes = procesar.construir_planes([cdr_suelta])
+
+    assert len(planes) == 1
+    principal, respaldos = planes[0]
+    assert principal == cdr_suelta
+    assert respaldos == []
+
+
+def test_construir_planes_cdr_con_pdf_pero_sin_xml_de_factura_no_se_empareja():
+    pdf = procesar.ArchivoDrive(id="1", name="Z.pdf", mime_type="application/pdf")
+    cdr = procesar.ArchivoDrive(id="2", name="R-Z.xml", mime_type="text/xml")
+
+    planes = procesar.construir_planes([pdf, cdr])
+
+    # Sin Z.xml, el grupo "z" no tiene exactamente un XML (tiene cero): la
+    # CDR no se reubica y cada archivo queda como plan propio.
+    assert {p[0].name for p in planes} == {"Z.pdf", "R-Z.xml"}
+    assert all(respaldos == [] for _, respaldos in planes)
+
+
+def test_construir_planes_cdr_mayusculas_minusculas_no_importan():
+    xml = procesar.ArchivoDrive(id="1", name="x.xml", mime_type="text/xml")
+    cdr = procesar.ArchivoDrive(id="2", name="r-X.xml", mime_type="text/xml")
+
+    planes = procesar.construir_planes([xml, cdr])
+
+    assert len(planes) == 1
+    principal, respaldos = planes[0]
+    assert principal == xml
+    assert respaldos == [cdr]
+
+
 # -----------------------------------------------------------------------------
 # nombre_destino_unico (reemplaza el viejo ruta_destino_unica basado en disco)
 # -----------------------------------------------------------------------------
