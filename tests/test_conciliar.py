@@ -1196,18 +1196,16 @@ def test_leer_filas_sheet_contable_arma_dicts_desde_la_cabecera():
     assert filas == [{"FECHA_EMISION": "15/06/2026", "EMPRESA": "EL TEMPLO", "TOTAL": "118.00"}]
 
 
-def test_estado_pago_infiere_pagada_solo_para_contado():
+def test_estado_pago_infiere_pagada_para_todo_comprobante_sin_estado():
     """El motor solo cruza filas con ESTADO_PAGO == 'PAGADA'. En el flujo nuevo
     nadie lo marca a mano (el documento no dice si ya se pago), asi que llegaba
-    vacio y el motor ignoraba TODOS los comprobantes: julio 2026 se concilio con
-    8 filas en el CSV y 0 cruces nuevos. Se infiere desde CONDICION, que si
-    viene en el documento, y solo para 'contado': un credito puede cargarse
-    semanas despues y ahi el falso positivo por monto+fecha si es un riesgo."""
-    assert conciliar._estado_pago_para_el_motor({"CONDICION": "contado"}) == "PAGADA"
-    assert conciliar._estado_pago_para_el_motor({"CONDICION": "credito"}) == ""
-    assert conciliar._estado_pago_para_el_motor({"CONDICION": ""}) == ""
-    # Mayusculas/espacios no deberian cambiar la decision.
-    assert conciliar._estado_pago_para_el_motor({"CONDICION": " CONTADO "}) == "PAGADA"
+    vacio y el motor ignoraba TODOS los comprobantes. Decision del dueño
+    (2026-09-13): todo se trata como pagado al contado, sin mirar CONDICION --
+    antes quedaban fuera los creditos (HUAMANI 'CREDITO MN 15') y las
+    liquidaciones con CONDICION vacia."""
+    for condicion in ("contado", "credito", "", "CREDITO MN 15", "cuota001", None):
+        assert conciliar._estado_pago_para_el_motor({"CONDICION": condicion}) == "PAGADA"
+    assert conciliar._estado_pago_para_el_motor({}) == "PAGADA"
     # Un ESTADO_PAGO ya puesto (corregido a mano en el Sheet) gana siempre.
     assert conciliar._estado_pago_para_el_motor(
         {"ESTADO_PAGO": "PENDIENTE", "CONDICION": "contado"}
@@ -1225,7 +1223,7 @@ def test_filtrar_y_escribir_csv_aplica_la_inferencia_de_estado_pago(tmp_path):
 
     with destino.open(encoding="utf-8-sig", newline="") as f:
         escritas = list(csv.DictReader(f))
-    assert [r["ESTADO_PAGO"] for r in escritas] == ["PAGADA", ""]
+    assert [r["ESTADO_PAGO"] for r in escritas] == ["PAGADA", "PAGADA"]
 
 
 def test_leer_filas_sheet_contable_pide_numeros_crudos_y_fechas_como_texto():

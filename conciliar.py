@@ -721,11 +721,15 @@ def _estado_pago_para_el_motor(fila: dict[str, Any]) -> str:
     que pasó al conciliar julio 2026 la primera vez (8 filas en el CSV, 0
     cruces nuevos).
 
-    Lo que sí trae el documento es la CONDICION (contado/crédito), que
-    `procesar.py` ahora extrae. Un comprobante al contado se paga contra
-    entrega, así que se ofrece al motor como candidato a cruzar; uno a crédito
-    no, porque su cargo puede caer semanas después y ahí sí el riesgo de falso
-    positivo es real.
+    Decisión del dueño (2026-09-13): TODO comprobante sin ESTADO_PAGO se
+    trata como pagado al contado y se ofrece al motor, sin mirar CONDICION.
+    Antes solo se inferia PAGADA con CONDICION == 'contado', y eso dejaba
+    fuera para siempre las facturas a crédito (nadie las marca a mano: 16
+    filas en jul-ago), las liquidaciones en PDF (CONDICION vacía: 23 filas de
+    EL TEMPLO) y variantes sin normalizar ('cuota001', 'credito mn 15'). Caso
+    real: HUAMANI FL01-2316 y FL01-2476, 'CREDITO MN 15', con sus dos cargos
+    de S/200.06 en el banco de INSTITUCION marcados SIN COMPROBANTE. Se acepta
+    el riesgo de un falso positivo por monto+fecha a cambio de cruzar todo.
 
     Esto es una INFERENCIA y vive solo en el CSV de la corrida: no se escribe
     de vuelta al Sheet contable, que debe seguir diciendo la verdad ("no se
@@ -736,8 +740,7 @@ def _estado_pago_para_el_motor(fila: dict[str, Any]) -> str:
     estado = str(fila.get("ESTADO_PAGO") or "").strip()
     if estado:
         return estado
-    condicion = str(fila.get("CONDICION") or "").strip().lower()
-    return "PAGADA" if condicion == "contado" else ""
+    return "PAGADA"
 
 
 def contar_filas_csv(ruta: pathlib.Path) -> int:
