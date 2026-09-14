@@ -623,9 +623,19 @@ def esta_pagado(c):
     return norm(c.get('ESTADO_PAGO', '')) == 'PAGADA'
 
 
+# Ventana de dias entre la fecha de referencia del comprobante (FECHA_PAGO, o
+# FECHA_EMISION si no hay) y la del cargo. Era +/-3; decision del dueño
+# (2026-09-13): +/-7, porque los proveedores cobran dias despues de emitir.
+# Caso real: HUAMANI FL01-00002476, emitida el 30/07/2026 y pagada el 03/08
+# (4 dias), quedaba SIN COMPROBANTE. La desambiguacion por fecha exacta
+# (CARGO_KEYS) sigue igual y es la que evita robarle el comprobante a otro
+# cargo del mismo monto.
+VENTANA_DIAS_CRUCE = 7
+
+
 def match_individual(monto, fecha_cargo, prov_hint, require_name):
     """Cruce 1-a-1: mismo TOTAL (+/- S/0.05, redondeado a 2 decimales) y fecha de
-    referencia dentro de +/-3 dias; prefiere el de menor diferencia de monto y
+    referencia dentro de +/-VENTANA_DIAS_CRUCE dias; prefiere el de menor diferencia de monto y
     luego de dias. Desambiguacion de fecha exacta: si dd>0 y existe otro cargo
     del mismo monto exactamente en la fecha de referencia del comprobante (ver
     CARGO_KEYS), el comprobante se reserva para ese cargo y no se ofrece aqui."""
@@ -640,7 +650,7 @@ def match_individual(monto, fecha_cargo, prov_hint, require_name):
         if diff_amt > TOL_INDIVIDUAL:
             continue
         dd = abs((ref - fecha_cargo).days)
-        if dd > 3:
+        if dd > VENTANA_DIAS_CRUCE:
             continue
         if dd > 0 and (round(c['_TOTAL'], 2), ref) in CARGO_KEYS:
             continue  # otro cargo de fecha exacta esta esperando este comprobante
@@ -725,7 +735,7 @@ def match_lote(monto, fecha_cargo, prov_hint, require_name):
             continue
         fp = c['_FECHA_PAGO']
         if fp is not None:
-            if abs((fp - fecha_cargo).days) > 3:
+            if abs((fp - fecha_cargo).days) > VENTANA_DIAS_CRUCE:
                 continue
             key = (norm(c.get('PROVEEDOR', '')), fp)
         else:

@@ -218,3 +218,24 @@ def test_match_lote_exacto_le_gana_a_aproximado_aunque_se_evalue_despues(bc):
     assert resultado is not None
     assert sorted(i["SERIE_NUMERO"] for i in resultado) == ["T-A", "T-B"]
     assert round(sum(i["_TOTAL"] for i in resultado), 2) == 550.00
+
+
+# -----------------------------------------------------------------------------
+# Ventana de cruce individual: +/-7 dias (decision del dueño 2026-09-13)
+# -----------------------------------------------------------------------------
+def test_match_individual_cruza_a_4_dias_caso_huamani(bc):
+    """HUAMANI FL01-00002476: emitida el 30/07/2026, cargo de S/200.06 el
+    03/08. Con la ventana vieja de +/-3 dias quedaba SIN COMPROBANTE."""
+    bc.comprobantes = [
+        comp(200.06, "FL01-00002476", fecha_emision=D(30, 7), proveedor="COMPAÑIA PERUANA DE PISCO SAC"),
+    ]
+    resultado = bc.match_individual(200.06, D(3, 8), "COMPANIA PERUANA DE PISCO", False)
+    assert resultado is not None
+    assert resultado["SERIE_NUMERO"] == "FL01-00002476"
+
+
+def test_match_individual_cruza_a_7_dias_y_no_a_8(bc):
+    bc.comprobantes = [comp(150.00, "A7", fecha_emision=D(1, 8), proveedor="PROV")]
+    assert bc.match_individual(150.00, D(8, 8), "PROV", False) is not None
+    bc.comprobantes = [comp(150.00, "A8", fecha_emision=D(1, 8), proveedor="PROV")]
+    assert bc.match_individual(150.00, D(9, 8), "PROV", False) is None
